@@ -1,0 +1,41 @@
+# Reference material — read-only, never committed (see CLAUDE.md)
+/plexo/
+
+# Local planning docs — kept out of the repo
+/CLAUDE.md
+/ARCHITECTURE.md
+/IMPLEMENTATION_PLAN.md
+
+# Rust
+/target/
+**/*.rs.bk
+
+# Frontend (ui/: Vue + Vite, pnpm)
+node_modules/
+dist/
+*.tsbuildinfo
+.vite/
+.pnpm-store/
+coverage/
+
+# Tauri generated files
+/src-tauri/gen/schemas/
+
+# nuxd in-progress downloads (tests, manual runs)
+*.nuxdpart
+
+# Logs and local environment
+*.log
+.env
+.env.*
+!.env.example
+
+# Editors
+.idea/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
