@@ -1,0 +1,6 @@
+# CLAUDE.md: "No unwrap()/expect() outside tests or genuinely infallible
+# cases." The workspace-level `unwrap_used`/`expect_used` deny (Cargo.toml)
+# is otherwise unconditional; these two let it exempt `#[test]` functions
+# specifically, while still catching them in ordinary library code.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true

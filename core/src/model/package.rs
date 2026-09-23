@@ -1,0 +1,179 @@
+//! `Package` and the types around it (`ARCHITECTURE.md` §4).
+
+use super::{ByteRate, FileEntry, PackageId, Priority};
+use serde::{Deserialize, Serialize};
+use std::fmt;
+use std::path::PathBuf;
+
+/// Set by multi-part archive grouping (§12.1, Phase 5). Kept minimal for
+/// now — extraction detail is added once Phase 5 settles whether
+/// extraction ships at all (see `IMPLEMENTATION_PLAN.md`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchiveSet {
+    pub scheme: ArchiveScheme,
+    /// The shared basename every volume in the set groups under.
+    pub base_name: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ArchiveScheme {
+    Rar,
+    RarLegacy,
+    SevenZip,
+    SplitZip,
+    GenericSplit,
+}
+
+/// Why a package failed — a serializable summary, same rationale as
+/// `FileError` (see `file.rs`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PackageError {
+    /// One or more files in the package failed.
+    FilesFailed,
+    VerifyFailed {
+        detail: String,
+    },
+    ExtractFailed {
+        detail: String,
+    },
+    /// Disk full or another fatal error (§16: "Fatal (package)").
+    Io {
+        detail: String,
+    },
+    Other {
+        detail: String,
+    },
+}
+
+impl fmt::Display for PackageError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::FilesFailed => write!(f, "one or more files failed"),
+            Self::VerifyFailed { detail } => write!(f, "verification failed: {detail}"),
+            Self::ExtractFailed { detail } => write!(f, "extraction failed: {detail}"),
+            Self::Io { detail } => write!(f, "disk error: {detail}"),
+            Self::Other { detail } => write!(f, "{detail}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PackageStatus {
+    Queued,
+    Downloading,
+    Paused,
+    Verifying,
+    Extracting,
+    Done,
+    Failed(PackageError),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Package {
+    pub id: PackageId,
+    pub name: String,
+    pub dest_dir: PathBuf,
+    pub priority: Priority,
+    /// `len() == 1` is a simple download; `len() > 1` is a grouped set.
+    /// Never empty — see `Package::new`.
+    pub files: Vec<FileEntry>,
+    pub archive: Option<ArchiveSet>,
+    pub limit: Option<ByteRate>,
+    pub status: PackageStatus,
+}
+
+impl Package {
+    /// A freshly collected package, queued and with no archive grouping
+    /// or rate limit yet. Returns `None` for an empty `name` or an empty
+    /// `files` — a package with nothing to download can't exist.
+    #[must_use]
+    pub fn new(
+        id: PackageId,
+        name: impl Into<String>,
+        dest_dir: PathBuf,
+        files: Vec<FileEntry>,
+    ) -> Option<Self> {
+        let name = name.into();
+        if name.is_empty() || files.is_empty() {
+            return None;
+        }
+        Some(Self {
+            id,
+            name,
+            dest_dir,
+            priority: Priority::default(),
+            files,
+            archive: None,
+            limit: None,
+            status: PackageStatus::Queued,
+        })
+    }
+
+    /// Whether every file has finished and validated — the precondition
+    /// for `PackageStatus::Done` (§4 invariant).
+    #[must_use]
+    pub fn all_files_verified(&self) -> bool {
+        self.files
+            .iter()
+            .all(|file| file.status == super::FileStatus::Verified)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::FileId;
+
+    fn one_file() -> Vec<FileEntry> {
+        vec![FileEntry::new(FileId::new(1), "https://example.com/f", "f.bin").unwrap()]
+    }
+
+    #[test]
+    fn new_rejects_empty_name() {
+        assert!(Package::new(PackageId::new(1), "", PathBuf::from("/tmp"), one_file()).is_none());
+    }
+
+    #[test]
+    fn new_rejects_no_files() {
+        assert!(Package::new(PackageId::new(1), "pkg", PathBuf::from("/tmp"), vec![]).is_none());
+    }
+
+    #[test]
+    fn new_starts_queued_with_normal_priority() {
+        let pkg =
+            Package::new(PackageId::new(1), "pkg", PathBuf::from("/tmp"), one_file()).unwrap();
+        assert_eq!(pkg.status, PackageStatus::Queued);
+        assert_eq!(pkg.priority, Priority::Normal);
+        assert!(pkg.archive.is_none());
+    }
+
+    #[test]
+    fn all_files_verified_false_when_any_file_is_not() {
+        let pkg =
+            Package::new(PackageId::new(1), "pkg", PathBuf::from("/tmp"), one_file()).unwrap();
+        assert!(!pkg.all_files_verified());
+    }
+
+    #[test]
+    fn all_files_verified_true_when_every_file_is() {
+        let mut pkg =
+            Package::new(PackageId::new(1), "pkg", PathBuf::from("/tmp"), one_file()).unwrap();
+        pkg.files[0].status = super::super::FileStatus::Verified;
+        assert!(pkg.all_files_verified());
+    }
+
+    #[test]
+    fn package_serde_round_trip() {
+        let mut pkg = Package::new(
+            PackageId::new(3),
+            "pkg",
+            PathBuf::from("/tmp/dl"),
+            one_file(),
+        )
+        .unwrap();
+        pkg.status = PackageStatus::Failed(PackageError::FilesFailed);
+        let json = serde_json::to_string(&pkg).unwrap();
+        let back: Package = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, pkg);
+    }
+}
