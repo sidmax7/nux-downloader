@@ -97,11 +97,18 @@ pub fn reserve_destination_path(dir: &Path, file_name: &str) -> Result<PathBuf, 
 /// download). An unknown size isn't preallocated; it's written
 /// sequentially instead.
 pub fn create_and_preallocate(path: &Path, size: Option<u64>) -> Result<File, StorageError> {
-    let file = File::create(path).map_err(|source| StorageError::Io {
-        operation: "create",
-        path: path.display().to_string(),
-        source,
-    })?;
+    // Read and write: byte sampling (§10) reads durable regions back.
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)
+        .map_err(|source| StorageError::Io {
+            operation: "create",
+            path: path.display().to_string(),
+            source,
+        })?;
 
     if let Some(size) = size
         && size > 0
@@ -212,6 +219,44 @@ pub fn write_at(file: &File, path: &Path, offset: u64, data: &[u8]) -> Result<()
             )));
         }
         written += n;
+    }
+    Ok(())
+}
+
+/// Reads exactly `buf.len()` bytes at `offset` — the counterpart of
+/// `write_at`, used to compare durable bytes with a fresh sample (§10).
+#[cfg(unix)]
+pub fn read_at(file: &File, path: &Path, offset: u64, buf: &mut [u8]) -> Result<(), StorageError> {
+    use std::os::unix::fs::FileExt;
+    file.read_exact_at(buf, offset)
+        .map_err(|source| StorageError::Io {
+            operation: "read",
+            path: path.display().to_string(),
+            source,
+        })
+}
+
+/// As the Unix version, but looping: `seek_read` may return short.
+#[cfg(windows)]
+pub fn read_at(file: &File, path: &Path, offset: u64, buf: &mut [u8]) -> Result<(), StorageError> {
+    use std::os::windows::fs::FileExt;
+    let map_err = |source: io::Error| StorageError::Io {
+        operation: "read",
+        path: path.display().to_string(),
+        source,
+    };
+    let mut filled = 0usize;
+    while filled < buf.len() {
+        let n = file
+            .seek_read(&mut buf[filled..], offset + filled as u64)
+            .map_err(map_err)?;
+        if n == 0 {
+            return Err(map_err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "seek_read hit end of file",
+            )));
+        }
+        filled += n;
     }
     Ok(())
 }

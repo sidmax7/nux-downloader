@@ -649,7 +649,7 @@ mod tests {
     #[test]
     fn restore_reprobes_a_file_that_never_finished_activating() {
         let package = sample_package(FileStatus::Preparing);
-        let (state, effects) =
+        let (mut state, effects) =
             EngineState::restore(EngineConfig::default(), &sample_queue(), vec![package]);
 
         let file = state
@@ -672,6 +672,14 @@ mod tests {
                 .files[0]
                 .parts
                 .is_empty()
+        );
+        // The probe pool issues the probe on the engine's first step.
+        assert!(!effects.iter().any(|e| matches!(e, Effect::Probe { .. })));
+        let effects = state.handle(
+            Input::Tick {
+                progress: Vec::new(),
+            },
+            Instant::now(),
         );
         assert!(
             effects
@@ -1188,5 +1196,1345 @@ mod tests {
             let done = simulate_three_links([a, b, c]);
             proptest::prop_assert!(done.iter().sum::<u32>() > 0);
         }
+    }
+
+    // --- host backoff (§16: 429/503 → host backoff, no retry counted) ---
+
+    fn refuse(
+        state: &mut EngineState,
+        now: Instant,
+        attempt: crate::model::AttemptId,
+        position: u64,
+    ) -> Vec<Effect> {
+        let effects = state.handle(
+            Input::AttemptEnded {
+                id: attempt,
+                outcome: AttemptOutcome::Failed(TransferError::Status(429)),
+                position,
+            },
+            now,
+        );
+        check_invariants(state);
+        effects
+    }
+
+    #[test]
+    fn a_429_backs_the_host_off_without_charging_the_block() {
+        let mut state = EngineState::new(EngineConfig::default());
+        let now = Instant::now();
+        state.handle(Input::LinksChanged(vec![link(1, "a0", 4)]), now);
+        let (_, file) = add_single_file(&mut state, now, "http://example.com/f.bin");
+        let (attempt, range) =
+            activate_and_start(&mut state, now, file, "http://example.com/f.bin", 1000);
+
+        let effects = refuse(&mut state, now, attempt, range.start);
+        assert!(
+            find_start_attempt(&effects, file).is_none(),
+            "host is cooling down"
+        );
+        assert_eq!(state.block_retries(file, 0), 0);
+        assert!(effects.contains(&Effect::WakeAt(now + Duration::from_secs(2))));
+
+        let early = state.handle(
+            Input::Tick {
+                progress: Vec::new(),
+            },
+            now + Duration::from_secs(1),
+        );
+        assert!(find_start_attempt(&early, file).is_none());
+        let later = state.handle(
+            Input::Tick {
+                progress: Vec::new(),
+            },
+            now + Duration::from_secs(2),
+        );
+        assert!(
+            find_start_attempt(&later, file).is_some(),
+            "retries after the backoff"
+        );
+    }
+
+    #[test]
+    fn repeated_refusals_lengthen_the_backoff_and_eventually_fail_the_file() {
+        let mut state = EngineState::new(EngineConfig::default());
+        let mut now = Instant::now();
+        state.handle(Input::LinksChanged(vec![link(1, "a0", 4)]), now);
+        let (_, file) = add_single_file(&mut state, now, "http://example.com/f.bin");
+        let (mut attempt, range) =
+            activate_and_start(&mut state, now, file, "http://example.com/f.bin", 1000);
+
+        let mut waits = Vec::new();
+        for _ in 0..12 {
+            let effects = refuse(&mut state, now, attempt, range.start);
+            if state
+                .file(file)
+                .is_some_and(|f| matches!(f.status, FileStatus::Failed(_)))
+            {
+                break;
+            }
+            let wake = effects
+                .iter()
+                .find_map(|e| match e {
+                    Effect::WakeAt(t) => Some(*t),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("no WakeAt in {effects:?}"));
+            waits.push(wake - now);
+            now = wake;
+            let effects = state.handle(
+                Input::Tick {
+                    progress: Vec::new(),
+                },
+                now,
+            );
+            attempt = find_start_attempt(&effects, file)
+                .unwrap_or_else(|| panic!("should retry after backoff"))
+                .0;
+        }
+        assert_eq!(waits[0], Duration::from_secs(2));
+        assert_eq!(waits[1], Duration::from_secs(4));
+        assert_eq!(*waits.iter().max().unwrap(), Duration::from_secs(60));
+        assert!(
+            matches!(
+                state.file(file).map(|f| f.status.clone()),
+                Some(FileStatus::Failed(_))
+            ),
+            "a host that never relents fails the file"
+        );
+    }
+
+    #[test]
+    fn a_refused_host_learns_a_lower_connection_cap() {
+        let mut state = EngineState::new(EngineConfig::default());
+        let now = Instant::now();
+        state.handle(Input::LinksChanged(vec![link(1, "a0", 8)]), now);
+        let (_, file) = add_single_file(&mut state, now, "http://example.com/big.bin");
+        state.handle(
+            Input::ProbeDone {
+                file,
+                result: ok_probe("http://example.com/big.bin", 64 * 1024 * 1024),
+            },
+            now,
+        );
+        let effects = state.handle(
+            Input::FilePrepared {
+                file,
+                result: Ok(PreparedFile {
+                    final_name: "big.bin".to_string(),
+                    frontiers_valid: true,
+                }),
+            },
+            now,
+        );
+        let started: Vec<_> = effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::StartAttempt { id, range, .. } => Some((*id, *range)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(started.len(), 8);
+
+        // The host refuses the ninth… here, one of the eight.
+        refuse(&mut state, now, started[0].0, started[0].1.start);
+        let after = now + Duration::from_secs(2);
+        let effects = state.handle(
+            Input::Tick {
+                progress: Vec::new(),
+            },
+            after,
+        );
+        // 7 still running; the host is capped at 7/2 = 3, so no new starts.
+        assert!(find_start_attempt(&effects, file).is_none());
+        assert_eq!(state.attempt_count(), 7);
+    }
+
+    #[test]
+    fn a_429_on_the_probe_is_retried_after_the_backoff() {
+        let mut state = EngineState::new(EngineConfig::default());
+        let now = Instant::now();
+        state.handle(Input::LinksChanged(vec![link(1, "a0", 4)]), now);
+        let (_, file) = add_single_file(&mut state, now, "http://example.com/f.bin");
+
+        let effects = state.handle(
+            Input::ProbeDone {
+                file,
+                result: Err(crate::error::ProbeError::UnexpectedStatus { status: 429 }),
+            },
+            now,
+        );
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::Emit(EngineEvent::FileFailed { .. })))
+        );
+        assert!(effects.contains(&Effect::WakeAt(now + Duration::from_secs(2))));
+
+        let early = state.handle(
+            Input::Tick {
+                progress: Vec::new(),
+            },
+            now + Duration::from_secs(1),
+        );
+        assert!(!early.iter().any(|e| matches!(e, Effect::Probe { .. })));
+        let due = state.handle(
+            Input::Tick {
+                progress: Vec::new(),
+            },
+            now + Duration::from_secs(2),
+        );
+        assert!(
+            due.iter()
+                .any(|e| matches!(e, Effect::Probe { file: f, .. } if *f == file))
+        );
+
+        // A different failure is still fatal.
+        let effects = state.handle(
+            Input::ProbeDone {
+                file,
+                result: Err(crate::error::ProbeError::UnexpectedStatus { status: 404 }),
+            },
+            now + Duration::from_secs(3),
+        );
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::Emit(EngineEvent::FileFailed { .. })))
+        );
+    }
+
+    #[test]
+    fn a_probe_that_keeps_getting_429_eventually_fails() {
+        let mut state = EngineState::new(EngineConfig::default());
+        let mut now = Instant::now();
+        state.handle(Input::LinksChanged(vec![link(1, "a0", 4)]), now);
+        let (_, file) = add_single_file(&mut state, now, "http://example.com/f.bin");
+        let mut failed = false;
+        for _ in 0..10 {
+            let effects = state.handle(
+                Input::ProbeDone {
+                    file,
+                    result: Err(crate::error::ProbeError::UnexpectedStatus { status: 503 }),
+                },
+                now,
+            );
+            if effects
+                .iter()
+                .any(|e| matches!(e, Effect::Emit(EngineEvent::FileFailed { .. })))
+            {
+                failed = true;
+                break;
+            }
+            now += Duration::from_secs(3600);
+            let due = state.handle(
+                Input::Tick {
+                    progress: Vec::new(),
+                },
+                now,
+            );
+            assert!(due.iter().any(|e| matches!(e, Effect::Probe { .. })));
+        }
+        assert!(failed, "probe retries are bounded");
+    }
+
+    #[test]
+    fn a_burst_of_simultaneous_refusals_is_one_strike() {
+        // Found against a real host: 7 of 8 parallel requests were turned
+        // away in the same instant, and counting each as a strike sent
+        // the backoff straight to 60 s.
+        let mut state = EngineState::new(EngineConfig::default());
+        let now = Instant::now();
+        state.handle(Input::LinksChanged(vec![link(1, "a0", 8)]), now);
+        let (_, file) = add_single_file(&mut state, now, "http://example.com/big.bin");
+        state.handle(
+            Input::ProbeDone {
+                file,
+                result: ok_probe("http://example.com/big.bin", 64 * 1024 * 1024),
+            },
+            now,
+        );
+        let effects = state.handle(
+            Input::FilePrepared {
+                file,
+                result: Ok(PreparedFile {
+                    final_name: "big.bin".to_string(),
+                    frontiers_valid: true,
+                }),
+            },
+            now,
+        );
+        let started: Vec<_> = effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::StartAttempt { id, range, .. } => Some((*id, range.start)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(started.len(), 8);
+
+        // All but the first are refused at once.
+        let mut wakes = Vec::new();
+        for (id, start) in &started[1..] {
+            for effect in refuse(&mut state, now, *id, *start) {
+                if let Effect::WakeAt(t) = effect {
+                    wakes.push(t - now);
+                }
+            }
+        }
+        assert_eq!(wakes, [Duration::from_secs(2)], "one backoff, not seven");
+
+        // After it, one connection at a time (only one was accepted).
+        let effects = state.handle(
+            Input::Tick {
+                progress: Vec::new(),
+            },
+            now + Duration::from_secs(2),
+        );
+        assert!(
+            find_start_attempt(&effects, file).is_none(),
+            "cap is 1 and the accepted attempt is still running"
+        );
+        assert_eq!(state.attempt_count(), 1);
+    }
+
+    #[test]
+    fn a_host_refusing_one_link_does_not_slow_another() {
+        // Hosts limit per client IP and each link is its own IP (§7.1).
+        let mut state = EngineState::new(EngineConfig::default());
+        let now = Instant::now();
+        state.handle(
+            Input::LinksChanged(vec![link(1, "a0", 2), link(2, "b0", 2)]),
+            now,
+        );
+        let (_, file) = add_single_file(&mut state, now, "http://example.com/big.bin");
+        state.handle(
+            Input::ProbeDone {
+                file,
+                result: ok_probe("http://example.com/big.bin", 64 * 1024 * 1024),
+            },
+            now,
+        );
+        let effects = state.handle(
+            Input::FilePrepared {
+                file,
+                result: Ok(PreparedFile {
+                    final_name: "big.bin".to_string(),
+                    frontiers_valid: true,
+                }),
+            },
+            now,
+        );
+        let on = |effects: &[Effect], link: u64| -> Vec<(crate::model::AttemptId, u64)> {
+            effects
+                .iter()
+                .filter_map(|e| match e {
+                    Effect::StartAttempt {
+                        id, link: l, range, ..
+                    } if l.get() == link => Some((*id, range.start)),
+                    _ => None,
+                })
+                .collect()
+        };
+        let a = on(&effects, 1);
+        let b = on(&effects, 2);
+        assert_eq!((a.len(), b.len()), (2, 2));
+
+        // Link 1 is refused; link 2 finishes a block normally.
+        refuse(&mut state, now, a[0].0, a[0].1);
+        let effects = state.handle(
+            Input::AttemptEnded {
+                id: b[0].0,
+                outcome: AttemptOutcome::Success,
+                position: b[0].1 + 2 * 1024 * 1024,
+            },
+            now,
+        );
+        assert_eq!(on(&effects, 2).len(), 1, "link 2 refills its slot at once");
+        assert!(on(&effects, 1).is_empty(), "link 1 is cooling down");
+    }
+
+    #[test]
+    fn retry_after_sets_a_floor_under_the_backoff() {
+        let mut state = EngineState::new(EngineConfig::default());
+        let now = Instant::now();
+        state.handle(Input::LinksChanged(vec![link(1, "a0", 4)]), now);
+        let (_, file) = add_single_file(&mut state, now, "http://example.com/f.bin");
+        let (attempt, range) =
+            activate_and_start(&mut state, now, file, "http://example.com/f.bin", 1000);
+        let effects = state.handle(
+            Input::AttemptEnded {
+                id: attempt,
+                outcome: AttemptOutcome::Failed(TransferError::Busy {
+                    status: 429,
+                    retry_after: Some(Duration::from_secs(10)),
+                }),
+                position: range.start,
+            },
+            now,
+        );
+        assert!(effects.contains(&Effect::WakeAt(now + Duration::from_secs(10))));
+        assert_eq!(state.block_retries(file, 0), 0);
+        let at_9 = state.handle(
+            Input::Tick {
+                progress: Vec::new(),
+            },
+            now + Duration::from_secs(9),
+        );
+        assert!(find_start_attempt(&at_9, file).is_none());
+        let at_10 = state.handle(
+            Input::Tick {
+                progress: Vec::new(),
+            },
+            now + Duration::from_secs(10),
+        );
+        assert!(find_start_attempt(&at_10, file).is_some());
+    }
+
+    // --- queue order and priority (P4.1) ---
+
+    /// Adds a one-file package and activates its file, returning ids and
+    /// the effects the activation produced.
+    fn add_and_activate(
+        state: &mut EngineState,
+        now: Instant,
+        url: &str,
+    ) -> (crate::model::PackageId, crate::model::FileId, Vec<Effect>) {
+        let (package, file) = add_single_file(state, now, url);
+        state.handle(
+            Input::ProbeDone {
+                file,
+                result: ok_probe(url, 1000),
+            },
+            now,
+        );
+        let effects = state.handle(
+            Input::FilePrepared {
+                file,
+                result: Ok(PreparedFile {
+                    final_name: "file.bin".to_string(),
+                    frontiers_valid: true,
+                }),
+            },
+            now,
+        );
+        check_invariants(state);
+        (package, file, effects)
+    }
+
+    fn finish(
+        state: &mut EngineState,
+        now: Instant,
+        attempt: crate::model::AttemptId,
+        end: u64,
+    ) -> Vec<Effect> {
+        let effects = state.handle(
+            Input::AttemptEnded {
+                id: attempt,
+                outcome: AttemptOutcome::Success,
+                position: end,
+            },
+            now,
+        );
+        check_invariants(state);
+        effects
+    }
+
+    /// One slot, three one-block files A (running), B, C (waiting).
+    fn abc() -> (
+        EngineState,
+        Instant,
+        [crate::model::PackageId; 3],
+        [crate::model::FileId; 3],
+        crate::model::AttemptId,
+    ) {
+        let mut state = EngineState::new(EngineConfig::default());
+        let now = Instant::now();
+        state.handle(Input::LinksChanged(vec![link(1, "a0", 1)]), now);
+        let (pa, fa, effects) = add_and_activate(&mut state, now, "http://a.example.com/a.bin");
+        let (attempt, _) = find_start_attempt(&effects, fa)
+            .unwrap_or_else(|| panic!("A should start: {effects:?}"));
+        let (pb, fb, _) = add_and_activate(&mut state, now, "http://b.example.com/b.bin");
+        let (pc, fc, _) = add_and_activate(&mut state, now, "http://c.example.com/c.bin");
+        assert_eq!(state.attempt_count(), 1, "only A holds the single slot");
+        (state, now, [pa, pb, pc], [fa, fb, fc], attempt)
+    }
+
+    #[test]
+    fn work_follows_queue_order_by_default() {
+        let (mut state, now, _, [_, fb, _], a) = abc();
+        let effects = finish(&mut state, now, a, 1000);
+        assert!(
+            find_start_attempt(&effects, fb).is_some(),
+            "B is next in line"
+        );
+    }
+
+    #[test]
+    fn moving_a_package_up_mid_download_changes_who_gets_the_next_slot() {
+        let (mut state, now, [_, _, pc], [_, fb, fc], a) = abc();
+        let effects = state.handle(
+            Input::Command(Command::MoveTo {
+                package: pc,
+                position: 0,
+            }),
+            now,
+        );
+        check_invariants(&state);
+        assert!(effects.contains(&Effect::Emit(EngineEvent::QueueReordered)));
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::AbortAttempt { .. })),
+            "the running attempt is not interrupted"
+        );
+        assert_eq!(state.packages()[0].id, pc);
+
+        let effects = finish(&mut state, now, a, 1000);
+        assert!(
+            find_start_attempt(&effects, fc).is_some(),
+            "C jumped the queue"
+        );
+        assert!(find_start_attempt(&effects, fb).is_none());
+    }
+
+    #[test]
+    fn moving_a_package_down_and_clamping_past_the_end() {
+        let (mut state, now, [pa, pb, pc], _, _) = abc();
+        state.handle(
+            Input::Command(Command::MoveTo {
+                package: pa,
+                position: 99,
+            }),
+            now,
+        );
+        let order: Vec<_> = state.packages().iter().map(|p| p.id).collect();
+        assert_eq!(order, [pb, pc, pa]);
+        // Lookups still work after the shuffle.
+        assert_eq!(state.package(pa).map(|p| p.id), Some(pa));
+        assert_eq!(state.package(pc).map(|p| p.id), Some(pc));
+    }
+
+    #[test]
+    fn a_higher_priority_outranks_queue_position() {
+        let (mut state, now, [_, _, pc], [_, fb, fc], a) = abc();
+        let effects = state.handle(
+            Input::Command(Command::SetPriority {
+                package: pc,
+                priority: Priority::High,
+            }),
+            now,
+        );
+        check_invariants(&state);
+        // The change is checkpointed before it is announced (§9.3).
+        let checkpoint = effects
+            .iter()
+            .position(|e| matches!(e, Effect::Checkpoint { package, .. } if *package == pc));
+        let event = effects
+            .iter()
+            .position(|e| matches!(e, Effect::Emit(EngineEvent::PackagePriorityChanged { .. })));
+        assert!(checkpoint.is_some() && event.is_some() && checkpoint < event);
+        // C keeps its queue position…
+        assert_eq!(state.packages()[2].id, pc);
+        // …but wins the next slot.
+        let effects = finish(&mut state, now, a, 1000);
+        assert!(find_start_attempt(&effects, fc).is_some());
+        assert!(find_start_attempt(&effects, fb).is_none());
+    }
+
+    #[test]
+    fn lowering_a_priority_lets_later_packages_go_first() {
+        let (mut state, now, [_, pb, _], [_, fb, fc], a) = abc();
+        state.handle(
+            Input::Command(Command::SetPriority {
+                package: pb,
+                priority: Priority::Low,
+            }),
+            now,
+        );
+        let effects = finish(&mut state, now, a, 1000);
+        assert!(find_start_attempt(&effects, fc).is_some(), "C now beats B");
+        assert!(find_start_attempt(&effects, fb).is_none());
+    }
+
+    #[test]
+    fn unknown_packages_and_no_op_changes_do_nothing() {
+        let (mut state, now, [pa, ..], _, _) = abc();
+        let ghost = crate::model::PackageId::new(999);
+        for command in [
+            Command::MoveTo {
+                package: ghost,
+                position: 0,
+            },
+            Command::SetPriority {
+                package: ghost,
+                priority: Priority::High,
+            },
+            Command::SetPriority {
+                package: pa,
+                priority: Priority::Normal, // already Normal
+            },
+            Command::MoveTo {
+                package: pa,
+                position: 0, // already first
+            },
+        ] {
+            assert!(state.handle(Input::Command(command), now).is_empty());
+        }
+    }
+
+    // --- lazy activation and caps (P4.2) ---
+
+    /// Adds one package with a file per URL and probes them all with the
+    /// given size. Returns the file ids and every effect produced.
+    fn add_probed_package(
+        state: &mut EngineState,
+        now: Instant,
+        urls: &[String],
+        size: u64,
+    ) -> (
+        crate::model::PackageId,
+        Vec<crate::model::FileId>,
+        Vec<Effect>,
+    ) {
+        let mut effects = state.handle(
+            Input::Command(Command::AddPackage {
+                name: "many".to_string(),
+                dest_dir: std::path::PathBuf::from("/tmp/nuxd-sim"),
+                sources: urls.to_vec(),
+                priority: Priority::Normal,
+            }),
+            now,
+        );
+        let package = package_added(&effects).unwrap_or_else(|| panic!("no PackageAdded"));
+        let files: Vec<_> = state
+            .package(package)
+            .unwrap_or_else(|| panic!("no package"))
+            .files
+            .iter()
+            .map(|f| f.id)
+            .collect();
+        for (file, url) in files.iter().zip(urls) {
+            effects.extend(state.handle(
+                Input::ProbeDone {
+                    file: *file,
+                    result: ok_probe(url, size),
+                },
+                now,
+            ));
+        }
+        check_invariants(state);
+        (package, files, effects)
+    }
+
+    fn prepared(final_name: &str) -> Result<PreparedFile, crate::error::StorageError> {
+        Ok(PreparedFile {
+            final_name: final_name.to_string(),
+            frontiers_valid: true,
+        })
+    }
+
+    fn prepare_targets(effects: &[Effect]) -> Vec<crate::model::FileId> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::PrepareFile { file, .. } => Some(*file),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn started(effects: &[Effect]) -> Vec<(crate::model::FileId, LinkId)> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::StartAttempt { file, link, .. } => Some((*file, *link)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn status_count(state: &EngineState, status: FileStatus) -> usize {
+        state
+            .packages()
+            .iter()
+            .flat_map(|p| p.files.iter())
+            .filter(|f| f.status == status)
+            .count()
+    }
+
+    #[test]
+    fn a_probed_file_stays_queued_until_the_scheduler_needs_it() {
+        let mut state = EngineState::new(EngineConfig::default());
+        let now = Instant::now();
+        // No link yet: probing must not create placeholders.
+        let urls = vec!["http://h.example.com/a.bin".to_string()];
+        let (_, files, effects) = add_probed_package(&mut state, now, &urls, 1000);
+        assert!(prepare_targets(&effects).is_empty());
+        assert_eq!(
+            state.file(files[0]).map(|f| f.status.clone()),
+            Some(FileStatus::Queued)
+        );
+
+        // A link appears: now the file is activated.
+        let effects = state.handle(Input::LinksChanged(vec![link(1, "a0", 4)]), now);
+        assert_eq!(prepare_targets(&effects), files);
+        assert_eq!(
+            state.file(files[0]).map(|f| f.status.clone()),
+            Some(FileStatus::Preparing)
+        );
+    }
+
+    #[test]
+    fn many_small_files_are_activated_only_as_fast_as_slots_free_up() {
+        let mut state = EngineState::new(EngineConfig::default());
+        let now = Instant::now();
+        state.handle(Input::LinksChanged(vec![link(1, "a0", 4)]), now);
+        let urls: Vec<String> = (0..20)
+            .map(|i| format!("http://h{i}.example.com/f{i}.bin"))
+            .collect();
+        let (_, files, effects) = add_probed_package(&mut state, now, &urls, 1000);
+
+        // 4 slots → 4 files preparing; the other 16 wait, untouched.
+        assert_eq!(prepare_targets(&effects).len(), 4);
+        assert_eq!(status_count(&state, FileStatus::Preparing), 4);
+        assert_eq!(status_count(&state, FileStatus::Queued), 16);
+
+        // As each is prepared it takes exactly one slot.
+        let mut all_started = Vec::new();
+        for file in prepare_targets(&effects) {
+            let effects = state.handle(
+                Input::FilePrepared {
+                    file,
+                    result: prepared("f.bin"),
+                },
+                now,
+            );
+            all_started.extend(started(&effects));
+        }
+        check_invariants(&state);
+        assert_eq!(all_started.len(), 4);
+        let distinct: std::collections::HashSet<_> = all_started.iter().map(|(f, _)| *f).collect();
+        assert_eq!(distinct.len(), 4, "one slot per file");
+        assert_eq!(state.attempt_count(), 4);
+        assert_eq!(files.len(), 20);
+    }
+
+    #[test]
+    fn a_finished_file_frees_a_slot_that_activates_the_next() {
+        let mut state = EngineState::new(EngineConfig::default());
+        let now = Instant::now();
+        state.handle(Input::LinksChanged(vec![link(1, "a0", 1)]), now);
+        let urls: Vec<String> = (0..3)
+            .map(|i| format!("http://h{i}.example.com/f{i}.bin"))
+            .collect();
+        let (_, files, effects) = add_probed_package(&mut state, now, &urls, 1000);
+        assert_eq!(prepare_targets(&effects), [files[0]]);
+
+        let effects = state.handle(
+            Input::FilePrepared {
+                file: files[0],
+                result: prepared("f0.bin"),
+            },
+            now,
+        );
+        let (attempt, _) = find_start_attempt(&effects, files[0])
+            .unwrap_or_else(|| panic!("f0 should start: {effects:?}"));
+        let effects = finish(&mut state, now, attempt, 1000);
+        // The slot is free again → the next queued file is activated.
+        assert_eq!(prepare_targets(&effects), [files[1]]);
+    }
+
+    #[test]
+    fn a_single_big_file_gets_every_slot_on_every_link() {
+        let mut state = EngineState::new(EngineConfig::default());
+        let now = Instant::now();
+        state.handle(
+            Input::LinksChanged(vec![link(1, "a0", 8), link(2, "b0", 8)]),
+            now,
+        );
+        // 400 MiB → 50 blocks of 8 MiB, plenty for 16 slots.
+        let urls = vec!["http://h.example.com/big.bin".to_string()];
+        let (_, files, effects) = add_probed_package(&mut state, now, &urls, 400 * 1024 * 1024);
+        assert_eq!(prepare_targets(&effects), files);
+        let effects = state.handle(
+            Input::FilePrepared {
+                file: files[0],
+                result: prepared("big.bin"),
+            },
+            now,
+        );
+        let started = started(&effects);
+        assert_eq!(started.len(), 16, "past the soft cap: focus mode");
+        assert_eq!(started.iter().filter(|(_, l)| l.get() == 1).count(), 8);
+        assert_eq!(started.iter().filter(|(_, l)| l.get() == 2).count(), 8);
+    }
+
+    #[test]
+    fn a_mix_gives_the_big_file_its_soft_cap_and_the_rest_go_to_other_files() {
+        let mut state = EngineState::new(EngineConfig::default());
+        let now = Instant::now();
+        // Two links: a host allows 8 connections per link (§7.1), so one
+        // link alone could never give the big file more than 8.
+        state.handle(
+            Input::LinksChanged(vec![link(1, "a0", 8), link(2, "b0", 8)]),
+            now,
+        );
+        // The big file is first in the queue, then two small ones.
+        let (_, big, effects) = add_probed_package(
+            &mut state,
+            now,
+            &["http://big.example.com/big.bin".to_string()],
+            400 * 1024 * 1024,
+        );
+        let (_, small, _) = add_probed_package(
+            &mut state,
+            now,
+            &[
+                "http://s1.example.com/a.bin".to_string(),
+                "http://s2.example.com/b.bin".to_string(),
+            ],
+            1000,
+        );
+        // The big file was activated first (it was alone), then two more
+        // preparing for the leftover slots.
+        assert_eq!(prepare_targets(&effects), big);
+        let mut all = Vec::new();
+        for file in std::iter::once(big[0]).chain(small.iter().copied()) {
+            all.extend(started(&state.handle(
+                Input::FilePrepared {
+                    file,
+                    result: prepared("x.bin"),
+                },
+                now,
+            )));
+        }
+        check_invariants(&state);
+        let for_big = all.iter().filter(|(f, _)| *f == big[0]).count();
+        let for_small = all.iter().filter(|(f, _)| small.contains(f)).count();
+        assert_eq!(for_small, 2, "each small file takes a slot");
+        assert_eq!(state.attempt_count(), 16, "no slot idles while work exists");
+        assert_eq!(for_big, 14, "the big file fills the rest");
+    }
+
+    #[test]
+    fn a_host_active_file_limit_holds_back_activation() {
+        let mut config = EngineConfig::default();
+        config.hosts.add_rule(
+            "*.limited.example.com",
+            crate::config::HostLimits {
+                max_active_files: Some(1),
+                ..crate::config::HostLimits::default()
+            },
+        );
+        let mut state = EngineState::new(config);
+        let now = Instant::now();
+        state.handle(Input::LinksChanged(vec![link(1, "a0", 8)]), now);
+        let urls = vec![
+            "http://a.limited.example.com/1.bin".to_string(),
+            "http://a.limited.example.com/2.bin".to_string(),
+            "http://other.example.com/3.bin".to_string(),
+        ];
+        let (_, files, effects) = add_probed_package(&mut state, now, &urls, 1000);
+        // File 1 and the unrelated host's file activate; file 2 waits.
+        let mut targets = prepare_targets(&effects);
+        targets.sort();
+        assert_eq!(targets, [files[0], files[2]]);
+        assert_eq!(
+            state.file(files[1]).map(|f| f.status.clone()),
+            Some(FileStatus::Queued)
+        );
+    }
+
+    #[test]
+    fn a_paused_package_is_not_activated() {
+        let mut state = EngineState::new(EngineConfig::default());
+        let now = Instant::now();
+        let urls = vec!["http://h.example.com/a.bin".to_string()];
+        let (package, files, _) = add_probed_package(&mut state, now, &urls, 1000);
+        state.handle(Input::Command(Command::Pause(package)), now);
+        let effects = state.handle(Input::LinksChanged(vec![link(1, "a0", 4)]), now);
+        assert!(prepare_targets(&effects).is_empty());
+        assert_eq!(
+            state.file(files[0]).map(|f| f.status.clone()),
+            Some(FileStatus::Queued)
+        );
+        let effects = state.handle(Input::Command(Command::Resume(package)), now);
+        assert_eq!(prepare_targets(&effects), files);
+    }
+
+    // --- probe pool (P4.4) ---
+
+    fn probes(effects: &[Effect]) -> Vec<crate::model::FileId> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::Probe { file, .. } => Some(*file),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn pasting_many_links_never_exceeds_the_probe_caps() {
+        let config = EngineConfig {
+            max_concurrent_probes: 5,
+            max_probes_per_host: 5,
+            ..EngineConfig::default()
+        };
+        let mut state = EngineState::new(config);
+        let now = Instant::now();
+        let sources: Vec<String> = (0..500)
+            .map(|i| format!("http://host{}.example.com/f{i}.bin", i % 50))
+            .collect();
+        let effects = state.handle(
+            Input::Command(Command::AddPackage {
+                name: "many".to_string(),
+                dest_dir: std::path::PathBuf::from("/tmp/nuxd-sim"),
+                sources,
+                priority: Priority::Normal,
+            }),
+            now,
+        );
+        let mut in_flight = probes(&effects);
+        assert_eq!(in_flight.len(), 5, "only the pool's worth start at once");
+
+        // Each finished probe releases exactly one more, never more than 5.
+        let mut done = 0;
+        while let Some(file) = in_flight.pop() {
+            let effects = state.handle(
+                Input::ProbeDone {
+                    file,
+                    result: ok_probe("http://x.example.com/f", 1000),
+                },
+                now,
+            );
+            done += 1;
+            in_flight.extend(probes(&effects));
+            assert!(in_flight.len() <= 5, "pool exceeded: {}", in_flight.len());
+        }
+        assert_eq!(done, 500, "every file gets probed exactly once");
+    }
+
+    #[test]
+    fn probes_to_one_host_are_capped_separately() {
+        let config = EngineConfig {
+            max_concurrent_probes: 8,
+            max_probes_per_host: 2,
+            ..EngineConfig::default()
+        };
+        let mut state = EngineState::new(config);
+        let now = Instant::now();
+        // Ten files on one host, then one on another.
+        let mut sources: Vec<String> = (0..10)
+            .map(|i| format!("http://same.example.com/f{i}.bin"))
+            .collect();
+        sources.push("http://other.example.com/o.bin".to_string());
+        let effects = state.handle(
+            Input::Command(Command::AddPackage {
+                name: "p".to_string(),
+                dest_dir: std::path::PathBuf::from("/tmp/nuxd-sim"),
+                sources,
+                priority: Priority::Normal,
+            }),
+            now,
+        );
+        // 2 for the crowded host, and the other host isn't starved.
+        assert_eq!(probes(&effects).len(), 3);
+    }
+
+    #[test]
+    fn a_paused_package_is_not_probed() {
+        let mut state = EngineState::new(EngineConfig::default());
+        let now = Instant::now();
+        let (package, _) = add_single_file(&mut state, now, "http://a.example.com/a.bin");
+        // The add already issued its probe; pause and add another file's
+        // package — nothing new is probed while paused.
+        state.handle(Input::Command(Command::Pause(package)), now);
+        let effects = state.handle(
+            Input::Tick {
+                progress: Vec::new(),
+            },
+            now,
+        );
+        assert!(probes(&effects).is_empty());
+    }
+
+    #[test]
+    fn add_probed_skips_probing_and_queues_the_files() {
+        let mut state = EngineState::new(EngineConfig::default());
+        state.handle(Input::LinksChanged(vec![link(1, "a0", 1)]), Instant::now());
+        let now = Instant::now();
+        let good = crate::engine::ProbedInput {
+            source: "http://a.example.com/a.bin".to_string(),
+            probe: ok_probe("http://a.example.com/a.bin", 1000).map_err(|e| e.to_string()),
+        };
+        let bad = crate::engine::ProbedInput {
+            source: "http://a.example.com/gone.bin".to_string(),
+            probe: Err("404".to_string()),
+        };
+        let effects = state.handle(
+            Input::Command(Command::AddProbed {
+                name: "drafted".to_string(),
+                dest_dir: std::path::PathBuf::from("/tmp/nuxd-sim"),
+                files: vec![good, bad],
+                priority: Priority::Normal,
+            }),
+            now,
+        );
+        assert!(probes(&effects).is_empty(), "already probed");
+        let package = package_added(&effects).unwrap();
+        let files = &state.package(package).unwrap().files;
+        assert_eq!(files.len(), 2);
+        // The good one goes straight to activation (a slot is free).
+        assert_eq!(files[0].status, FileStatus::Preparing);
+        assert!(matches!(files[1].status, FileStatus::Failed(_)));
+        assert!(!prepare_targets(&effects).is_empty());
+        check_invariants(&state);
+    }
+
+    // --- re-resolve on 403/410 (P4.5) ---
+
+    fn status_failure(
+        state: &mut EngineState,
+        now: Instant,
+        attempt: crate::model::AttemptId,
+        position: u64,
+        code: u16,
+    ) -> Vec<Effect> {
+        let effects = state.handle(
+            Input::AttemptEnded {
+                id: attempt,
+                outcome: AttemptOutcome::Failed(TransferError::Status(code)),
+                position,
+            },
+            now,
+        );
+        check_invariants(state);
+        effects
+    }
+
+    #[test]
+    fn an_expired_link_is_re_resolved_once_and_the_download_continues() {
+        for code in [403, 410] {
+            let mut state = EngineState::new(EngineConfig::default());
+            let now = Instant::now();
+            state.handle(Input::LinksChanged(vec![link(1, "a0", 4)]), now);
+            let (_, file) = add_single_file(&mut state, now, "http://old.example.com/f.bin");
+            let (attempt, range) =
+                activate_and_start(&mut state, now, file, "http://old.example.com/f.bin", 1000);
+
+            let effects = status_failure(&mut state, now, attempt, range.start, code);
+            assert!(
+                effects.iter().any(|e| matches!(
+                    e,
+                    Effect::Reresolve { file: f, source } if *f == file && source == "http://old.example.com/f.bin"
+                )),
+                "{code} should trigger a re-resolve: {effects:?}"
+            );
+            assert!(
+                find_start_attempt(&effects, file).is_none(),
+                "waits for the answer"
+            );
+            assert_eq!(state.block_retries(file, 0), 0);
+            assert!(!matches!(
+                state.file(file).map(|f| f.status.clone()),
+                Some(FileStatus::Failed(_))
+            ));
+
+            // A fresh URL comes back: the block restarts against it.
+            let fresh = ok_probe("http://new.example.com/f.bin?sig=2", 1000).unwrap();
+            let effects = state.handle(
+                Input::Reresolved {
+                    file,
+                    result: Ok(fresh),
+                },
+                now,
+            );
+            let started = effects.iter().find_map(|e| match e {
+                Effect::StartAttempt { url, .. } => Some(url.to_string()),
+                _ => None,
+            });
+            assert_eq!(
+                started.as_deref(),
+                Some("http://new.example.com/f.bin?sig=2")
+            );
+        }
+    }
+
+    #[test]
+    fn a_second_expiry_fails_the_file() {
+        let mut state = EngineState::new(EngineConfig::default());
+        let now = Instant::now();
+        state.handle(Input::LinksChanged(vec![link(1, "a0", 4)]), now);
+        let (_, file) = add_single_file(&mut state, now, "http://old.example.com/f.bin");
+        let (attempt, range) =
+            activate_and_start(&mut state, now, file, "http://old.example.com/f.bin", 1000);
+        status_failure(&mut state, now, attempt, range.start, 403);
+        let effects = state.handle(
+            Input::Reresolved {
+                file,
+                result: ok_probe("http://old.example.com/f.bin", 1000).map_err(|e| e.to_string()),
+            },
+            now,
+        );
+        let (again, _) = find_start_attempt(&effects, file).unwrap();
+        let effects = status_failure(&mut state, now, again, range.start, 403);
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::Reresolve { .. })),
+            "only one re-resolve per file"
+        );
+        assert!(matches!(
+            state.file(file).map(|f| f.status.clone()),
+            Some(FileStatus::Failed(_))
+        ));
+    }
+
+    #[test]
+    fn a_failed_re_resolve_or_a_changed_size_fails_the_file() {
+        for result in [
+            Err("gone".to_string()),
+            ok_probe("http://old.example.com/f.bin", 999_999).map_err(|e| e.to_string()),
+        ] {
+            let mut state = EngineState::new(EngineConfig::default());
+            let now = Instant::now();
+            state.handle(Input::LinksChanged(vec![link(1, "a0", 4)]), now);
+            let (_, file) = add_single_file(&mut state, now, "http://old.example.com/f.bin");
+            let (attempt, range) =
+                activate_and_start(&mut state, now, file, "http://old.example.com/f.bin", 1000);
+            status_failure(&mut state, now, attempt, range.start, 410);
+            state.handle(Input::Reresolved { file, result }, now);
+            assert!(matches!(
+                state.file(file).map(|f| f.status.clone()),
+                Some(FileStatus::Failed(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn a_non_http_scheme_becomes_a_failed_file_not_a_probe() {
+        let mut state = EngineState::new(EngineConfig::default());
+        let now = Instant::now();
+        let effects = state.handle(
+            Input::Command(Command::AddPackage {
+                name: "p".to_string(),
+                dest_dir: std::path::PathBuf::from("/tmp/nuxd-sim"),
+                sources: vec!["ftp://example.com/a.bin".to_string()],
+                priority: Priority::Normal,
+            }),
+            now,
+        );
+        assert!(probes(&effects).is_empty());
+        let package = package_added(&effects).unwrap();
+        let status = state.package(package).unwrap().files[0].status.clone();
+        assert!(
+            matches!(&status, FileStatus::Failed(e) if e.to_string().contains("ftp")),
+            "{status:?}"
+        );
+    }
+
+    // --- remote change (P4.6) ---
+
+    fn two_file_package(
+        state: &mut EngineState,
+        now: Instant,
+    ) -> (
+        crate::model::PackageId,
+        [crate::model::FileId; 2],
+        Vec<Effect>,
+    ) {
+        let urls = vec![
+            "http://a.example.com/a.bin".to_string(),
+            "http://b.example.com/b.bin".to_string(),
+        ];
+        let (package, files, mut effects) = add_probed_package(state, now, &urls, 1000);
+        for file in &files {
+            effects.extend(state.handle(
+                Input::FilePrepared {
+                    file: *file,
+                    result: prepared("x.bin"),
+                },
+                now,
+            ));
+        }
+        (package, [files[0], files[1]], effects)
+    }
+
+    #[test]
+    fn a_changed_file_fails_alone_and_the_rest_of_the_package_carries_on() {
+        let mut state = EngineState::new(EngineConfig::default());
+        let now = Instant::now();
+        state.handle(Input::LinksChanged(vec![link(1, "a0", 4)]), now);
+        let (package, [fa, fb], effects) = two_file_package(&mut state, now);
+        let (attempt_a, range_a) = find_start_attempt(&effects, fa).unwrap();
+        let (attempt_b, _) = find_start_attempt(&effects, fb).unwrap();
+
+        let effects = state.handle(
+            Input::AttemptEnded {
+                id: attempt_a,
+                outcome: AttemptOutcome::Failed(TransferError::RemoteChanged(
+                    "size changed".to_string(),
+                )),
+                position: range_a.start,
+            },
+            now,
+        );
+        check_invariants(&state);
+        assert!(matches!(
+            state.file(fa).map(|f| f.status.clone()),
+            Some(FileStatus::Failed(
+                crate::model::FileError::RemoteChanged { .. }
+            ))
+        ));
+        // Only that file: B is untouched and the package is still going.
+        assert_eq!(
+            state.file(fb).map(|f| f.status.clone()),
+            Some(FileStatus::Active)
+        );
+        assert_eq!(
+            state.package(package).map(|p| p.status.clone()),
+            Some(PackageStatus::Downloading)
+        );
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::AbortAttempt { .. }))
+        );
+
+        // B finishes; now every file has settled → the package fails.
+        finish(&mut state, now, attempt_b, 1000);
+        assert_eq!(
+            state.package(package).map(|p| p.status.clone()),
+            Some(PackageStatus::Failed(
+                crate::model::PackageError::FilesFailed
+            ))
+        );
+    }
+
+    #[test]
+    fn a_failed_file_stops_its_other_blocks() {
+        let mut state = EngineState::new(EngineConfig::default());
+        let now = Instant::now();
+        state.handle(Input::LinksChanged(vec![link(1, "a0", 4)]), now);
+        let (_, file) = add_single_file(&mut state, now, "http://big.example.com/big.bin");
+        state.handle(
+            Input::ProbeDone {
+                file,
+                result: ok_probe("http://big.example.com/big.bin", 64 * 1024 * 1024),
+            },
+            now,
+        );
+        let effects = state.handle(
+            Input::FilePrepared {
+                file,
+                result: prepared("big.bin"),
+            },
+            now,
+        );
+        let all: Vec<_> = effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::StartAttempt { id, range, .. } => Some((*id, range.start)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(all.len(), 4);
+        let effects = state.handle(
+            Input::AttemptEnded {
+                id: all[0].0,
+                outcome: AttemptOutcome::Failed(TransferError::RemoteChanged("changed".into())),
+                position: all[0].1,
+            },
+            now,
+        );
+        let aborted = effects
+            .iter()
+            .filter(|e| matches!(e, Effect::AbortAttempt { .. }))
+            .count();
+        assert_eq!(aborted, 3, "the file's other running blocks are stopped");
+        assert_eq!(state.attempt_count(), 0);
+    }
+
+    #[test]
+    fn restarting_a_failed_file_resets_it_and_revives_the_package() {
+        let mut state = EngineState::new(EngineConfig::default());
+        let now = Instant::now();
+        state.handle(Input::LinksChanged(vec![link(1, "a0", 4)]), now);
+        let (package, [fa, fb], effects) = two_file_package(&mut state, now);
+        let (attempt_a, range_a) = find_start_attempt(&effects, fa).unwrap();
+        let (attempt_b, _) = find_start_attempt(&effects, fb).unwrap();
+        state.handle(
+            Input::AttemptEnded {
+                id: attempt_a,
+                outcome: AttemptOutcome::Failed(TransferError::RemoteChanged("x".into())),
+                position: range_a.start,
+            },
+            now,
+        );
+        finish(&mut state, now, attempt_b, 1000);
+        assert!(matches!(
+            state.package(package).map(|p| p.status.clone()),
+            Some(PackageStatus::Failed(_))
+        ));
+
+        let effects = state.handle(Input::Command(Command::RestartFile(fa)), now);
+        check_invariants(&state);
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::DiscardFile { file, .. } if *file == fa))
+        );
+        assert!(effects.contains(&Effect::Emit(EngineEvent::FileRestarted { file: fa })));
+        let entry = state.file(fa).unwrap();
+        assert_eq!(entry.status, FileStatus::Unprobed);
+        assert!(entry.parts.is_empty() && entry.url.is_none() && entry.versions.is_empty());
+        assert_eq!(
+            state.package(package).map(|p| p.status.clone()),
+            Some(PackageStatus::Downloading)
+        );
+        // The probe pool takes it from here; B (verified) is untouched.
+        assert!(probes(&effects).contains(&fa));
+        assert_eq!(
+            state.file(fb).map(|f| f.status.clone()),
+            Some(FileStatus::Verified)
+        );
+    }
+
+    #[test]
+    fn restarting_a_file_that_has_not_failed_does_nothing() {
+        let mut state = EngineState::new(EngineConfig::default());
+        let now = Instant::now();
+        state.handle(Input::LinksChanged(vec![link(1, "a0", 4)]), now);
+        let (_, [fa, _], _) = two_file_package(&mut state, now);
+        assert!(
+            state
+                .handle(Input::Command(Command::RestartFile(fa)), now)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_confirmed_relabelling_adds_the_version_once() {
+        let mut state = EngineState::new(EngineConfig::default());
+        let now = Instant::now();
+        state.handle(Input::LinksChanged(vec![link(1, "a0", 4)]), now);
+        let (_, file) = add_single_file(&mut state, now, "http://a.example.com/f.bin");
+        activate_and_start(&mut state, now, file, "http://a.example.com/f.bin", 1000);
+        let relabelled = crate::model::FileVersion {
+            etag: Some("\"other\"".to_string()),
+            last_modified: None,
+            total_bytes: 1000,
+        };
+        for _ in 0..2 {
+            state.handle(
+                Input::VersionAccepted {
+                    file,
+                    version: relabelled.clone(),
+                },
+                now,
+            );
+        }
+        assert_eq!(state.file(file).unwrap().versions.len(), 2);
     }
 }

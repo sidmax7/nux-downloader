@@ -48,8 +48,11 @@ impl Bars {
             bar.set_length(total);
             bar.set_position(durable);
             bar.set_message(status_word(&file.status));
-            if matches!(file.status, FileStatus::Verified | FileStatus::Failed(_)) {
-                bar.finish();
+            match file.status {
+                FileStatus::Verified => bar.finish(),
+                // `finish` would draw a failed file as full.
+                FileStatus::Failed(_) => bar.abandon(),
+                _ => {}
             }
         }
     }
@@ -99,7 +102,7 @@ impl Bars {
         }
         for bar in self.by_file.values() {
             if !bar.is_finished() {
-                bar.finish();
+                bar.abandon();
             }
         }
     }

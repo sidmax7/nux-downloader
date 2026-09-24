@@ -35,6 +35,13 @@ pub enum Fault {
     /// under ~40 KB/s so a stall test can outlast a timeout) this can
     /// model megabytes per second.
     Throttle(u64),
+    /// `429 Too Many Requests` with `Retry-After: <seconds>`, as a
+    /// rate-limiting server sends.
+    RateLimited(u64),
+    /// Wait this many milliseconds before answering, then serve the
+    /// request correctly — a slow server, for probe-pool and overlap
+    /// tests.
+    Delay(u64),
     /// Reply with this status and no body.
     Status(u16),
     /// Redirect to this URL (a `302`).

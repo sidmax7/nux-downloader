@@ -83,6 +83,17 @@ pub enum EngineEvent {
     PackageRemoved {
         package: PackageId,
     },
+    /// A failed file was reset and will be probed again.
+    FileRestarted {
+        file: FileId,
+    },
+    /// A package's priority changed (`Command::SetPriority`).
+    PackagePriorityChanged {
+        package: PackageId,
+    },
+    /// The queue order changed (`Command::MoveTo`); read the new order
+    /// from a snapshot.
+    QueueReordered,
     PackageFailed {
         package: PackageId,
         error: PackageError,
@@ -103,6 +114,19 @@ pub enum Effect {
     PrepareFile {
         file: FileId,
         plan: FilePrep,
+    },
+    /// Deletes a restarted file's partial data and placeholder (the file
+    /// is being started over). Fire-and-forget.
+    DiscardFile {
+        file: FileId,
+        dest_dir: PathBuf,
+        name: String,
+    },
+    /// Resolve and probe `source` again (§13): a `403`/`410` on a signed
+    /// URL means it expired. Reported back as `Input::Reresolved`.
+    Reresolve {
+        file: FileId,
+        source: String,
     },
     StartAttempt {
         id: crate::model::AttemptId,

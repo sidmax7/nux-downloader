@@ -188,9 +188,22 @@ fn pick_pass(
 /// stays free until the next state change.
 #[must_use]
 pub fn pick_work(view: &SchedulerView<'_>, link: LinkId) -> Option<Work> {
+    pick_spread(view, link).or_else(|| pick_focus(view, link))
+}
+
+/// Pass 1 alone (§7.2): spread across files, soft per-file cap enforced.
+/// The engine tries this first, then activates a queued file (§7.3) if
+/// one could use the slot, and only then falls back to `pick_focus`.
+#[must_use]
+pub fn pick_spread(view: &SchedulerView<'_>, link: LinkId) -> Option<Work> {
     pick_pass(view, link, true, true)
-        .or_else(|| pick_pass(view, link, false, true))
-        .or_else(|| pick_pass(view, link, false, false))
+}
+
+/// Pass 2 (focus) and the avoid-rule fallback: the soft per-file cap is
+/// dropped, so a lone big file can take every slot.
+#[must_use]
+pub fn pick_focus(view: &SchedulerView<'_>, link: LinkId) -> Option<Work> {
+    pick_pass(view, link, false, true).or_else(|| pick_pass(view, link, false, false))
 }
 
 #[cfg(test)]

@@ -3,13 +3,15 @@
 //! queue manifest and the data directory, and otherwise just forwards to
 //! a `Driver`.
 
+use crate::collect::PackageDraft;
 use crate::config::EngineConfig;
 use crate::driver::Driver;
-use crate::engine::{Command, EngineEvent, EngineSnapshot, EngineState};
+use crate::engine::{Command, EngineEvent, EngineSnapshot, EngineState, ProbedInput};
 use crate::error::{EngineError, StorageError};
-use crate::model::{Link, LinkId, LinkKind, PackageId, Priority};
+use crate::model::{FileId, Link, LinkId, LinkKind, PackageId, Priority};
 use crate::net::bind::BindPolicy;
 use crate::net::monitor::LinkSetup;
+use crate::resolve::Registry;
 use crate::storage::manifest::{
     QUEUE_SCHEMA_VERSION, QueueManifest, QueueSettings, load_all_package_manifests,
     load_queue_manifest, save_queue_manifest,
@@ -47,6 +49,9 @@ pub struct Engine {
     driver: Driver,
     manifest_dir: PathBuf,
     queue_path: PathBuf,
+    config: EngineConfig,
+    registry: Registry,
+    client: reqwest::Client,
 }
 
 /// The single synthetic link `Engine::start` uses (`ARCHITECTURE.md`
@@ -109,6 +114,33 @@ impl Engine {
         data_dir: Option<PathBuf>,
         links: LinkSetup,
     ) -> Result<Self, EngineError> {
+        Self::start_inner(config, data_dir, links, false).await
+    }
+
+    /// Opens the queue for management only — adding, listing, pausing,
+    /// reordering, removing — without starting anything: no probes, no
+    /// transfers, and nothing that wasn't touched is rewritten. Used by
+    /// commands that must not begin downloading as a side effect
+    /// (`nuxd add`, `nuxd queue`, …). Two processes on one data
+    /// directory at once is not protected against yet (a lock file is
+    /// Phase 8).
+    pub async fn open_offline(
+        config: EngineConfig,
+        data_dir: Option<PathBuf>,
+    ) -> Result<Self, EngineError> {
+        let links = LinkSetup::Fixed {
+            links: Vec::new(),
+            bind: BindPolicy::Off,
+        };
+        Self::start_inner(config, data_dir, links, true).await
+    }
+
+    async fn start_inner(
+        config: EngineConfig,
+        data_dir: Option<PathBuf>,
+        links: LinkSetup,
+        offline: bool,
+    ) -> Result<Self, EngineError> {
         let data_dir = match data_dir {
             Some(dir) => dir,
             None => {
@@ -147,14 +179,74 @@ impl Engine {
             .map(|manifest| manifest.package)
             .collect();
 
-        let (state, initial_effects) = EngineState::restore(config, &queue, packages);
+        let client = crate::net::client::build_default_client(&config)?;
+        let engine_config = config.clone();
+        let (state, initial_effects) = if offline {
+            (
+                EngineState::restore_offline(config, &queue, packages),
+                Vec::new(),
+            )
+        } else {
+            EngineState::restore(config, &queue, packages)
+        };
         let driver = Driver::spawn_with(state, initial_effects, links, manifest_dir.clone());
 
         Ok(Self {
             driver,
             manifest_dir,
             queue_path,
+            config: engine_config,
+            registry: Registry::default(),
+            client,
         })
+    }
+
+    /// The collect stage (§5): resolves and probes `inputs` on the
+    /// bounded probe pool and returns drafts to review. Nothing is queued
+    /// until `enqueue`.
+    pub async fn collect(&self, inputs: Vec<String>) -> Vec<PackageDraft> {
+        crate::collect::collect(
+            inputs,
+            &self.config,
+            &self.registry,
+            &self.client,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+    }
+
+    /// Queues a reviewed draft. Its files are already probed, so nothing
+    /// is probed again.
+    pub async fn enqueue(
+        &self,
+        draft: PackageDraft,
+        opts: AddOptions,
+    ) -> Result<PackageId, EngineError> {
+        let mut events = self.driver.subscribe();
+        self.driver
+            .command(Command::AddProbed {
+                name: opts.name,
+                dest_dir: opts.dest_dir,
+                files: draft
+                    .files
+                    .into_iter()
+                    .map(|file| ProbedInput {
+                        source: file.source,
+                        probe: file.probe,
+                    })
+                    .collect(),
+                priority: opts.priority,
+            })
+            .await
+            .map_err(|_| shutdown_error())?;
+        let package = wait_for(&mut events, |event| match event {
+            EngineEvent::PackageAdded { package } => Some(*package),
+            _ => None,
+        })
+        .await
+        .ok_or_else(shutdown_error)?;
+        self.save_queue().await?;
+        Ok(package)
     }
 
     /// Adds one package containing one file per source URL, and returns
@@ -222,16 +314,112 @@ impl Engine {
                         std::fs::remove_file(crate::driver::prepare::part_path_for(&final_path));
                 }
             }
+            let mut events = self.driver.subscribe();
             self.driver
                 .command(Command::Remove(id))
                 .await
                 .map_err(|_| shutdown_error())?;
+            // `PackageRemoved` is announced after any checkpoint still
+            // queued for the package, so deleting its manifest now can't
+            // be undone by a late write.
+            if package.is_some() {
+                let _ = wait_for(&mut events, |event| match event {
+                    EngineEvent::PackageRemoved { package } if *package == id => Some(()),
+                    _ => None,
+                })
+                .await;
+            }
             let _ = std::fs::remove_file(crate::driver::prepare::manifest_path(
                 &self.manifest_dir,
                 id,
             ));
         }
 
+        self.save_queue().await
+    }
+
+    /// Starts a failed file over (§10): discards its partial data and
+    /// probes it again. Other files in its package are unaffected.
+    pub async fn restart_file(&self, file: FileId) -> Result<(), EngineError> {
+        let snapshot = self.snapshot().await;
+        let entry = snapshot
+            .packages
+            .iter()
+            .flat_map(|package| package.files.iter())
+            .find(|entry| entry.id == file)
+            .ok_or(EngineError::UnknownFile(file))?;
+        if !matches!(entry.status, crate::model::FileStatus::Failed(_)) {
+            return Ok(());
+        }
+        let mut events = self.driver.subscribe();
+        self.driver
+            .command(Command::RestartFile(file))
+            .await
+            .map_err(|_| shutdown_error())?;
+        wait_for(&mut events, |event| match event {
+            EngineEvent::FileRestarted { file: f } if *f == file => Some(()),
+            _ => None,
+        })
+        .await
+        .ok_or_else(shutdown_error)
+    }
+
+    /// Changes a package's priority. Running transfers aren't
+    /// interrupted; the next free slot follows the new order (§7.2).
+    pub async fn set_priority(&self, id: PackageId, priority: Priority) -> Result<(), EngineError> {
+        let snapshot = self.snapshot().await;
+        let package = snapshot
+            .packages
+            .iter()
+            .find(|package| package.id == id)
+            .ok_or(EngineError::UnknownPackage(id))?;
+        if package.priority == priority {
+            return Ok(());
+        }
+        let mut events = self.driver.subscribe();
+        self.driver
+            .command(Command::SetPriority {
+                package: id,
+                priority,
+            })
+            .await
+            .map_err(|_| shutdown_error())?;
+        // The engine checkpoints the package's manifest (which holds its
+        // priority) before announcing the change.
+        wait_for(&mut events, |event| match event {
+            EngineEvent::PackagePriorityChanged { package } if *package == id => Some(()),
+            _ => None,
+        })
+        .await
+        .ok_or_else(shutdown_error)
+    }
+
+    /// Moves a package to `position` in the queue (0 = front; anything
+    /// past the end means the back) and saves the new order.
+    pub async fn move_to(&self, id: PackageId, position: usize) -> Result<(), EngineError> {
+        let snapshot = self.snapshot().await;
+        let current = snapshot
+            .packages
+            .iter()
+            .position(|package| package.id == id)
+            .ok_or(EngineError::UnknownPackage(id))?;
+        if current == position.min(snapshot.packages.len() - 1) {
+            return Ok(());
+        }
+        let mut events = self.driver.subscribe();
+        self.driver
+            .command(Command::MoveTo {
+                package: id,
+                position,
+            })
+            .await
+            .map_err(|_| shutdown_error())?;
+        wait_for(&mut events, |event| match event {
+            EngineEvent::QueueReordered => Some(()),
+            _ => None,
+        })
+        .await
+        .ok_or_else(shutdown_error)?;
         self.save_queue().await
     }
 

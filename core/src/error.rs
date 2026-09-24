@@ -50,6 +50,18 @@ pub enum ProbeError {
     /// `bytes */0` (an empty file, §5).
     #[error("unexpected probe response status: {status}")]
     UnexpectedStatus { status: u16 },
+    /// `429`/`503`: the host is busy or rate-limiting us, not refusing
+    /// the file. `retry_after` is its `Retry-After`, if it sent one in
+    /// seconds.
+    #[error("server is busy ({status}){}", retry_after_note(*retry_after))]
+    Busy {
+        status: u16,
+        retry_after: Option<std::time::Duration>,
+    },
+}
+
+fn retry_after_note(retry_after: Option<std::time::Duration>) -> String {
+    retry_after.map_or_else(String::new, |d| format!(", retry after {}s", d.as_secs()))
 }
 
 /// One transfer attempt's failure modes (`driver::transfer`, Phase 2).
@@ -82,6 +94,13 @@ pub enum TransferError {
     /// Any HTTP status not covered by a more specific variant above.
     #[error("server responded {0}")]
     Status(u16),
+    /// `429`/`503`: the host is busy or rate-limiting this client. See
+    /// `ProbeError::Busy`.
+    #[error("server is busy ({status}){}", retry_after_note(*retry_after))]
+    Busy {
+        status: u16,
+        retry_after: Option<std::time::Duration>,
+    },
     /// The remote file's version no longer matches what this download
     /// accepted (§10) — a size change, or an unresolvable validator
     /// mismatch.
@@ -154,7 +173,20 @@ pub enum ExtractError {}
 
 /// The `LinkResolver` registry and `DirectUrl` (`resolve`, Phase 4).
 #[derive(Debug, Error)]
-pub enum ResolveError {}
+pub enum ResolveError {
+    /// Not something a URL can be made of.
+    #[error("not a valid URL: {input}")]
+    InvalidUrl { input: String },
+    /// A URL, but not one this tool downloads (`http`/`https` only).
+    #[error("unsupported scheme `{scheme}` in {input}")]
+    UnsupportedScheme { input: String, scheme: String },
+    /// No registered resolver claimed the input.
+    #[error("nothing can resolve {input}")]
+    NoResolver { input: String },
+    /// A resolver claimed the input but couldn't produce links.
+    #[error("couldn't resolve {input}: {detail}")]
+    Failed { input: String, detail: String },
+}
 
 /// The public API boundary's error type (`Engine`'s methods, §15).
 #[derive(Debug, Error)]
@@ -171,6 +203,12 @@ pub enum EngineError {
     Extract(#[from] ExtractError),
     #[error(transparent)]
     Resolve(#[from] ResolveError),
+    /// A command named a package the engine doesn't have (never added, or
+    /// already removed).
+    #[error("no such package: {0}")]
+    UnknownPackage(crate::model::PackageId),
+    #[error("no such file: {0}")]
+    UnknownFile(crate::model::FileId),
 }
 
 /// Who a transfer failure counts against (§16) — decides whether a
@@ -210,7 +248,7 @@ pub fn blame(error: &TransferError) -> Blame {
         | TransferError::MissingContentRange => Blame::Attempt,
 
         TransferError::Status(416 | 404 | 403 | 410) => Blame::File,
-        TransferError::Status(429 | 503) => Blame::Host,
+        TransferError::Status(429 | 503) | TransferError::Busy { .. } => Blame::Host,
         // Any status the table doesn't name.
         TransferError::Status(_) => Blame::Attempt,
 
@@ -275,6 +313,16 @@ mod tests {
             blame(&TransferError::RemoteChanged("size differs".into())),
             Blame::File
         );
+    }
+
+    #[test]
+    fn busy_blames_the_host() {
+        let busy = TransferError::Busy {
+            status: 429,
+            retry_after: Some(std::time::Duration::from_secs(10)),
+        };
+        assert_eq!(blame(&busy), Blame::Host);
+        assert_eq!(busy.to_string(), "server is busy (429), retry after 10s");
     }
 
     #[test]

@@ -70,6 +70,34 @@ impl HostPolicy {
         self
     }
 
+    /// Adds a rule from `PATTERN=CONNS[:FILES]` text (the CLI's
+    /// `--host-limit`): `CONNS` is the per-link connection cap and the
+    /// optional `FILES` the cap on files active at once, e.g.
+    /// `*.example.com=4:2`. Unspecified parts keep the defaults.
+    pub fn add_rule_text(&mut self, text: &str) -> Result<&mut Self, String> {
+        let (pattern, limits) = text
+            .split_once('=')
+            .ok_or_else(|| format!("expected PATTERN=CONNS[:FILES], got `{text}`"))?;
+        if pattern.trim().is_empty() {
+            return Err(format!("empty host pattern in `{text}`"));
+        }
+        let (conns, files) = match limits.split_once(':') {
+            Some((conns, files)) => (conns, Some(files)),
+            None => (limits, None),
+        };
+        let parse = |what: &str, value: &str| -> Result<u32, String> {
+            match value.trim().parse::<u32>() {
+                Ok(n) if n >= 1 => Ok(n),
+                _ => Err(format!("{what} must be a whole number ≥ 1, got `{value}`")),
+            }
+        };
+        let limits = HostLimits {
+            max_connections_per_link: parse("connections", conns)?,
+            max_active_files: files.map(|f| parse("files", f)).transpose()?,
+        };
+        Ok(self.add_rule(pattern.trim(), limits))
+    }
+
     /// The limits that apply to `host`. When several rules match, the
     /// most specific one wins: specificity is the count of non-`*`
     /// characters in the pattern (a longer literal match beats a
@@ -135,6 +163,11 @@ pub struct EngineConfig {
     // --- Slots and constraints (§7.1) ---
     pub slots_per_link: u8,
     pub max_connections_total: u32,
+    /// Probes (`Range: bytes=0-0` requests) in flight at once, so pasting
+    /// hundreds of links doesn't open hundreds of connections (§5).
+    pub max_concurrent_probes: u32,
+    /// Probes in flight at once to one host.
+    pub max_probes_per_host: u32,
     pub soft_max_connections_per_file: u32,
 
     // --- Block planning (§7.4) ---
@@ -191,6 +224,8 @@ impl Default for EngineConfig {
         Self {
             slots_per_link: 8,
             max_connections_total: 32,
+            max_concurrent_probes: 8,
+            max_probes_per_host: 2,
             soft_max_connections_per_file: 8,
 
             single_block_threshold_bytes: 4 * 1024 * 1024,
@@ -236,6 +271,32 @@ impl Default for EngineConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rule_text_sets_connections_and_optionally_files() {
+        let mut policy = HostPolicy::default();
+        policy.add_rule_text("*.example.com=4:2").unwrap();
+        policy.add_rule_text("plain.org=3").unwrap();
+        let a = policy.limits_for("cdn.example.com");
+        assert_eq!(
+            (a.max_connections_per_link, a.max_active_files),
+            (4, Some(2))
+        );
+        let b = policy.limits_for("plain.org");
+        assert_eq!((b.max_connections_per_link, b.max_active_files), (3, None));
+        assert_eq!(policy.limits_for("other.net"), HostLimits::default());
+    }
+
+    #[test]
+    fn rule_text_rejects_nonsense() {
+        let mut policy = HostPolicy::default();
+        for bad in ["nope", "=4", "a.com=0", "a.com=x", "a.com=2:0", "a.com=2:y"] {
+            assert!(
+                policy.add_rule_text(bad).is_err(),
+                "{bad} should be rejected"
+            );
+        }
+    }
 
     #[test]
     fn defaults_match_the_architecture_table() {

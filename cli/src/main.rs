@@ -1,13 +1,14 @@
 //! `nuxd`: thin CLI over `nuxd-core` (`ARCHITECTURE.md` §15). The primary
 //! way to exercise the engine before the Tauri UI exists (Phase 6).
 
+mod manage;
 mod progress;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use nuxd_core::config::EngineConfig;
-use nuxd_core::model::{PackageId, PackageStatus};
+use nuxd_core::model::{FileId, FileStatus, PackageId, PackageStatus, Priority};
 use nuxd_core::net::monitor::{self, LinkSetup, MonitorSetup};
-use nuxd_core::{AddOptions, Engine};
+use nuxd_core::{AddOptions, Engine, Target};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
@@ -38,6 +39,34 @@ struct Cli {
     /// the OS route every connection.
     #[arg(long, global = true)]
     unbound: bool,
+    /// Limit connections to a host: `PATTERN=CONNS[:FILES]` — CONNS
+    /// connections per link and, optionally, at most FILES files active at
+    /// once; `*` matches any run of characters (`*.example.com=4:2`).
+    /// Repeatable. Applies to commands that download.
+    #[arg(
+        long = "host-limit",
+        global = true,
+        value_name = "PATTERN=CONNS[:FILES]"
+    )]
+    host_limits: Vec<String>,
+}
+
+/// Priority levels as typed on the command line.
+#[derive(Clone, Copy, ValueEnum)]
+enum PriorityArg {
+    Low,
+    Normal,
+    High,
+}
+
+impl From<PriorityArg> for Priority {
+    fn from(arg: PriorityArg) -> Self {
+        match arg {
+            PriorityArg::Low => Self::Low,
+            PriorityArg::Normal => Self::Normal,
+            PriorityArg::High => Self::High,
+        }
+    }
 }
 
 /// The global options that shape how the engine starts.
@@ -45,6 +74,7 @@ struct StartOpts {
     data_dir: Option<PathBuf>,
     write_buffer_bytes: Option<usize>,
     unbound: bool,
+    host_limits: Vec<String>,
     /// Restrict to these interface names (`get --links`).
     only_links: Option<Vec<String>>,
 }
@@ -67,20 +97,70 @@ enum Command {
     },
     /// Lists the network links (interfaces) downloads can use.
     Links,
-    /// Lists every package the engine knows about.
-    List,
-    /// Resumes any interrupted packages and waits for them to finish.
-    Resume,
+    /// Adds URLs to the queue as one package without downloading them.
+    /// URLs come from the arguments, `-i FILE` (`-` for stdin), or stdin
+    /// when it is piped. Run `nuxd resume` to download the queue.
+    Add {
+        urls: Vec<String>,
+        /// A file with one link per line (`#` comments and blank lines are
+        /// skipped); `-` reads stdin.
+        #[arg(short = 'i', long = "input", value_name = "FILE")]
+        input: Option<PathBuf>,
+        /// Destination directory (default: the current directory).
+        #[arg(short = 'o', long = "output", value_name = "DIR")]
+        output: Option<PathBuf>,
+        /// Package name (default: the first file's name).
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long, value_enum, default_value = "normal")]
+        priority: PriorityArg,
+    },
+    /// Lists the queue: every package with its priority, status and
+    /// progress (`-v` adds each file).
+    #[command(alias = "list")]
+    Queue {
+        #[arg(short, long)]
+        verbose: bool,
+    },
+    /// Pauses a package (its id from `nuxd queue`) or `all`.
+    Pause { target: String },
+    /// Downloads the queue: resumes the given packages (or every paused or
+    /// interrupted one) and waits for them to finish.
+    Resume { targets: Vec<String> },
+    /// Removes a package (id) or `all` from the queue; `--delete-files`
+    /// also deletes what was downloaded.
+    Remove {
+        target: String,
+        #[arg(long)]
+        delete_files: bool,
+    },
+    /// Sets a package's priority.
+    Priority {
+        id: u64,
+        #[arg(value_enum)]
+        level: PriorityArg,
+    },
+    /// Moves a package in the queue to `top`, `bottom`, or a 1-based
+    /// position.
+    Move { id: u64, position: String },
+    /// Starts a failed file over from scratch (its id from
+    /// `nuxd queue -v`); `nuxd resume` then downloads it again.
+    RestartFile { file: u64 },
 }
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let _ = tracing_subscriber::fmt::try_init();
+    // `RUST_LOG=nuxd_core=debug nuxd get … 2>log.txt` shows every failed
+    // attempt and host backoff; the default shows warnings only.
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
+    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
     let cli = Cli::parse();
     let opts = StartOpts {
         data_dir: cli.data_dir,
         write_buffer_bytes: cli.write_buffer_bytes,
         unbound: cli.unbound,
+        host_limits: cli.host_limits,
         only_links: None,
     };
     let mut opts = opts;
@@ -94,15 +174,54 @@ async fn main() -> ExitCode {
             run_get(urls, output, opts).await
         }
         Command::Links => run_links().await,
-        Command::List => run_list(opts).await,
-        Command::Resume => run_resume(opts).await,
+        Command::Add {
+            urls,
+            input,
+            output,
+            name,
+            priority,
+        } => manage::add(urls, input, output, name, priority.into(), opts.data_dir).await,
+        Command::Queue { verbose } => manage::queue(verbose, opts.data_dir).await,
+        Command::Pause { target } => match manage::parse_target(&target) {
+            Ok(target) => manage::pause(target, opts.data_dir).await,
+            Err(error) => usage(&error),
+        },
+        Command::Resume { targets } => run_resume(targets, opts).await,
+        Command::Remove {
+            target,
+            delete_files,
+        } => match manage::parse_target(&target) {
+            Ok(target) => manage::remove(target, delete_files, opts.data_dir).await,
+            Err(error) => usage(&error),
+        },
+        Command::Priority { id, level } => {
+            manage::set_priority(PackageId::new(id), level.into(), opts.data_dir).await
+        }
+        Command::Move { id, position } => match manage::parse_position(&position) {
+            Ok(position) => manage::move_to(PackageId::new(id), position, opts.data_dir).await,
+            Err(error) => usage(&error),
+        },
+        Command::RestartFile { file } => {
+            manage::restart_file(FileId::new(file), opts.data_dir).await
+        }
     }
+}
+
+fn usage(message: &str) -> ExitCode {
+    eprintln!("nuxd: {message}");
+    ExitCode::from(2)
 }
 
 async fn start_engine(opts: StartOpts) -> Option<Engine> {
     let mut config = EngineConfig::default();
     if let Some(write_buffer_bytes) = opts.write_buffer_bytes {
         config.write_buffer_bytes = write_buffer_bytes;
+    }
+    for rule in &opts.host_limits {
+        if let Err(error) = config.hosts.add_rule_text(rule) {
+            eprintln!("nuxd: --host-limit: {error}");
+            return None;
+        }
     }
     let started = if opts.unbound {
         Engine::start(config, opts.data_dir).await
@@ -228,10 +347,27 @@ async fn run_get(urls: Vec<String>, output: Option<PathBuf>, opts: StartOpts) ->
     wait_for_packages(engine, ids).await
 }
 
-async fn run_resume(opts: StartOpts) -> ExitCode {
+async fn run_resume(targets: Vec<String>, opts: StartOpts) -> ExitCode {
+    let mut wanted = Vec::new();
+    for text in &targets {
+        match manage::parse_target(text) {
+            Ok(target) => wanted.push(target),
+            Err(error) => return usage(&error),
+        }
+    }
     let Some(engine) = start_engine(opts).await else {
         return ExitCode::from(2);
     };
+    // No targets means the whole queue: un-pause everything, and anything
+    // that was mid-download is already running again.
+    if wanted.is_empty() {
+        wanted.push(Target::All);
+    }
+    for target in wanted {
+        if let Err(error) = engine.resume(target).await {
+            eprintln!("nuxd resume: {error}");
+        }
+    }
 
     let ids: Vec<PackageId> = engine
         .snapshot()
@@ -241,57 +377,19 @@ async fn run_resume(opts: StartOpts) -> ExitCode {
         .filter(|package| {
             !matches!(
                 package.status,
-                PackageStatus::Done | PackageStatus::Failed(_)
+                PackageStatus::Done | PackageStatus::Failed(_) | PackageStatus::Paused
             )
         })
         .map(|package| package.id)
         .collect();
 
     if ids.is_empty() {
-        println!("nuxd: nothing to resume");
+        println!("nuxd: nothing to download");
         engine.shutdown().await;
         return ExitCode::SUCCESS;
     }
 
     wait_for_packages(engine, ids).await
-}
-
-async fn run_list(opts: StartOpts) -> ExitCode {
-    let Some(engine) = start_engine(opts).await else {
-        return ExitCode::from(2);
-    };
-    let snapshot = engine.snapshot().await;
-    if snapshot.packages.is_empty() {
-        println!("nuxd: no packages");
-    }
-    for package in &snapshot.packages {
-        let total: u64 = package
-            .files
-            .iter()
-            .filter_map(|file| file.expected_size)
-            .sum();
-        let durable: u64 = package
-            .files
-            .iter()
-            .flat_map(|file| file.parts.iter())
-            .map(|part| part.durable)
-            .sum();
-        println!(
-            "{:>4}  {:<10?}  {:>5} file(s)  {:>10} / {:<10}  {}",
-            package.id,
-            package.status,
-            package.files.len(),
-            durable,
-            if total == 0 {
-                "?".to_string()
-            } else {
-                total.to_string()
-            },
-            package.name,
-        );
-    }
-    engine.shutdown().await;
-    ExitCode::SUCCESS
 }
 
 /// Watches `ids` until every one of them settles (`Done` or `Failed`),
@@ -335,6 +433,18 @@ async fn wait_for_packages(engine: Engine, ids: Vec<PackageId>) -> ExitCode {
     }
 
     bars.finish();
+    // Say why, not just "failed".
+    let snapshot = engine.snapshot().await;
+    for package in snapshot.packages.iter().filter(|p| ids.contains(&p.id)) {
+        for file in &package.files {
+            if let FileStatus::Failed(error) = &file.status {
+                eprintln!("nuxd: {}: {error}", file.name);
+            }
+        }
+        if let PackageStatus::Failed(error) = &package.status {
+            eprintln!("nuxd: package {}: {error}", package.name);
+        }
+    }
     engine.shutdown().await;
     if all_ok {
         ExitCode::SUCCESS

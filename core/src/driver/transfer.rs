@@ -8,7 +8,7 @@ use crate::engine::AttemptOutcome;
 use crate::error::TransferError;
 use crate::model::{ByteRange, FileVersion};
 use crate::probe::parse_content_range;
-use crate::storage::file::write_at;
+use crate::storage::file::{read_at, write_at};
 use crate::version::{VersionCheck, compare};
 use reqwest::header::{CONTENT_LENGTH, CONTENT_RANGE, ETAG, LAST_MODIFIED, RANGE};
 use reqwest::{Client, Response, StatusCode};
@@ -31,13 +31,29 @@ pub struct AttemptSpec {
     /// The file's size as probed, if known — decides whether a request
     /// starting at byte 0 covers the whole file.
     pub expected_size: Option<u64>,
-    /// The version the download started on (§10), if the driver has it.
-    pub accepted: Option<FileVersion>,
+    /// Every version this download has accepted so far (§10) — the one it
+    /// started on, plus any later relabelling confirmed by sampling.
+    pub accepted: Vec<FileVersion>,
+    /// Durable regions of the file to compare against fresh server bytes
+    /// when a response's validators differ (§10). Empty when nothing is
+    /// durable yet.
+    pub samples: Vec<SampleRegion>,
+    /// Set to the new version when this attempt confirmed by sampling
+    /// that a differently labelled response holds identical bytes; the
+    /// driver forwards it to the engine.
+    pub confirmed_version: Arc<std::sync::Mutex<Option<FileVersion>>>,
     pub stall_timeout: Duration,
     pub buffer_bytes: usize,
     /// Absolute file offset of the next byte this attempt will write.
     pub position: Arc<AtomicU64>,
     pub cancel: CancellationToken,
+}
+
+/// A stretch of already-durable bytes to compare with the server's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SampleRegion {
+    pub offset: u64,
+    pub len: u64,
 }
 
 /// Runs the attempt to completion or failure. `None` means it was
@@ -82,7 +98,15 @@ fn range_header(range: ByteRange, expected_size: Option<u64>) -> Option<String> 
 
 /// §8 step 2: validates status, `Content-Range` and version before any
 /// byte is written. Returns whether the response is a `206`.
-fn validate(response: &Response, spec: &AttemptSpec) -> Result<bool, TransferError> {
+///
+/// The second value is `Some(version)` when only the validators (ETag,
+/// `Last-Modified`) differ from every accepted version: a hint, settled
+/// by `confirm_by_sampling` before any byte is written. A size change is
+/// proof and fails right here.
+fn validate(
+    response: &Response,
+    spec: &AttemptSpec,
+) -> Result<(bool, Option<FileVersion>), TransferError> {
     let status = response.status();
     let start = spec.range.start;
     let (partial, total) = if status == StatusCode::PARTIAL_CONTENT {
@@ -90,31 +114,105 @@ fn validate(response: &Response, spec: &AttemptSpec) -> Result<bool, TransferErr
             .and_then(parse_content_range)
             .ok_or(TransferError::MissingContentRange)?;
         if served.start != start || spec.range.end.is_some_and(|end| served.end > end) {
+            tracing::debug!(
+                requested_start = start,
+                requested_end = ?spec.range.end,
+                served_start = served.start,
+                served_end = served.end,
+                content_range = header(response, CONTENT_RANGE),
+                "server served a different range than requested"
+            );
             return Err(TransferError::WrongRange);
         }
         (true, served.total)
     } else if status == StatusCode::OK && start == 0 {
         let length = header(response, CONTENT_LENGTH).and_then(|value| value.parse().ok());
         (false, length)
+    } else if matches!(status.as_u16(), 429 | 503) {
+        return Err(TransferError::Busy {
+            status: status.as_u16(),
+            retry_after: crate::probe::retry_after(response.headers()),
+        });
     } else {
         return Err(TransferError::Status(status.as_u16()));
     };
 
-    if let Some(accepted) = &spec.accepted {
+    let mut needs_confirmation = None;
+    if !spec.accepted.is_empty() {
         let seen = FileVersion {
             etag: header(response, ETAG).map(str::to_string),
             last_modified: header(response, LAST_MODIFIED).map(str::to_string),
             total_bytes: total.unwrap_or(0),
         };
-        // A size change is proof (§10). A validator-only mismatch needs
-        // byte sampling to settle, which is P4.6; until then it's
-        // accepted rather than failing a file a load balancer merely
-        // relabelled.
-        if let VersionCheck::Size { detail } = compare(std::slice::from_ref(accepted), &seen) {
-            return Err(TransferError::RemoteChanged(detail));
+        match compare(&spec.accepted, &seen) {
+            VersionCheck::Same => {}
+            // A size change is proof (§10).
+            VersionCheck::Size { detail } => return Err(TransferError::RemoteChanged(detail)),
+            VersionCheck::Validators { .. } => needs_confirmation = Some(seen),
         }
     }
-    Ok(partial)
+    Ok((partial, needs_confirmation))
+}
+
+/// How many 16 KiB samples settle a validator mismatch (§10).
+pub const MAX_SAMPLES: usize = 8;
+/// Bytes per sample.
+pub const SAMPLE_LEN: u64 = 16 * 1024;
+
+/// §10: different ETag/`Last-Modified` with the same size *maybe* means a
+/// different file — load balancers label identical bytes differently.
+/// Settles it by re-fetching small samples of durable regions from the
+/// server now presenting the new label and comparing them with what is
+/// on disk. All identical → the new label is accepted; any difference →
+/// `RemoteChanged`; a sample that can't be fetched → an ordinary
+/// (retried) failure. With nothing durable yet there is nothing to be
+/// stitched inconsistently, so the new label is simply adopted.
+async fn confirm_by_sampling(spec: &AttemptSpec) -> Result<(), TransferError> {
+    for region in spec.samples.iter().take(MAX_SAMPLES) {
+        let end = region.offset + region.len - 1;
+        let request = spec
+            .client
+            .get(spec.url.clone())
+            .header(RANGE, format!("bytes={}-{end}", region.offset));
+        let response = match timeout(spec.stall_timeout, request.send()).await {
+            Err(_) => {
+                return Err(TransferError::Connect(
+                    "sample request timed out".to_string(),
+                ));
+            }
+            Ok(Err(error)) => return Err(TransferError::Connect(error.to_string())),
+            Ok(Ok(response)) => response,
+        };
+        let served = header(&response, CONTENT_RANGE).and_then(parse_content_range);
+        if response.status() != StatusCode::PARTIAL_CONTENT
+            || served.is_none_or(|range| range.start != region.offset)
+        {
+            return Err(TransferError::Connect(
+                "sample request wasn't answered with the requested range".to_string(),
+            ));
+        }
+        let fetched = match timeout(spec.stall_timeout, response.bytes()).await {
+            Err(_) | Ok(Err(_)) => return Err(TransferError::Reset),
+            Ok(Ok(bytes)) => bytes,
+        };
+        let mut local = vec![0u8; usize::try_from(region.len).unwrap_or(0)];
+        let file = spec.file.clone();
+        let path = spec.path.clone();
+        let offset = region.offset;
+        let local = tokio::task::spawn_blocking(move || {
+            read_at(&file, &path, offset, &mut local).map(|()| local)
+        })
+        .await
+        .map_err(|error| TransferError::Io(error.to_string()))?
+        .map_err(|error| TransferError::Io(error.to_string()))?;
+        if fetched.len() != local.len() || fetched[..] != local[..] {
+            return Err(TransferError::RemoteChanged(format!(
+                "the bytes at offset {} differ from what was already downloaded",
+                region.offset
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Buffered, in-place writer for one attempt: bytes are written at their
@@ -175,7 +273,13 @@ async fn transfer(spec: &AttemptSpec) -> Result<(), TransferError> {
         Ok(Err(error)) => return Err(TransferError::Connect(error.to_string())),
         Ok(Ok(response)) => response,
     };
-    let partial = validate(&response, spec)?;
+    let (partial, unconfirmed) = validate(&response, spec)?;
+    if let Some(version) = unconfirmed {
+        confirm_by_sampling(spec).await?;
+        if let Ok(mut slot) = spec.confirmed_version.lock() {
+            *slot = Some(version);
+        }
+    }
 
     let wanted = spec.range.end.map(|end| end - spec.range.start + 1);
     let mut received = 0u64;

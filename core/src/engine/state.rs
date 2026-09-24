@@ -53,6 +53,33 @@ struct Meter {
     speed: f64,
 }
 
+/// What the engine has learned about one host from `429`/`503`
+/// responses (§16: "Host backoff; no retry counted"), per link: hosts
+/// limit each client IP, and every link is its own IP (§7.1), so one
+/// link being refused says nothing about another.
+#[derive(Debug, Clone, Copy, Default)]
+struct HostState {
+    /// No new connections to the host before this.
+    cooldown_until: Option<Instant>,
+    /// Consecutive refusals with no bytes delivered in between.
+    strikes: u32,
+    /// Connections the host has shown it will tolerate: halved on each
+    /// refusal, raised by one for every attempt that then delivers.
+    /// `None` = no restriction learned.
+    learned_cap: Option<u32>,
+}
+
+/// A host that refuses this many times running, with nothing delivered,
+/// fails the file instead of retrying forever.
+const MAX_HOST_STRIKES: u32 = 10;
+/// Host backoff after the first refusal, doubling per strike to the cap.
+const HOST_BACKOFF_BASE: Duration = Duration::from_secs(2);
+const HOST_BACKOFF_MAX: Duration = Duration::from_secs(60);
+/// The longest `Retry-After` honored as given; longer ones are clamped.
+const RETRY_AFTER_MAX: Duration = Duration::from_secs(600);
+/// A `429`/`503` on a file's probe is retried this many times.
+const MAX_PROBE_RETRIES: u32 = 6;
+
 #[derive(Debug, Clone, Copy, Default)]
 struct CheckpointState {
     bytes_since: u64,
@@ -74,6 +101,24 @@ pub struct EngineState {
     /// Durable bytes credited to each link since this engine started.
     link_bytes: HashMap<LinkId, u64>,
     meters: HashMap<LinkId, Meter>,
+    /// Keyed by (host, link); `None` is the unbound probe client.
+    hosts: HashMap<(String, Option<LinkId>), HostState>,
+    /// Files whose probe was refused with `429`/`503`: when to try again,
+    /// and how many tries so far.
+    probe_waits: HashMap<FileId, (Instant, u32)>,
+    /// Files with a probe request in flight (the probe pool, §5).
+    probing: HashSet<FileId>,
+    /// What each package's manifest last held, so a checkpoint can tell a
+    /// clean package (nothing to write) from a dirty one.
+    written: HashMap<PackageId, Package>,
+    /// Set for management-only sessions (`restore_offline`): nothing is
+    /// probed.
+    idle: bool,
+    /// Files whose source is being re-resolved after a `403`/`410`;
+    /// nothing new starts for them until it reports back.
+    refreshing: HashSet<FileId>,
+    /// Files that already used their one re-resolve (§13: "once").
+    reresolved: HashSet<FileId>,
     attempts: HashMap<AttemptId, AttemptState>,
     blocks: HashMap<(FileId, u32), BlockRuntime>,
     checkpoints: HashMap<PackageId, CheckpointState>,
@@ -94,6 +139,13 @@ impl EngineState {
             health: HashMap::new(),
             link_bytes: HashMap::new(),
             meters: HashMap::new(),
+            hosts: HashMap::new(),
+            probe_waits: HashMap::new(),
+            probing: HashSet::new(),
+            written: HashMap::new(),
+            idle: false,
+            refreshing: HashSet::new(),
+            reresolved: HashSet::new(),
             attempts: HashMap::new(),
             blocks: HashMap::new(),
             checkpoints: HashMap::new(),
@@ -208,9 +260,33 @@ impl EngineState {
     pub fn restore(
         config: EngineConfig,
         queue: &QueueManifest,
+        packages: Vec<Package>,
+    ) -> (Self, Vec<Effect>) {
+        Self::restore_inner(config, queue, packages, false)
+    }
+
+    /// Loads persisted state **as it is**, for management commands
+    /// (`nuxd add`, `pause`, `queue`, …) that must not start, reopen or
+    /// re-probe anything — and must not rewrite what they didn't touch.
+    /// The state is idle: no probes are issued and, with no links, no
+    /// transfers start. Commands still apply and checkpoint.
+    #[must_use]
+    pub fn restore_offline(
+        config: EngineConfig,
+        queue: &QueueManifest,
+        packages: Vec<Package>,
+    ) -> Self {
+        Self::restore_inner(config, queue, packages, true).0
+    }
+
+    fn restore_inner(
+        config: EngineConfig,
+        queue: &QueueManifest,
         mut packages: Vec<Package>,
+        offline: bool,
     ) -> (Self, Vec<Effect>) {
         let mut state = Self::new(config);
+        state.idle = offline;
         state.next_package_id = queue.next_package_id;
         state.next_file_id = queue.next_file_id;
 
@@ -227,7 +303,7 @@ impl EngineState {
         });
 
         let mut effects = Vec::new();
-        for package in &mut packages {
+        for package in packages.iter_mut().filter(|_| !offline) {
             if !state.config.auto_resume_on_startup && package.status == PackageStatus::Downloading
             {
                 package.status = PackageStatus::Paused;
@@ -253,28 +329,13 @@ impl EngineState {
                         // stale probe result is no cheaper to keep around
                         // than a fresh one, so this just restarts the
                         // file's whole lifecycle instead of resuming it.
-                        let source_url = file.url.clone().or_else(|| Url::parse(&file.source).ok());
                         file.status = FileStatus::Unprobed;
                         file.url = None;
                         file.layout = None;
                         file.parts.clear();
-                        if let Some(url) = source_url {
-                            effects.push(Effect::Probe {
-                                file: file.id,
-                                url,
-                                via: None,
-                            });
-                        }
+                        // The probe pool picks it up (`pump_probes`).
                     }
-                    FileStatus::Unprobed => {
-                        if let Ok(url) = Url::parse(&file.source) {
-                            effects.push(Effect::Probe {
-                                file: file.id,
-                                url,
-                                via: None,
-                            });
-                        }
-                    }
+                    FileStatus::Unprobed => {}
                     FileStatus::Complete | FileStatus::Verified | FileStatus::Failed(_) => {}
                 }
             }
@@ -299,12 +360,25 @@ impl EngineState {
         match input {
             Input::Command(command) => self.handle_command(command, now, &mut effects),
             Input::Tick { progress } => self.handle_tick(progress, now, &mut effects),
+            Input::VersionAccepted { file, version } => {
+                if let Some(&(package_id, index)) = self.file_index.get(&file)
+                    && let Some(package) = self.package_mut(package_id)
+                    && !package.files[index].versions.contains(&version)
+                {
+                    package.files[index].versions.push(version);
+                }
+            }
+            Input::Reresolved { file, result } => {
+                self.handle_reresolved(file, result, &mut effects);
+            }
             Input::AttemptEnded {
                 id,
                 outcome,
                 position,
             } => self.handle_attempt_ended(id, outcome, position, now, &mut effects),
-            Input::ProbeDone { file, result } => self.handle_probe_done(file, result, &mut effects),
+            Input::ProbeDone { file, result } => {
+                self.handle_probe_done(file, result, now, &mut effects);
+            }
             Input::FilePrepared { file, result } => {
                 self.handle_file_prepared(file, result, now, &mut effects);
             }
@@ -313,6 +387,7 @@ impl EngineState {
             }
             Input::LinksChanged(links) => self.handle_links_changed(links, &mut effects),
         }
+        self.pump_probes(now, &mut effects);
         self.fill_slots(now, &mut effects);
         effects
     }
@@ -402,12 +477,29 @@ impl EngineState {
                 dest_dir,
                 sources,
                 priority,
-            } => self.add_package(name, dest_dir, sources, priority, effects),
+            } => self.add_package(name, dest_dir, sources, priority, now, effects),
             Command::Pause(package) => self.pause_package(package, now, effects),
-            Command::Resume(package) => self.resume_package(package, effects),
-            Command::Cancel(package) => self.cancel_package(package, effects),
+            Command::AddProbed {
+                name,
+                dest_dir,
+                files,
+                priority,
+            } => self.add_probed(name, dest_dir, files, priority, now, effects),
+            Command::RestartFile(file) => self.restart_file(file, now, effects),
+            Command::SetPriority { package, priority } => {
+                self.set_priority(package, priority, now, effects);
+            }
+            Command::MoveTo { package, position } => self.move_package(package, position, effects),
+            Command::Resume(package) => self.resume_package(package, now, effects),
+            Command::Cancel(package) => self.cancel_package(package, now, effects),
             Command::Remove(package) => self.remove_package(package, effects),
-            Command::Shutdown => self.checkpoint_all(now, effects),
+            Command::Shutdown => {
+                // A management session changed only what its commands
+                // already checkpointed; rewriting the rest is churn.
+                if !self.idle {
+                    self.checkpoint_all(now, effects);
+                }
+            }
         }
     }
 
@@ -417,14 +509,23 @@ impl EngineState {
         dest_dir: std::path::PathBuf,
         sources: Vec<String>,
         priority: crate::model::Priority,
+        now: Instant,
         effects: &mut Vec<Effect>,
     ) {
         let package_id = self.alloc_package_id();
         let mut files = Vec::new();
-        let mut urls: Vec<Option<Url>> = Vec::new();
         for source in sources {
             let file_id = self.alloc_file_id();
             match Url::parse(&source) {
+                Ok(url) if !crate::resolve::is_supported_scheme(&url) => {
+                    let Some(mut file) = FileEntry::new(file_id, source.clone(), "download") else {
+                        continue;
+                    };
+                    file.status = FileStatus::Failed(FileError::ProbeFailed {
+                        detail: format!("unsupported scheme `{}`", url.scheme()),
+                    });
+                    files.push(file);
+                }
                 Ok(url) => {
                     let placeholder_name = crate::probe::filename_from_url(&url);
                     let Some(file) = FileEntry::new(file_id, source.clone(), placeholder_name)
@@ -432,7 +533,7 @@ impl EngineState {
                         continue;
                     };
                     files.push(file);
-                    urls.push(Some(url));
+                    let _ = url;
                 }
                 Err(_) => {
                     let Some(mut file) = FileEntry::new(file_id, source.clone(), "download") else {
@@ -442,17 +543,24 @@ impl EngineState {
                         detail: "couldn't parse as a URL".to_string(),
                     });
                     files.push(file);
-                    urls.push(None);
                 }
             }
         }
-        if files.is_empty() {
-            return;
-        }
-
-        let Some(mut package) = Package::new(package_id, name, dest_dir, files) else {
+        let Some(package) = Package::new(package_id, name, dest_dir, files) else {
             return;
         };
+        self.install_package(package, priority, now, effects);
+    }
+
+    /// Puts a freshly built package at the back of the queue, `Downloading`.
+    fn install_package(
+        &mut self,
+        mut package: Package,
+        priority: crate::model::Priority,
+        now: Instant,
+        effects: &mut Vec<Effect>,
+    ) {
+        let package_id = package.id;
         package.priority = priority;
         package.status = PackageStatus::Downloading;
 
@@ -460,21 +568,147 @@ impl EngineState {
         for (file_index, file) in package.files.iter().enumerate() {
             self.file_index.insert(file.id, (package_id, file_index));
         }
-        for (file, url) in package.files.iter().zip(urls.iter()) {
-            if let Some(url) = url {
-                effects.push(Effect::Probe {
-                    file: file.id,
-                    url: url.clone(),
-                    via: None,
-                });
-            }
-        }
         self.package_index.insert(package_id, index);
         self.packages.push(package);
+        // A new package is durable at once, not at the next tick — but
+        // the periodic cadence stays fresh, so its first progress is
+        // checkpointed promptly rather than a full interval later.
+        self.checkpoint_now(package_id, now, effects);
+        if let Some(checkpoint) = self.checkpoints.get_mut(&package_id) {
+            checkpoint.last = None;
+        }
         effects.push(Effect::Emit(EngineEvent::PackageAdded {
             package: package_id,
         }));
         self.update_package_status(package_id, effects);
+    }
+
+    /// A `403`/`410` on a file: signed URLs expire, so re-resolve its
+    /// source once (§13). Returns whether the failure is absorbed — true
+    /// while a re-resolve is running or was just started, false once the
+    /// file has already had its one.
+    fn begin_reresolve(
+        &mut self,
+        package_id: PackageId,
+        index: usize,
+        file: FileId,
+        effects: &mut Vec<Effect>,
+    ) -> bool {
+        if self.refreshing.contains(&file) {
+            return true;
+        }
+        if self.reresolved.contains(&file) {
+            return false;
+        }
+        let Some(source) = self
+            .package_ref(package_id)
+            .map(|p| p.files[index].source.clone())
+        else {
+            return false;
+        };
+        self.reresolved.insert(file);
+        self.refreshing.insert(file);
+        effects.push(Effect::Reresolve { file, source });
+        true
+    }
+
+    fn handle_reresolved(
+        &mut self,
+        file_id: FileId,
+        result: Result<crate::probe::ProbeResult, String>,
+        effects: &mut Vec<Effect>,
+    ) {
+        if !self.refreshing.remove(&file_id) {
+            return;
+        }
+        let Some(&(package_id, index)) = self.file_index.get(&file_id) else {
+            return;
+        };
+        match result {
+            Ok(probe) => {
+                let expected = self
+                    .package_ref(package_id)
+                    .and_then(|p| p.files[index].expected_size);
+                if probe.expected_size != expected {
+                    self.fail_file(
+                        package_id,
+                        index,
+                        FileError::RemoteChanged {
+                            detail: format!(
+                                "size changed from {expected:?} to {:?} while refreshing the link",
+                                probe.expected_size
+                            ),
+                        },
+                        effects,
+                    );
+                    self.update_package_status(package_id, effects);
+                } else if let Some(package) = self.package_mut(package_id) {
+                    package.files[index].url = Some(probe.final_url);
+                }
+            }
+            Err(detail) => {
+                self.fail_file(
+                    package_id,
+                    index,
+                    FileError::ProbeFailed {
+                        detail: format!("couldn't refresh the link: {detail}"),
+                    },
+                    effects,
+                );
+                self.update_package_status(package_id, effects);
+            }
+        }
+    }
+
+    /// `AddProbed`: like `add_package`, but each file arrives already
+    /// probed, so it goes straight to `Queued` (§7.3).
+    fn add_probed(
+        &mut self,
+        name: String,
+        dest_dir: std::path::PathBuf,
+        inputs: Vec<super::input::ProbedInput>,
+        priority: crate::model::Priority,
+        now: Instant,
+        effects: &mut Vec<Effect>,
+    ) {
+        let package_id = self.alloc_package_id();
+        let mut files = Vec::new();
+        for input in inputs {
+            let file_id = self.alloc_file_id();
+            let placeholder = Url::parse(&input.source)
+                .map(|url| crate::probe::filename_from_url(&url))
+                .unwrap_or_else(|_| "download".to_string());
+            let Some(mut file) = FileEntry::new(file_id, input.source, placeholder) else {
+                continue;
+            };
+            match input.probe {
+                Ok(probe) => self.apply_probe(&mut file, probe),
+                Err(detail) => {
+                    file.status = FileStatus::Failed(FileError::ProbeFailed { detail });
+                }
+            }
+            files.push(file);
+        }
+        let Some(package) = Package::new(package_id, name, dest_dir, files) else {
+            return;
+        };
+        self.install_package(package, priority, now, effects);
+    }
+
+    /// Records what a probe found on `file` and leaves it `Queued`:
+    /// probed and planned, but not activated — no placeholder file or
+    /// descriptor exists until the scheduler wants it (§7.3).
+    fn apply_probe(&self, file: &mut FileEntry, probe: crate::probe::ProbeResult) {
+        let layout =
+            plan::plan_layout_with(probe.expected_size, probe.supports_ranges, &self.config);
+        file.url = Some(probe.final_url);
+        file.name = probe.suggested_name;
+        file.expected_size = probe.expected_size;
+        file.supports_ranges = probe.supports_ranges;
+        file.versions = vec![probe.version];
+        file.layout = Some(layout);
+        file.parts = vec![PartStatus::not_started(); layout.count as usize];
+        file.status = FileStatus::Queued;
     }
 
     fn pause_package(&mut self, package_id: PackageId, now: Instant, effects: &mut Vec<Effect>) {
@@ -495,7 +729,7 @@ impl EngineState {
         }));
     }
 
-    fn resume_package(&mut self, package_id: PackageId, effects: &mut Vec<Effect>) {
+    fn resume_package(&mut self, package_id: PackageId, now: Instant, effects: &mut Vec<Effect>) {
         let Some(package) = self.package_mut(package_id) else {
             return;
         };
@@ -503,12 +737,15 @@ impl EngineState {
             return;
         }
         package.status = PackageStatus::Downloading;
+        // Persist the status change now: a management session may exit
+        // before any tick.
+        self.checkpoint_now(package_id, now, effects);
         effects.push(Effect::Emit(EngineEvent::PackageResumed {
             package: package_id,
         }));
     }
 
-    fn cancel_package(&mut self, package_id: PackageId, effects: &mut Vec<Effect>) {
+    fn cancel_package(&mut self, package_id: PackageId, now: Instant, effects: &mut Vec<Effect>) {
         self.abort_package_attempts(package_id, AbortReason::Cancel, effects);
         let Some(package) = self.package_mut(package_id) else {
             return;
@@ -517,10 +754,50 @@ impl EngineState {
             detail: "cancelled".to_string(),
         };
         package.status = PackageStatus::Failed(error.clone());
+        self.checkpoint_now(package_id, now, effects);
         effects.push(Effect::Emit(EngineEvent::PackageFailed {
             package: package_id,
             error,
         }));
+    }
+
+    fn set_priority(
+        &mut self,
+        package_id: PackageId,
+        priority: crate::model::Priority,
+        now: Instant,
+        effects: &mut Vec<Effect>,
+    ) {
+        let Some(package) = self.package_mut(package_id) else {
+            return;
+        };
+        if package.priority == priority {
+            return;
+        }
+        package.priority = priority;
+        // The priority lives in the package's own manifest, so it is
+        // checkpointed at once rather than waiting for the next tick;
+        // the event follows so a subscriber can trust it landed.
+        self.checkpoint_now(package_id, now, effects);
+        effects.push(Effect::Emit(EngineEvent::PackagePriorityChanged {
+            package: package_id,
+        }));
+    }
+
+    fn move_package(&mut self, package_id: PackageId, position: usize, effects: &mut Vec<Effect>) {
+        let Some(&from) = self.package_index.get(&package_id) else {
+            return;
+        };
+        let to = position.min(self.packages.len() - 1);
+        if from == to {
+            return;
+        }
+        let package = self.packages.remove(from);
+        self.packages.insert(to, package);
+        for (index, package) in self.packages.iter().enumerate() {
+            self.package_index.insert(package.id, index);
+        }
+        effects.push(Effect::Emit(EngineEvent::QueueReordered));
     }
 
     fn remove_package(&mut self, package_id: PackageId, effects: &mut Vec<Effect>) {
@@ -531,6 +808,7 @@ impl EngineState {
         let package = self.packages.remove(index);
         self.package_index.remove(&package_id);
         self.checkpoints.remove(&package_id);
+        self.written.remove(&package_id);
         for file in &package.files {
             self.file_index.remove(&file.id);
             self.blocks.retain(|(file_id, _), _| *file_id != file.id);
@@ -550,15 +828,8 @@ impl EngineState {
     fn checkpoint_all(&mut self, now: Instant, effects: &mut Vec<Effect>) {
         let package_ids: Vec<PackageId> = self.packages.iter().map(|p| p.id).collect();
         for id in package_ids {
-            if let Some(package) = self.package_ref(id) {
-                effects.push(Effect::Checkpoint {
-                    package: id,
-                    manifest: PackageManifest::new(package.clone()),
-                });
-            }
-            let checkpoint = self.checkpoints.entry(id).or_default();
-            checkpoint.bytes_since = 0;
-            checkpoint.last = Some(now);
+            self.write_checkpoint(id, false, effects);
+            self.mark_checkpointed(id, now);
         }
     }
 
@@ -590,45 +861,40 @@ impl EngineState {
         &mut self,
         file_id: FileId,
         result: Result<crate::probe::ProbeResult, crate::error::ProbeError>,
+        now: Instant,
         effects: &mut Vec<Effect>,
     ) {
+        self.probing.remove(&file_id);
         let Some(&(package_id, index)) = self.file_index.get(&file_id) else {
             return;
         };
         match result {
             Ok(probe) => {
-                let layout = plan::plan_layout_with(
-                    probe.expected_size,
-                    probe.supports_ranges,
-                    &self.config,
-                );
-                let Some(package) = self.package_mut(package_id) else {
-                    return;
+                self.probe_waits.remove(&file_id);
+                let mut entry = match self.package_ref(package_id) {
+                    Some(package) => package.files[index].clone(),
+                    None => return,
                 };
-                let file = &mut package.files[index];
-                file.url = Some(probe.final_url);
-                file.name = probe.suggested_name;
-                file.expected_size = probe.expected_size;
-                file.supports_ranges = probe.supports_ranges;
-                file.versions = vec![probe.version];
-                file.layout = Some(layout);
-                file.parts = vec![PartStatus::not_started(); layout.count as usize];
-                file.status = FileStatus::Preparing;
-
-                let plan = FilePrep {
-                    package: package_id,
-                    dest_dir: package.dest_dir.clone(),
-                    suggested_name: file.name.clone(),
-                    expected_size: file.expected_size,
-                    resume_final_name: None,
-                };
+                self.apply_probe(&mut entry, probe);
+                if let Some(package) = self.package_mut(package_id) {
+                    package.files[index] = entry;
+                }
                 effects.push(Effect::Emit(EngineEvent::FileProbed { file: file_id }));
-                effects.push(Effect::PrepareFile {
-                    file: file_id,
-                    plan,
-                });
             }
             Err(error) => {
+                // A host that answers `429`/`503` is busy, not wrong:
+                // wait out its backoff and probe again.
+                let busy = match &error {
+                    crate::error::ProbeError::Busy { retry_after, .. } => Some(*retry_after),
+                    crate::error::ProbeError::UnexpectedStatus { status: 429 | 503 } => Some(None),
+                    _ => None,
+                };
+                if let Some(retry_after) = busy
+                    && self.schedule_reprobe(file_id, package_id, index, retry_after, now, effects)
+                {
+                    return;
+                }
+                self.probe_waits.remove(&file_id);
                 self.fail_file(
                     package_id,
                     index,
@@ -640,6 +906,213 @@ impl EngineState {
                 self.update_package_status(package_id, effects);
             }
         }
+    }
+
+    /// Puts a refused probe on a timer, penalizing its host. `false` if
+    /// the retries are used up (the caller then fails the file).
+    fn schedule_reprobe(
+        &mut self,
+        file_id: FileId,
+        package_id: PackageId,
+        index: usize,
+        retry_after: Option<Duration>,
+        now: Instant,
+        effects: &mut Vec<Effect>,
+    ) -> bool {
+        let tries = self.probe_waits.get(&file_id).map_or(0, |(_, n)| *n) + 1;
+        if tries > MAX_PROBE_RETRIES {
+            return false;
+        }
+        let Some(host) = self
+            .package_ref(package_id)
+            .and_then(|p| Url::parse(&p.files[index].source).ok())
+            .and_then(|url| url.host_str().map(str::to_string))
+        else {
+            return false;
+        };
+        let until = self.penalize_host(&host, None, retry_after, now, effects);
+        self.probe_waits.insert(file_id, (until, tries));
+        true
+    }
+
+    /// The probe pool (§5): issues probes for `Unprobed` files, in queue
+    /// order, without ever exceeding `max_concurrent_probes` in flight
+    /// overall or `max_probes_per_host` to one host. A file whose probe
+    /// was refused (`429`/`503`) waits out its host's backoff first.
+    fn pump_probes(&mut self, now: Instant, effects: &mut Vec<Effect>) {
+        if self.idle {
+            return;
+        }
+        let total_cap = self.config.max_concurrent_probes as usize;
+        if self.probing.len() >= total_cap {
+            return;
+        }
+        let per_host_cap = self.config.max_probes_per_host;
+        let host_of = |source: &str| {
+            Url::parse(source)
+                .ok()
+                .and_then(|url| url.host_str().map(str::to_string))
+        };
+        let mut per_host: HashMap<String, u32> = HashMap::new();
+        for file_id in &self.probing {
+            if let Some(&(package_id, index)) = self.file_index.get(file_id)
+                && let Some(package) = self.package_ref(package_id)
+                && let Some(host) = host_of(&package.files[index].source)
+            {
+                *per_host.entry(host).or_default() += 1;
+            }
+        }
+
+        let mut order: Vec<usize> = (0..self.packages.len()).collect();
+        order.sort_by(|&a, &b| {
+            self.packages[b]
+                .priority
+                .cmp(&self.packages[a].priority)
+                .then(a.cmp(&b))
+        });
+        let mut to_probe = Vec::new();
+        'outer: for package_index in order {
+            let package = &self.packages[package_index];
+            if package.status != PackageStatus::Downloading {
+                continue;
+            }
+            for file in &package.files {
+                if file.status != FileStatus::Unprobed || self.probing.contains(&file.id) {
+                    continue;
+                }
+                if self
+                    .probe_waits
+                    .get(&file.id)
+                    .is_some_and(|(until, _)| now < *until)
+                {
+                    continue;
+                }
+                let Ok(url) = Url::parse(&file.source) else {
+                    continue;
+                };
+                let Some(host) = url.host_str().map(str::to_string) else {
+                    continue;
+                };
+                let count = per_host.entry(host).or_default();
+                if *count >= per_host_cap {
+                    continue;
+                }
+                *count += 1;
+                to_probe.push((file.id, url));
+                if self.probing.len() + to_probe.len() >= total_cap {
+                    break 'outer;
+                }
+            }
+        }
+        for (file, url) in to_probe {
+            self.probing.insert(file);
+            effects.push(Effect::Probe {
+                file,
+                url,
+                via: None,
+            });
+        }
+    }
+
+    /// Bytes came from this file's host: it is not refusing us, so the
+    /// strike count resets and the learned connection cap creeps back up.
+    fn host_delivered(&mut self, package_id: PackageId, index: usize, link: LinkId) {
+        let Some(host) = self
+            .package_ref(package_id)
+            .and_then(|p| p.files[index].url.as_ref())
+            .and_then(|url| url.host_str().map(str::to_string))
+        else {
+            return;
+        };
+        let Some(state) = self.hosts.get_mut(&(host, Some(link))) else {
+            return;
+        };
+        state.strikes = 0;
+        state.learned_cap = state.learned_cap.map(|cap| cap + 1);
+    }
+
+    /// A transfer on `link` was refused by the file's host.
+    fn host_refused(
+        &mut self,
+        package_id: PackageId,
+        index: usize,
+        link: LinkId,
+        retry_after: Option<Duration>,
+        now: Instant,
+        effects: &mut Vec<Effect>,
+    ) {
+        let Some(host) = self
+            .package_ref(package_id)
+            .and_then(|p| p.files[index].url.as_ref())
+            .and_then(|url| url.host_str().map(str::to_string))
+        else {
+            return;
+        };
+        self.penalize_host(&host, Some(link), retry_after, now, effects);
+        let strikes = self.hosts.get(&(host, Some(link))).map_or(0, |h| h.strikes);
+        if strikes > MAX_HOST_STRIKES {
+            self.fail_file(package_id, index, FileError::TooManyRetries, effects);
+        }
+    }
+
+    /// A host refused us (`429`/`503`): back off, and learn a lower
+    /// connection cap. Returns when it may be tried again.
+    fn penalize_host(
+        &mut self,
+        host: &str,
+        link: Option<LinkId>,
+        retry_after: Option<Duration>,
+        now: Instant,
+        effects: &mut Vec<Effect>,
+    ) -> Instant {
+        // The host's own `Retry-After`, when given, is a floor under our
+        // backoff: waiting less just earns another refusal.
+        let asked = retry_after.map(|d| d.min(RETRY_AFTER_MAX));
+        let hosts = self.active_attempt_hosts();
+        let active_on_host = u32::try_from(
+            self.attempts
+                .iter()
+                .filter(|(id, attempt)| {
+                    link.is_none_or(|link| attempt.link == link)
+                        && hosts.get(*id).is_some_and(|h| h.as_str() == host)
+                })
+                .count(),
+        )
+        .unwrap_or(u32::MAX);
+        let state = self.hosts.entry((host.to_string(), link)).or_default();
+        // Refusals that arrive while the host is already cooling down are
+        // one burst (a batch of simultaneous requests all turned away
+        // together), not separate offences: only the first escalates the
+        // backoff. Every refusal still tightens the learned cap, to the
+        // number of connections that were accepted alongside it.
+        let halved = (active_on_host / 2).max(1);
+        state.learned_cap = Some(state.learned_cap.map_or(halved, |cap| cap.min(halved)));
+        if let Some(until) = state.cooldown_until.filter(|until| now < *until) {
+            // Same burst — but honor a longer wait if this refusal asks.
+            let until = asked.map_or(until, |asked| until.max(now + asked));
+            if Some(until) != state.cooldown_until {
+                state.cooldown_until = Some(until);
+                effects.push(Effect::WakeAt(until));
+            }
+            return until;
+        }
+        state.strikes += 1;
+        let backoff = HOST_BACKOFF_BASE
+            .saturating_mul(1u32 << (state.strikes - 1).min(16))
+            .min(HOST_BACKOFF_MAX);
+        let backoff = asked.map_or(backoff, |asked| backoff.max(asked));
+        let until = now + backoff;
+        tracing::debug!(
+            host,
+            ?link,
+            strikes = state.strikes,
+            ?backoff,
+            cap = ?state.learned_cap,
+            "host refused; backing off"
+        );
+        state.cooldown_until = Some(until);
+        effects.push(Effect::WakeAt(until));
+        until
     }
 
     fn handle_file_prepared(
@@ -741,10 +1214,69 @@ impl EngineState {
         };
         package.files[index].status = FileStatus::Failed(error.clone());
         let file_id = package.files[index].id;
+        // A failed file's other blocks have nothing left to do.
+        let doomed: Vec<AttemptId> = self
+            .attempts
+            .iter()
+            .filter(|(_, attempt)| attempt.file == file_id)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in doomed {
+            if let Some(attempt) = self.attempts.remove(&id) {
+                if let Some(block) = self.blocks.get_mut(&(attempt.file, attempt.block)) {
+                    block.in_flight = None;
+                }
+                effects.push(Effect::AbortAttempt {
+                    id,
+                    reason: AbortReason::Cancel,
+                });
+            }
+        }
         effects.push(Effect::Emit(EngineEvent::FileFailed {
             file: file_id,
             error,
         }));
+    }
+
+    /// `RestartFile`: throws a failed file's progress away and starts it
+    /// over from a fresh probe (§10: "the user can restart the file").
+    fn restart_file(&mut self, file_id: FileId, now: Instant, effects: &mut Vec<Effect>) {
+        let Some(&(package_id, index)) = self.file_index.get(&file_id) else {
+            return;
+        };
+        let Some(package) = self.package_mut(package_id) else {
+            return;
+        };
+        if !matches!(package.files[index].status, FileStatus::Failed(_)) {
+            return;
+        }
+        let dest_dir = package.dest_dir.clone();
+        let file = &mut package.files[index];
+        let name = file.name.clone();
+        file.status = FileStatus::Unprobed;
+        file.url = None;
+        file.expected_size = None;
+        file.supports_ranges = false;
+        file.versions.clear();
+        file.layout = None;
+        file.parts.clear();
+        // A package that failed only because of its failed files is
+        // live again; one the user cancelled stays cancelled.
+        if package.status == PackageStatus::Failed(PackageError::FilesFailed) {
+            package.status = PackageStatus::Downloading;
+        }
+        self.blocks.retain(|(f, _), _| *f != file_id);
+        self.reresolved.remove(&file_id);
+        self.refreshing.remove(&file_id);
+        self.probe_waits.remove(&file_id);
+        self.probing.remove(&file_id);
+        effects.push(Effect::DiscardFile {
+            file: file_id,
+            dest_dir,
+            name,
+        });
+        self.checkpoint_now(package_id, now, effects);
+        effects.push(Effect::Emit(EngineEvent::FileRestarted { file: file_id }));
     }
 
     // --- progress and completion ---
@@ -851,13 +1383,40 @@ impl EngineState {
         if !due_by_time && !due_by_bytes {
             return;
         }
+        // Only a dirty package is rewritten: one whose state still matches
+        // its last manifest costs nothing, however many are queued.
+        if self.write_checkpoint(package_id, false, effects) {
+            self.mark_checkpointed(package_id, now);
+        } else if let Some(checkpoint) = self.checkpoints.get_mut(&package_id) {
+            checkpoint.last = Some(now);
+        }
+    }
+
+    /// Queues a `Checkpoint` for `package_id` and remembers what it
+    /// holds. Unless `force`, does nothing (returns false) when the
+    /// package is unchanged since its last one.
+    fn write_checkpoint(
+        &mut self,
+        package_id: PackageId,
+        force: bool,
+        effects: &mut Vec<Effect>,
+    ) -> bool {
         let Some(package) = self.package_ref(package_id) else {
-            return;
+            return false;
         };
+        if !force && self.written.get(&package_id) == Some(package) {
+            return false;
+        }
+        let package = package.clone();
         effects.push(Effect::Checkpoint {
             package: package_id,
             manifest: PackageManifest::new(package.clone()),
         });
+        self.written.insert(package_id, package);
+        true
+    }
+
+    fn mark_checkpointed(&mut self, package_id: PackageId, now: Instant) {
         let checkpoint = self.checkpoints.entry(package_id).or_default();
         checkpoint.bytes_since = 0;
         checkpoint.last = Some(now);
@@ -891,6 +1450,9 @@ impl EngineState {
                 block.avoid_links.remove(&attempt.link);
             }
         }
+        if delivered > 0 {
+            self.host_delivered(package_id, index, attempt.link);
+        }
 
         let is_success = matches!(outcome, AttemptOutcome::Success);
         let is_open_ended = self
@@ -905,7 +1467,21 @@ impl EngineState {
                     block.retry_until = None;
                 }
             }
+            AttemptOutcome::Failed(error)
+                if matches!(error, crate::error::TransferError::Status(403 | 410))
+                    && self.begin_reresolve(package_id, index, attempt.file, effects) =>
+            {
+                // Absorbed: the URL probably expired; the block waits (no
+                // retry counted) while the source is resolved again.
+            }
             AttemptOutcome::Failed(error) => {
+                if blame(&error) == Blame::Host {
+                    let retry_after = match &error {
+                        crate::error::TransferError::Busy { retry_after, .. } => *retry_after,
+                        _ => None,
+                    };
+                    self.host_refused(package_id, index, attempt.link, retry_after, now, effects);
+                }
                 if blame(&error) == Blame::Link {
                     let health = self.health.entry(attempt.link).or_default();
                     if let Some(until) = health.record_failure(now, &self.config) {
@@ -942,16 +1518,9 @@ impl EngineState {
     /// An immediate checkpoint, outside the tick cadence (§9.3: "on pause,
     /// file completion, and shutdown").
     fn checkpoint_now(&mut self, package_id: PackageId, now: Instant, effects: &mut Vec<Effect>) {
-        let Some(package) = self.package_ref(package_id) else {
-            return;
-        };
-        effects.push(Effect::Checkpoint {
-            package: package_id,
-            manifest: PackageManifest::new(package.clone()),
-        });
-        let checkpoint = self.checkpoints.entry(package_id).or_default();
-        checkpoint.bytes_since = 0;
-        checkpoint.last = Some(now);
+        if self.write_checkpoint(package_id, true, effects) {
+            self.mark_checkpointed(package_id, now);
+        }
     }
 
     fn handle_attempt_failure(
@@ -969,7 +1538,13 @@ impl EngineState {
             // breaker (§6.4) is what stops a dead link from being tried
             // forever.
             Blame::Link => {}
-            Blame::Attempt | Blame::Host => {
+            // §16: a busy host is not the block's fault — back the host
+            // off and learn a lower connection cap; the block itself is
+            // not charged a retry. A host that never relents fails the
+            // file rather than looping forever.
+            // Handled in `handle_attempt_ended`, which knows the link.
+            Blame::Host => {}
+            Blame::Attempt => {
                 let retries = {
                     let block = self.blocks.entry(block_key).or_default();
                     block.retries += 1;
@@ -986,14 +1561,18 @@ impl EngineState {
                 }
             }
             Blame::File => {
-                self.fail_file(
-                    package_id,
-                    index,
-                    FileError::Other {
-                        detail: error.to_string(),
+                let failure = match error {
+                    // §10: fails this file only; the user can restart it.
+                    crate::error::TransferError::RemoteChanged(detail) => {
+                        FileError::RemoteChanged {
+                            detail: detail.clone(),
+                        }
+                    }
+                    other => FileError::Other {
+                        detail: other.to_string(),
                     },
-                    effects,
-                );
+                };
+                self.fail_file(package_id, index, failure, effects);
             }
             Blame::Fatal => {
                 self.fail_file(
@@ -1095,8 +1674,20 @@ impl EngineState {
 
     // --- scheduling (§7.2) ---
 
-    fn build_candidates(&self, now: Instant) -> Vec<sched::FileCandidate> {
+    /// Every block that could start now on `link`.
+    fn build_candidates(&self, now: Instant, link: LinkId) -> Vec<sched::FileCandidate> {
         let mut out = Vec::new();
+        let mut active_by_host: HashMap<&str, u32> = HashMap::new();
+        for attempt in self.attempts.values().filter(|a| a.link == link) {
+            if let Some(host) = self
+                .file_index
+                .get(&attempt.file)
+                .and_then(|&(p, i)| self.package_ref(p)?.files[i].url.as_ref())
+                .and_then(|url| url.host_str())
+            {
+                *active_by_host.entry(host).or_default() += 1;
+            }
+        }
         for (queue_position, package) in self.packages.iter().enumerate() {
             if package.status != PackageStatus::Downloading {
                 continue;
@@ -1107,7 +1698,21 @@ impl EngineState {
                 }
                 let Some(layout) = file.layout else { continue };
                 let Some(url) = &file.url else { continue };
+                if self.refreshing.contains(&file.id) {
+                    continue;
+                }
                 let Some(host) = url.host_str() else { continue };
+                if let Some(state) = self.hosts.get(&(host.to_string(), Some(link))) {
+                    if state.cooldown_until.is_some_and(|until| now < until) {
+                        continue;
+                    }
+                    if state
+                        .learned_cap
+                        .is_some_and(|cap| active_by_host.get(host).copied().unwrap_or(0) >= cap)
+                    {
+                        continue;
+                    }
+                }
                 let total = file.expected_size.unwrap_or(0);
 
                 let mut blocks = Vec::new();
@@ -1196,6 +1801,110 @@ impl EngineState {
         }
     }
 
+    /// Files whose placeholder is being created right now.
+    fn preparing_count(&self) -> u32 {
+        u32::try_from(
+            self.packages
+                .iter()
+                .flat_map(|package| package.files.iter())
+                .filter(|file| file.status == FileStatus::Preparing)
+                .count(),
+        )
+        .unwrap_or(u32::MAX)
+    }
+
+    /// Slots that could take work right now, across every link.
+    fn free_slot_count(&self, now: Instant) -> u32 {
+        let mut free = 0u32;
+        for link in &self.links {
+            let cap = self
+                .health
+                .get(&link.id)
+                .map_or(u32::from(link.max_slots), |health| {
+                    health.slot_cap(u32::from(link.max_slots), now)
+                });
+            let active = u32::try_from(
+                self.attempts
+                    .values()
+                    .filter(|attempt| attempt.link == link.id)
+                    .count(),
+            )
+            .unwrap_or(u32::MAX);
+            free = free.saturating_add(cap.saturating_sub(active));
+        }
+        let room = self
+            .config
+            .max_connections_total
+            .saturating_sub(u32::try_from(self.attempts.len()).unwrap_or(u32::MAX));
+        free.min(room)
+    }
+
+    /// Lazy activation (§7.3): starts preparing the highest-ranked
+    /// `Queued` file, if free slots exist that files already preparing
+    /// won't fill and the file's host allows another active file. The
+    /// `PrepareFile` effect creates and preallocates its placeholder;
+    /// the file turns `Active` — and gets attempts — when the driver
+    /// reports it prepared. Returns whether one was activated.
+    fn try_activate_one(&mut self, now: Instant, effects: &mut Vec<Effect>) -> bool {
+        if self.preparing_count() >= self.free_slot_count(now) {
+            return false;
+        }
+
+        // Queue order: priority, then position (§4).
+        let mut order: Vec<usize> = (0..self.packages.len()).collect();
+        order.sort_by(|&a, &b| {
+            self.packages[b]
+                .priority
+                .cmp(&self.packages[a].priority)
+                .then(a.cmp(&b))
+        });
+        for package_index in order {
+            let package = &self.packages[package_index];
+            if package.status != PackageStatus::Downloading {
+                continue;
+            }
+            for (file_index, file) in package.files.iter().enumerate() {
+                if file.status != FileStatus::Queued {
+                    continue;
+                }
+                if let Some(host) = file.url.as_ref().and_then(|url| url.host_str())
+                    && let Some(max) = self.config.hosts.limits_for(host).max_active_files
+                {
+                    let active_for_host = self
+                        .packages
+                        .iter()
+                        .flat_map(|p| p.files.iter())
+                        .filter(|f| {
+                            matches!(f.status, FileStatus::Active | FileStatus::Preparing)
+                                && f.url.as_ref().and_then(|u| u.host_str()) == Some(host)
+                        })
+                        .count();
+                    if u32::try_from(active_for_host).unwrap_or(u32::MAX) >= max {
+                        continue;
+                    }
+                }
+                let plan = FilePrep {
+                    package: package.id,
+                    dest_dir: package.dest_dir.clone(),
+                    suggested_name: file.name.clone(),
+                    expected_size: file.expected_size,
+                    resume_final_name: None,
+                };
+                let file_id = file.id;
+                let package_id = package.id;
+                if let Some(package) = self.package_mut(package_id) {
+                    package.files[file_index].status = FileStatus::Preparing;
+                }
+                effects.push(Effect::PrepareFile {
+                    file: file_id,
+                    plan,
+                });
+                return true;
+            }
+        }
+        false
+    }
+
     /// Starts at most one attempt on `link`, if it has a free slot (its
     /// own cap, narrowed by its health) and the scheduler has work for
     /// it. Returns whether one was started.
@@ -1222,31 +1931,57 @@ impl EngineState {
             return false;
         }
 
-        let candidates = self.build_candidates(now);
-        if candidates.is_empty() {
-            return false;
-        }
-        let host_map = self.active_attempt_hosts();
-        let active: Vec<sched::ActiveAttempt<'_>> = self
-            .attempts
-            .iter()
-            .filter_map(|(id, attempt)| {
-                let host = host_map.get(id)?;
-                Some(sched::ActiveAttempt {
-                    file: attempt.file,
-                    link: attempt.link,
-                    host: host.as_str(),
+        let candidates = self.build_candidates(now, link.id);
+        // §7.2: spread first; then activate a queued file if one could use
+        // this slot; only then focus (a lone big file taking every slot).
+        // Both picks are made up front so the borrows of `self` end before
+        // activation mutates it.
+        let (spread, focus) = {
+            let host_map = self.active_attempt_hosts();
+            let active: Vec<sched::ActiveAttempt<'_>> = self
+                .attempts
+                .iter()
+                .filter_map(|(id, attempt)| {
+                    let host = host_map.get(id)?;
+                    Some(sched::ActiveAttempt {
+                        file: attempt.file,
+                        link: attempt.link,
+                        host: host.as_str(),
+                    })
                 })
-            })
-            .collect();
-        let view = sched::SchedulerView {
-            files: &candidates,
-            active: &active,
-            hosts: &self.config.hosts,
-            config: &self.config,
+                .collect();
+            let view = sched::SchedulerView {
+                files: &candidates,
+                active: &active,
+                hosts: &self.config.hosts,
+                config: &self.config,
+            };
+            let spread = sched::pick_spread(&view, link.id);
+            let focus = if spread.is_none() {
+                sched::pick_focus(&view, link.id)
+            } else {
+                None
+            };
+            (spread, focus)
         };
-        let Some(work) = sched::pick_work(&view, link.id) else {
-            return false;
+        let work = match spread {
+            Some(work) => work,
+            None => {
+                if self.try_activate_one(now, effects) {
+                    return true;
+                }
+                // Slots that files still preparing will need are kept
+                // free for them, instead of being soaked up by a big
+                // file's focus pass just before they become Active.
+                if self.preparing_count() > 0 && self.free_slot_count(now) <= self.preparing_count()
+                {
+                    return false;
+                }
+                match focus {
+                    Some(work) => work,
+                    None => return false,
+                }
+            }
         };
         let sched::Work::Primary {
             file,

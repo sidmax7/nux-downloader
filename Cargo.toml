@@ -35,7 +35,7 @@ url = "2"
 fs4 = { version = "0.9", features = ["tokio"] }
 directories = "5"
 tracing = "0.1"
-tracing-subscriber = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [workspace.lints.clippy]
 unwrap_used = "deny"

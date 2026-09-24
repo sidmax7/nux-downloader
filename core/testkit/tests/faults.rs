@@ -641,3 +641,37 @@ async fn a_blocked_source_gets_no_answer_until_unblocked() {
     origin.unblock_source(source);
     assert_eq!(client.get(origin.url()).send().await.unwrap().status(), 200);
 }
+
+#[tokio::test]
+async fn rate_limited_sends_429_with_retry_after() {
+    let origin = origin(OriginOptions::default()).await;
+    origin.set_default_fault(Fault::RateLimited(7));
+    let response = reqwest::get(origin.url()).await.unwrap();
+    assert_eq!(response.status(), 429);
+    assert_eq!(response.headers()["retry-after"], "7");
+}
+
+#[tokio::test]
+async fn delay_waits_then_serves_correctly_and_overlap_is_measurable() {
+    let origin = origin(OriginOptions {
+        size: 100,
+        seed: 5,
+        ..Default::default()
+    })
+    .await;
+    origin.set_default_fault(Fault::Delay(150));
+    let url = origin.url();
+    let started = std::time::Instant::now();
+    let (a, b, c) = tokio::join!(reqwest::get(&url), reqwest::get(&url), reqwest::get(&url));
+    for response in [a, b, c] {
+        let response = response.unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            response.bytes().await.unwrap().as_ref(),
+            content_range(5, 0, 100).as_slice()
+        );
+    }
+    assert!(started.elapsed() >= Duration::from_millis(140));
+    assert_eq!(origin.max_overlap(|_| true), 3);
+    assert_eq!(origin.max_overlap(|r| r.n == 1), 1);
+}

@@ -363,15 +363,50 @@ pub async fn probe(
                 },
             })
         }
+        other if matches!(other.as_u16(), 429 | 503) => Err(ProbeError::Busy {
+            status: other.as_u16(),
+            retry_after: retry_after(&headers),
+        }),
         other => Err(ProbeError::UnexpectedStatus {
             status: other.as_u16(),
         }),
     }
 }
 
+/// `Retry-After` in delta-seconds (RFC 9110 §10.2.3). The HTTP-date form
+/// isn't read — it's rare on `429`s, and the engine's own backoff still
+/// applies without it.
+#[must_use]
+pub fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<std::time::Duration> {
+    let seconds: u64 = headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    Some(std::time::Duration::from_secs(seconds))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retry_after_reads_delta_seconds_only() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        assert_eq!(retry_after(&headers), None);
+        headers.insert(reqwest::header::RETRY_AFTER, " 10 ".parse().unwrap());
+        assert_eq!(
+            retry_after(&headers),
+            Some(std::time::Duration::from_secs(10))
+        );
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            "Wed, 21 Oct 2015 07:28:00 GMT".parse().unwrap(),
+        );
+        assert_eq!(retry_after(&headers), None);
+    }
 
     // --- parse_content_range ---
 

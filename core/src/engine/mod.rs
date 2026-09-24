@@ -12,6 +12,6 @@ mod snapshot;
 mod state;
 
 pub use effect::{Effect, EngineEvent, FilePrep, PreparedFile};
-pub use input::{AbortReason, AttemptOutcome, Command, Input};
+pub use input::{AbortReason, AttemptOutcome, Command, Input, ProbedInput};
 pub use snapshot::{EngineSnapshot, LinkStats};
 pub use state::EngineState;

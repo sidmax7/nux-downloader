@@ -3,7 +3,7 @@
 //! `Command` are `EngineState::handle`'s only way in.
 
 use crate::error::{ProbeError, StorageError, TransferError};
-use crate::model::{AttemptId, FileId, Link, PackageId, Priority};
+use crate::model::{AttemptId, FileId, FileVersion, Link, PackageId, Priority};
 use crate::probe::ProbeResult;
 use std::path::PathBuf;
 
@@ -24,7 +24,33 @@ pub enum Command {
         sources: Vec<String>,
         priority: Priority,
     },
+    /// Adds a package whose files were already probed (the collect stage,
+    /// §5) — no probing happens again. A file whose probe failed becomes
+    /// a `Failed` file, so counts stay predictable.
+    AddProbed {
+        name: String,
+        dest_dir: PathBuf,
+        files: Vec<ProbedInput>,
+        priority: Priority,
+    },
+    /// Starts a failed file over from scratch (§10): its partial data is
+    /// discarded and it is probed again.
+    RestartFile(FileId),
     Pause(PackageId),
+    /// Changes a package's priority (§7.2: priority orders work before
+    /// queue position does). Running attempts are left alone; the next
+    /// free slot is what follows the new order.
+    SetPriority {
+        package: PackageId,
+        priority: Priority,
+    },
+    /// Moves a package to `position` in the queue (0 = front), clamped to
+    /// the end. Like `SetPriority`, it only changes who gets the next
+    /// free slot — nothing running is interrupted.
+    MoveTo {
+        package: PackageId,
+        position: usize,
+    },
     Resume(PackageId),
     Cancel(PackageId),
     /// Drops a package from engine state entirely, aborting any attempts
@@ -36,6 +62,14 @@ pub enum Command {
     /// responsible for actually exiting once the returned effects are
     /// executed.
     Shutdown,
+}
+
+/// One file of `Command::AddProbed`: its source and what probing it
+/// found, or why that failed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProbedInput {
+    pub source: String,
+    pub probe: Result<ProbeResult, String>,
 }
 
 /// How one transfer attempt ended (§8 step 6). `position` on the
@@ -95,6 +129,20 @@ pub enum Input {
     CheckpointDone {
         package: PackageId,
         result: Result<(), StorageError>,
+    },
+    /// A response's validators differed from every accepted version, but
+    /// sampling durable bytes showed the file is identical (§10): the
+    /// new version is recorded and later attempts accept it.
+    VersionAccepted {
+        file: FileId,
+        version: FileVersion,
+    },
+    /// The result of re-resolving a file's source after a `403`/`410`
+    /// (`Effect::Reresolve`): fresh probe data — including its current
+    /// URL — or why that failed.
+    Reresolved {
+        file: FileId,
+        result: Result<ProbeResult, String>,
     },
     /// A fresh interface scan (P3.4): the complete set of usable links
     /// now. The driver sends it once at startup and again whenever the

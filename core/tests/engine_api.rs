@@ -283,3 +283,95 @@ async fn a_package_survives_a_restart_through_queue_json() {
 
     engine.shutdown().await;
 }
+
+/// Packages that wait on a stalled first download, so their order can be
+/// changed before anything moves.
+async fn three_waiting_packages(
+    engine: &Engine,
+    origin: &Origin,
+    dest: &std::path::Path,
+) -> Vec<nuxd_core::model::PackageId> {
+    let mut ids = Vec::new();
+    for name in ["a", "b", "c"] {
+        let added = engine
+            .add(vec![origin.url()], opts(name, dest.join(name)))
+            .await
+            .unwrap_or_else(|error| panic!("add {name}: {error}"));
+        ids.extend(added);
+    }
+    ids
+}
+
+#[tokio::test]
+async fn reordering_and_priority_survive_a_restart() {
+    let origin = Origin::start(OriginOptions {
+        size: 1000,
+        seed: 31,
+        ..Default::default()
+    })
+    .await;
+    // Nothing may finish: every request hangs, so the queue stays put.
+    origin.set_default_fault(Fault::StallHeaders);
+    let data_dir = tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
+    let dest = tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
+
+    let (a, b, c);
+    {
+        let engine = Engine::start(EngineConfig::default(), Some(data_dir.path().to_path_buf()))
+            .await
+            .unwrap_or_else(|error| panic!("start: {error}"));
+        let ids = three_waiting_packages(&engine, &origin, dest.path()).await;
+        (a, b, c) = (ids[0], ids[1], ids[2]);
+
+        engine
+            .move_to(c, 0)
+            .await
+            .unwrap_or_else(|error| panic!("move_to: {error}"));
+        engine
+            .set_priority(b, Priority::High)
+            .await
+            .unwrap_or_else(|error| panic!("set_priority: {error}"));
+        let order: Vec<_> = engine
+            .snapshot()
+            .await
+            .packages
+            .iter()
+            .map(|p| p.id)
+            .collect();
+        assert_eq!(order, [c, a, b]);
+        engine.shutdown().await;
+    }
+
+    let engine = Engine::start(EngineConfig::default(), Some(data_dir.path().to_path_buf()))
+        .await
+        .unwrap_or_else(|error| panic!("restart: {error}"));
+    let snapshot = engine.snapshot().await;
+    let order: Vec<_> = snapshot.packages.iter().map(|p| p.id).collect();
+    assert_eq!(order, [c, a, b], "queue order survives a restart");
+    let b_priority = snapshot
+        .packages
+        .iter()
+        .find(|p| p.id == b)
+        .map(|p| p.priority);
+    assert_eq!(b_priority, Some(Priority::High), "priority survives too");
+    engine.shutdown().await;
+    origin.shutdown().await;
+}
+
+#[tokio::test]
+async fn reordering_an_unknown_package_is_an_error_and_a_no_op_is_fine() {
+    let data_dir = tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
+    let engine = Engine::start(EngineConfig::default(), Some(data_dir.path().to_path_buf()))
+        .await
+        .unwrap_or_else(|error| panic!("start: {error}"));
+    let ghost = nuxd_core::model::PackageId::new(42);
+    assert!(matches!(
+        engine.move_to(ghost, 0).await,
+        Err(nuxd_core::error::EngineError::UnknownPackage(_))
+    ));
+    assert!(matches!(
+        engine.set_priority(ghost, Priority::High).await,
+        Err(nuxd_core::error::EngineError::UnknownPackage(_))
+    ));
+    engine.shutdown().await;
+}

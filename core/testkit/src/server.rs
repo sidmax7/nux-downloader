@@ -98,6 +98,12 @@ pub struct LoggedRequest {
     /// Bytes of body actually written before the response ended, one way
     /// or another. Updated live as the body streams, not only at the end.
     pub bytes_sent: Arc<std::sync::atomic::AtomicU64>,
+    /// When the request reached the handler.
+    pub started: std::time::Instant,
+    /// When the response ended, one way or another (`None` while it is
+    /// still open) — with `started`, the interval the request was
+    /// "in flight", for measuring overlap.
+    pub finished: Arc<Mutex<Option<std::time::Instant>>>,
 }
 
 /// Locks `state`, turning a poisoned lock (a prior request's handler
@@ -113,6 +119,9 @@ fn lock_state(state: &Arc<Mutex<SharedState>>) -> std::sync::MutexGuard<'_, Shar
 struct SharedState {
     options: OriginOptions,
     requests: Vec<LoggedRequest>,
+    /// Requests seen so far — numbered when they arrive, not when they
+    /// are logged, so concurrent requests never share a number.
+    arrived: usize,
     fault_for_request: HashMap<usize, Fault>,
     default_fault: Fault,
     /// Per-source-address faults (Phase 3 multi-link tests): a request
@@ -136,10 +145,14 @@ struct SharedState {
 struct ConcurrencyGuard {
     state: Arc<Mutex<SharedState>>,
     source: IpAddr,
+    finished: Arc<Mutex<Option<std::time::Instant>>>,
 }
 
 impl Drop for ConcurrencyGuard {
     fn drop(&mut self) {
+        if let Ok(mut finished) = self.finished.lock() {
+            finished.get_or_insert_with(std::time::Instant::now);
+        }
         if let Ok(mut state) = self.state.lock()
             && let Some(count) = state.concurrent_by_source.get_mut(&self.source)
         {
@@ -171,6 +184,7 @@ impl Origin {
         let state = Arc::new(Mutex::new(SharedState {
             options,
             requests: Vec::new(),
+            arrived: 0,
             fault_for_request: HashMap::new(),
             default_fault: Fault::Ok,
             fault_for_source: HashMap::new(),
@@ -227,6 +241,18 @@ impl Origin {
         lock_state(&self.state).fault_for_request.insert(n, fault);
     }
 
+    /// Changes the `ETag` every later response carries — a load balancer
+    /// relabelling the same bytes (or, with `set_seed`, a real change).
+    pub fn set_etag(&self, etag: Option<&str>) {
+        lock_state(&self.state).options.etag = etag.map(str::to_string);
+    }
+
+    /// Changes the content every later response serves: same size,
+    /// different bytes — the file was republished mid-download.
+    pub fn set_seed(&self, seed: u64) {
+        lock_state(&self.state).options.seed = seed;
+    }
+
     /// The fault every request from `source` gets, unless overridden by
     /// `set_fault` for a specific request. Gives one "link" its own
     /// behavior — slow, failing — when several are bound to different
@@ -265,6 +291,30 @@ impl Origin {
             .get(&source)
             .copied()
             .unwrap_or(0)
+    }
+
+    /// The most requests matching `filter` that were in flight at the same
+    /// moment, from each request's start to the end of its response.
+    /// Finer than `peak_concurrent_from` — it can separate probes from
+    /// transfers, or one host's files from another's.
+    #[must_use]
+    pub fn max_overlap(&self, filter: impl Fn(&LoggedRequest) -> bool) -> usize {
+        let now = std::time::Instant::now();
+        let mut edges: Vec<(std::time::Instant, i32)> = Vec::new();
+        for request in self.requests().iter().filter(|r| filter(r)) {
+            edges.push((request.started, 1));
+            let end = request.finished.lock().ok().and_then(|f| *f).unwrap_or(now);
+            edges.push((end, -1));
+        }
+        // Ends sort before starts at the same instant: back-to-back is
+        // not overlap.
+        edges.sort_by_key(|(at, delta)| (*at, *delta));
+        let (mut current, mut peak) = (0i32, 0i32);
+        for (_, delta) in edges {
+            current += delta;
+            peak = peak.max(current);
+        }
+        usize::try_from(peak).unwrap_or(0)
     }
 
     /// Arms a one-shot hold: the next request's body pauses after
@@ -317,6 +367,10 @@ impl axum::serve::Listener for FilteringListener {
                 drop(stream);
                 continue;
             }
+            // Without this, the small body pieces of a throttled response
+            // stall on Nagle + the client's delayed ACK (tens of ms per
+            // piece), which no real origin under test would show.
+            let _ = stream.set_nodelay(true);
             return (stream, addr);
         }
     }
@@ -370,7 +424,8 @@ async fn handle_request(
 
     let (options, fault, n, hold_at) = {
         let mut state = lock_state(&app.shared);
-        let n = state.requests.len() + 1;
+        state.arrived += 1;
+        let n = state.arrived;
         let fault = state
             .fault_for_request
             .remove(&n)
@@ -401,10 +456,16 @@ async fn handle_request(
     };
 
     let bytes_sent = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let started = std::time::Instant::now();
+    let finished = Arc::new(Mutex::new(None));
     let guard = ConcurrencyGuard {
         state: app.shared.clone(),
         source: from.ip(),
+        finished: finished.clone(),
     };
+    if let Fault::Delay(ms) = &fault {
+        tokio::time::sleep(Duration::from_millis(*ms)).await;
+    }
 
     let (status, headers, body) = build_response(
         &options,
@@ -428,6 +489,8 @@ async fn handle_request(
             fault,
             status: status.as_u16(),
             bytes_sent,
+            started,
+            finished,
         });
     }
 
@@ -463,6 +526,12 @@ async fn build_response(
         Fault::Status(code) => {
             let status = StatusCode::from_u16(*code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
             (status, Vec::new(), Body::empty())
+        }
+        Fault::RateLimited(seconds) => {
+            let headers = HeaderValue::from_str(&seconds.to_string())
+                .map(|value| vec![(header::RETRY_AFTER, value)])
+                .unwrap_or_default();
+            (StatusCode::TOO_MANY_REQUESTS, headers, Body::empty())
         }
         Fault::Redirect(location) => {
             let headers = HeaderValue::from_str(location)

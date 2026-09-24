@@ -7,11 +7,15 @@
 //! - **Async I/O** (`Probe`, `StartAttempt`) runs on its own spawned
 //!   task and reports back through the shared input channel, since a
 //!   probe or a transfer can take seconds and must never block the loop.
-//! - **Local disk I/O** (`PrepareFile`, `Checkpoint`, `Finalize`) runs on
-//!   `spawn_blocking` but is *awaited inline*: the work is local and
-//!   bounded, and awaiting it here — rather than round-tripping through
-//!   the channel — lets one external `Input` and everything it causes
-//!   settle before the next one is picked up, with no extra plumbing.
+//! - **`PrepareFile`** (create and preallocate) runs on `spawn_blocking`
+//!   but is *awaited inline*: it is cheap local work and its result
+//!   feeds straight back into the engine.
+//! - **Durability work** (`Checkpoint`, `Finalize`) and the events that
+//!   announce it go through one ordered *lane* — a task that runs them
+//!   strictly in the order they were issued. An `fsync` can take
+//!   milliseconds, and awaiting it inline stalled every slot behind
+//!   every finished file; on the lane it stalls nothing, yet an event
+//!   still never overtakes the checkpoint it announces (§9.3).
 
 pub mod prepare;
 pub mod transfer;
@@ -33,6 +37,71 @@ use std::time::Instant;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
+
+/// Work for the ordered durability lane (see the module docs).
+enum LaneJob {
+    Checkpoint {
+        package: crate::model::PackageId,
+        files: Vec<(Arc<std::fs::File>, PathBuf)>,
+        manifest: crate::storage::manifest::PackageManifest,
+    },
+    Finalize {
+        file: FileId,
+        open: OpenFile,
+    },
+    Emit(EngineEvent),
+    /// Replies once everything queued before it has run. A snapshot goes
+    /// through one, so it never shows a file as done while its rename is
+    /// still waiting on the lane.
+    Barrier(tokio::sync::oneshot::Sender<()>),
+}
+
+/// Runs lane jobs one after another until every sender is gone.
+async fn run_lane(
+    mut jobs: mpsc::UnboundedReceiver<LaneJob>,
+    manifest_dir: PathBuf,
+    input_tx: mpsc::WeakSender<Input>,
+    events_tx: broadcast::Sender<EngineEvent>,
+) {
+    while let Some(job) = jobs.recv().await {
+        match job {
+            LaneJob::Checkpoint {
+                package,
+                files,
+                manifest,
+            } => {
+                let dir = manifest_dir.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    prepare::checkpoint(&files, &dir, &manifest)
+                })
+                .await
+                .unwrap_or_else(|error| {
+                    Err(StorageError::Io {
+                        operation: "checkpoint (task panicked)",
+                        path: String::new(),
+                        source: std::io::Error::other(error.to_string()),
+                    })
+                });
+                if let Some(tx) = input_tx.upgrade() {
+                    let _ = tx.send(Input::CheckpointDone { package, result }).await;
+                }
+            }
+            LaneJob::Finalize { file, open } => {
+                match tokio::task::spawn_blocking(move || prepare::finish(&open)).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => warn!("driver: finalize failed for {file:?}: {error}"),
+                    Err(error) => warn!("driver: finalize task panicked for {file:?}: {error}"),
+                }
+            }
+            LaneJob::Emit(event) => {
+                let _ = events_tx.send(event);
+            }
+            LaneJob::Barrier(reached) => {
+                let _ = reached.send(());
+            }
+        }
+    }
+}
 
 /// A running attempt's shared, driver-owned handles: the engine only
 /// keeps ids, but the tick sampler and `AbortAttempt` both need to reach
@@ -194,14 +263,15 @@ impl Driver {
 struct Worker {
     state: EngineState,
     default_client: Client,
+    lane: mpsc::UnboundedSender<LaneJob>,
+    lane_task: Option<tokio::task::JoinHandle<()>>,
+    registry: crate::resolve::Registry,
     link_clients: HashMap<LinkId, LinkClient>,
     /// How link clients are pinned to their link.
     bind: BindPolicy,
-    manifest_dir: PathBuf,
     open_files: HashMap<FileId, OpenFile>,
     running: HashMap<AttemptId, RunningAttempt>,
     input_tx: mpsc::Sender<Input>,
-    events_tx: broadcast::Sender<EngineEvent>,
 }
 
 impl Worker {
@@ -215,16 +285,24 @@ impl Worker {
         let default_client = build_default_client(state.config()).unwrap_or_else(|error| {
             panic!("driver: couldn't build the default HTTP client: {error}")
         });
+        let (lane, lane_jobs) = mpsc::unbounded_channel();
+        let lane_task = tokio::spawn(run_lane(
+            lane_jobs,
+            manifest_dir.clone(),
+            input_tx.downgrade(),
+            events_tx.clone(),
+        ));
         Self {
             state,
             default_client,
+            lane,
+            lane_task: Some(lane_task),
+            registry: crate::resolve::Registry::default(),
             link_clients: HashMap::new(),
             bind,
-            manifest_dir,
             open_files: HashMap::new(),
             running: HashMap::new(),
             input_tx,
-            events_tx,
         }
     }
 
@@ -338,12 +416,33 @@ impl Worker {
                 }
             }
         }
+
+        // Let the queued checkpoints, renames and events finish before
+        // this task ends: a shutdown's final checkpoint must have landed.
+        drop(std::mem::replace(
+            &mut self.lane,
+            mpsc::unbounded_channel().0,
+        ));
+        if let Some(task) = self.lane_task.take() {
+            let _ = task.await;
+        }
     }
 
     fn handle_request(&self, request: WorkerRequest) {
         match request {
             WorkerRequest::Snapshot(reply) => {
-                let _ = reply.send(self.state.snapshot());
+                // Take the state now, but hand it out only once the
+                // durability work already issued has landed.
+                let snapshot = self.state.snapshot();
+                let (reached, wait) = tokio::sync::oneshot::channel();
+                if self.lane.send(LaneJob::Barrier(reached)).is_ok() {
+                    tokio::spawn(async move {
+                        let _ = wait.await;
+                        let _ = reply.send(snapshot);
+                    });
+                } else {
+                    let _ = reply.send(snapshot);
+                }
             }
         }
     }
@@ -377,6 +476,22 @@ impl Worker {
     async fn execute(&mut self, effect: Effect, now: Instant, queue: &mut VecDeque<Effect>) {
         match effect {
             Effect::Probe { file, url, via } => self.spawn_probe(file, url, via),
+            Effect::Reresolve { file, source } => self.spawn_reresolve(file, source),
+            Effect::DiscardFile {
+                file,
+                dest_dir,
+                name,
+            } => {
+                // Drop our handle first (Windows can't delete an open file).
+                self.open_files.remove(&file);
+                let final_path = dest_dir.join(&name);
+                let _ = std::fs::remove_file(prepare::part_path_for(&final_path));
+                // The reserved placeholder is empty until the file is
+                // finalized; never delete anything with content.
+                if std::fs::metadata(&final_path).is_ok_and(|m| m.len() == 0) {
+                    let _ = std::fs::remove_file(&final_path);
+                }
+            }
             Effect::StartAttempt {
                 id,
                 file,
@@ -428,41 +543,27 @@ impl Worker {
                 queue.extend(more);
             }
             Effect::Checkpoint { package, manifest } => {
+                // Handles are captured now (this file is still open); the
+                // lane syncs them and writes the manifest in order.
                 let files: Vec<_> = self
                     .open_files
                     .values()
                     .filter(|open| open.package == package)
                     .map(|open| (open.file.clone(), open.part_path.clone()))
                     .collect();
-                let manifest_dir = self.manifest_dir.clone();
-                let result = tokio::task::spawn_blocking(move || {
-                    prepare::checkpoint(&files, &manifest_dir, &manifest)
-                })
-                .await
-                .unwrap_or_else(|error| {
-                    Err(StorageError::Io {
-                        operation: "checkpoint (task panicked)",
-                        path: String::new(),
-                        source: std::io::Error::other(error.to_string()),
-                    })
+                let _ = self.lane.send(LaneJob::Checkpoint {
+                    package,
+                    files,
+                    manifest,
                 });
-                let more = self
-                    .state
-                    .handle(Input::CheckpointDone { package, result }, now);
-                queue.extend(more);
             }
             Effect::Finalize { file } => {
                 if let Some(open) = self.open_files.remove(&file) {
-                    let result = tokio::task::spawn_blocking(move || prepare::finish(&open)).await;
-                    match result {
-                        Ok(Ok(())) => {}
-                        Ok(Err(error)) => warn!("driver: finalize failed for {file:?}: {error}"),
-                        Err(error) => warn!("driver: finalize task panicked for {file:?}: {error}"),
-                    }
+                    let _ = self.lane.send(LaneJob::Finalize { file, open });
                 }
             }
             Effect::Emit(event) => {
-                let _ = self.events_tx.send(event);
+                let _ = self.lane.send(LaneJob::Emit(event));
             }
             Effect::WakeAt(_) => {
                 // The tick cadence already re-checks every block's backoff
@@ -470,6 +571,31 @@ impl Worker {
                 // action needed for correctness.
             }
         }
+    }
+
+    /// Resolves `source` again and probes what it yields, so a signed URL
+    /// that expired is replaced by a fresh one (§13).
+    fn spawn_reresolve(&self, file: FileId, source: String) {
+        let client = self.default_client.clone();
+        let config = self.state.config().clone();
+        let registry = self.registry.clone();
+        let input_tx = self.input_tx.clone();
+        tokio::spawn(async move {
+            let ctx = crate::resolve::ResolveContext {
+                client: client.clone(),
+                cancel: CancellationToken::new(),
+            };
+            let result = match registry.resolve(&source, &ctx).await {
+                Ok(links) => match links.into_iter().next() {
+                    Some(link) => crate::probe::probe(&client, link.url, &config)
+                        .await
+                        .map_err(|error| error.to_string()),
+                    None => Err("the source no longer resolves to anything".to_string()),
+                },
+                Err(error) => Err(error.to_string()),
+            };
+            let _ = input_tx.send(Input::Reresolved { file, result }).await;
+        });
     }
 
     fn spawn_probe(&self, file: FileId, url: url::Url, via: Option<LinkId>) {
@@ -483,6 +609,40 @@ impl Worker {
             let result: Result<_, ProbeError> = crate::probe::probe(&client, url, &config).await;
             let _ = input_tx.send(Input::ProbeDone { file, result }).await;
         });
+    }
+
+    /// Up to `MAX_SAMPLES` 16 KiB stretches of already-durable bytes,
+    /// spread across the file's blocks — what a validator mismatch is
+    /// checked against (§10).
+    fn pick_samples(&self, file: FileId) -> Vec<transfer::SampleRegion> {
+        let Some(entry) = self.state.file(file) else {
+            return Vec::new();
+        };
+        let Some(layout) = entry.layout else {
+            return Vec::new();
+        };
+        let total = entry.expected_size.unwrap_or(0);
+        let eligible: Vec<(u64, u64)> = entry
+            .parts
+            .iter()
+            .enumerate()
+            .filter(|(_, part)| part.durable > 0)
+            .filter_map(|(index, part)| {
+                let start =
+                    crate::plan::block_range(&layout, total, u32::try_from(index).ok()?)?.start;
+                Some((start, part.durable))
+            })
+            .collect();
+        let step = (eligible.len() / transfer::MAX_SAMPLES).max(1);
+        eligible
+            .into_iter()
+            .step_by(step)
+            .take(transfer::MAX_SAMPLES)
+            .map(|(offset, durable)| transfer::SampleRegion {
+                offset,
+                len: durable.min(transfer::SAMPLE_LEN),
+            })
+            .collect()
     }
 
     fn spawn_attempt(
@@ -506,7 +666,10 @@ impl Worker {
         let accepted = self
             .state
             .file(file)
-            .and_then(|entry| entry.versions.first().cloned());
+            .map(|entry| entry.versions.clone())
+            .unwrap_or_default();
+        let samples = self.pick_samples(file);
+        let confirmed_version = Arc::new(std::sync::Mutex::new(None));
         let expected_size = self.state.file(file).and_then(|entry| entry.expected_size);
         let config = self.state.config();
 
@@ -528,6 +691,8 @@ impl Worker {
             path: open.part_path.clone(),
             expected_size,
             accepted,
+            samples,
+            confirmed_version: confirmed_version.clone(),
             stall_timeout: config.stall_timeout,
             buffer_bytes: config.write_buffer_bytes,
             position,
@@ -535,7 +700,19 @@ impl Worker {
         };
         let input_tx = self.input_tx.clone();
         tokio::spawn(async move {
-            if let Some((outcome, position)) = transfer::run(spec).await {
+            let ran = transfer::run(spec).await;
+            // A relabelled-but-identical file (§10) is recorded even if
+            // this attempt then fails for another reason.
+            let confirmed = confirmed_version.lock().ok().and_then(|mut v| v.take());
+            if let Some(version) = confirmed {
+                let _ = input_tx
+                    .send(Input::VersionAccepted { file, version })
+                    .await;
+            }
+            if let Some((outcome, position)) = ran {
+                if let crate::engine::AttemptOutcome::Failed(error) = &outcome {
+                    tracing::debug!(?id, ?link, position, %error, "attempt failed");
+                }
                 let _ = input_tx
                     .send(Input::AttemptEnded {
                         id,

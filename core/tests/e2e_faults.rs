@@ -250,15 +250,16 @@ async fn a_persistent_body_stall_fails_the_file() {
 #[tokio::test]
 async fn an_unreachable_origin_fails_the_probe_and_the_file() {
     // A server error at probe time — `probe::probe` only accepts 200,
-    // 206, or a `416 bytes */0` empty file (§5); nothing else recovers,
-    // since M1 has no probe retry loop (a documented P2.6 scoping note).
+    // 206, or a `416 bytes */0` empty file (§5). A `429`/`503` is retried
+    // after a host backoff (`host_backoff.rs`), but any other status
+    // fails the file at once.
     let origin = Origin::start(OriginOptions {
         size: 1000,
         seed: 5,
         ..Default::default()
     })
     .await;
-    origin.set_default_fault(Fault::Status(503));
+    origin.set_default_fault(Fault::Status(500));
     let dest = tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
     let driver = Driver::spawn_fresh(
         EngineConfig::default(),
@@ -278,7 +279,7 @@ async fn an_unreachable_origin_fails_the_probe_and_the_file() {
     .await;
     assert!(
         !done,
-        "a probe that only ever gets a 503 must fail the file"
+        "a probe that only ever gets a 500 must fail the file"
     );
 
     driver.shutdown().await;
