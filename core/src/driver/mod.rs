@@ -20,7 +20,9 @@ use crate::config::EngineConfig;
 use crate::engine::{Command, Effect, EngineEvent, EngineSnapshot, EngineState, Input};
 use crate::error::{ProbeError, StorageError};
 use crate::model::{AttemptId, FileId, Link, LinkId};
+use crate::net::bind::{BindPolicy, build_bound_client};
 use crate::net::client::{build_default_client, build_link_client};
+use crate::net::monitor::{self, LinkSetup, MonitorSetup};
 use prepare::OpenFile;
 use reqwest::Client;
 use std::collections::{HashMap, VecDeque};
@@ -38,6 +40,14 @@ use tracing::warn;
 struct RunningAttempt {
     position: Arc<AtomicU64>,
     cancel: CancellationToken,
+}
+
+/// A link's client, remembered with the addresses it was built for so a
+/// rescan that changes them rebuilds it.
+struct LinkClient {
+    v4: Option<std::net::Ipv4Addr>,
+    v6: Option<std::net::Ipv6Addr>,
+    client: Client,
 }
 
 /// A read-only query the worker answers directly from its own
@@ -79,14 +89,39 @@ impl Driver {
         links: Vec<Link>,
         manifest_dir: PathBuf,
     ) -> Self {
+        Self::spawn_with(
+            state,
+            initial_effects,
+            LinkSetup::Fixed {
+                links,
+                bind: BindPolicy::Off,
+            },
+            manifest_dir,
+        )
+    }
+
+    /// Like `spawn`, but the links come from a `LinkSetup`: a fixed list,
+    /// or a monitored, interface-bound set that follows the machine's
+    /// network changes (§6.1).
+    #[must_use]
+    pub fn spawn_with(
+        state: EngineState,
+        initial_effects: Vec<Effect>,
+        links: LinkSetup,
+        manifest_dir: PathBuf,
+    ) -> Self {
         let (input_tx, input_rx) = mpsc::channel(256);
         let (request_tx, request_rx) = mpsc::channel(32);
         let (events_tx, _) = broadcast::channel(1024);
 
+        let bind = match &links {
+            LinkSetup::Fixed { bind, .. } => *bind,
+            LinkSetup::Monitored(MonitorSetup { bind, .. }) => *bind,
+        };
         let worker = Worker::new(
             state,
             manifest_dir,
-            links.clone(),
+            bind,
             input_tx.clone(),
             events_tx.clone(),
         );
@@ -159,7 +194,9 @@ impl Driver {
 struct Worker {
     state: EngineState,
     default_client: Client,
-    link_clients: HashMap<LinkId, Client>,
+    link_clients: HashMap<LinkId, LinkClient>,
+    /// How link clients are pinned to their link.
+    bind: BindPolicy,
     manifest_dir: PathBuf,
     open_files: HashMap<FileId, OpenFile>,
     running: HashMap<AttemptId, RunningAttempt>,
@@ -171,27 +208,18 @@ impl Worker {
     fn new(
         state: EngineState,
         manifest_dir: PathBuf,
-        links: Vec<Link>,
+        bind: BindPolicy,
         input_tx: mpsc::Sender<Input>,
         events_tx: broadcast::Sender<EngineEvent>,
     ) -> Self {
-        let config = state.config();
-        let default_client = build_default_client(config).unwrap_or_else(|error| {
+        let default_client = build_default_client(state.config()).unwrap_or_else(|error| {
             panic!("driver: couldn't build the default HTTP client: {error}")
         });
-        let link_clients = links
-            .iter()
-            .map(|link| {
-                let client = build_link_client(config).unwrap_or_else(|error| {
-                    panic!("driver: couldn't build a client for {}: {error}", link.name)
-                });
-                (link.id, client)
-            })
-            .collect();
         Self {
             state,
             default_client,
-            link_clients,
+            link_clients: HashMap::new(),
+            bind,
             manifest_dir,
             open_files: HashMap::new(),
             running: HashMap::new(),
@@ -200,17 +228,82 @@ impl Worker {
         }
     }
 
+    /// Brings the per-link clients in line with a fresh link set: builds
+    /// one for each new link (or one whose addresses changed), drops the
+    /// rest, and returns only the links that have a working client — a
+    /// link that can't be bound is left out rather than fed to the engine
+    /// to fail on every attempt.
+    fn sync_clients(&mut self, links: Vec<Link>) -> Vec<Link> {
+        let config = self.state.config().clone();
+        let mut clients = HashMap::new();
+        let mut usable = Vec::new();
+        for link in links {
+            let existing = self
+                .link_clients
+                .remove(&link.id)
+                .filter(|held| held.v4 == link.v4 && held.v6 == link.v6);
+            let held = match existing {
+                Some(held) => held,
+                None => {
+                    let built = match self.bind.mode_for(&link) {
+                        Some(mode) => build_bound_client(&config, &link, &mode),
+                        None if self.bind == BindPolicy::Off => build_link_client(&config),
+                        None => Err(crate::error::NetError::NoBindAddress {
+                            link: link.name.clone(),
+                        }),
+                    };
+                    match built {
+                        Ok(client) => LinkClient {
+                            v4: link.v4,
+                            v6: link.v6,
+                            client,
+                        },
+                        Err(error) => {
+                            warn!("driver: skipping link {}: {error}", link.name);
+                            continue;
+                        }
+                    }
+                }
+            };
+            clients.insert(link.id, held);
+            usable.push(link);
+        }
+        self.link_clients = clients;
+        usable
+    }
+
     async fn run(
         mut self,
         mut input_rx: mpsc::Receiver<Input>,
         mut request_rx: mpsc::Receiver<WorkerRequest>,
-        links: Vec<Link>,
+        setup: LinkSetup,
         initial_effects: Vec<Effect>,
     ) {
         // `LinksChanged` is folded in here rather than by the caller, so
         // its own effects (e.g. `StartAttempt`s a restored, already-Active
         // file is now ready for) join `initial_effects` in one drain
         // instead of being silently dropped.
+        let links = match setup {
+            LinkSetup::Fixed { links, .. } => links,
+            LinkSetup::Monitored(monitor_setup) => {
+                let config = self.state.config().clone();
+                let found = monitor::scan(&monitor_setup, &config, &[])
+                    .await
+                    .unwrap_or_else(|error| {
+                        warn!("driver: initial link scan failed: {error}");
+                        Vec::new()
+                    });
+                let found = self.sync_clients(found);
+                monitor::spawn_watch(
+                    monitor_setup,
+                    config,
+                    found.clone(),
+                    self.input_tx.downgrade(),
+                );
+                found
+            }
+        };
+        let links = self.sync_clients(links);
         let now = Instant::now();
         let links_effects = self.state.handle(Input::LinksChanged(links), now);
         self.drain(
@@ -267,6 +360,10 @@ impl Worker {
     /// returning.
     async fn step(&mut self, input: Input) {
         let now = Instant::now();
+        let input = match input {
+            Input::LinksChanged(links) => Input::LinksChanged(self.sync_clients(links)),
+            other => other,
+        };
         let effects = self.state.handle(input, now);
         self.drain(effects.into(), now).await;
     }
@@ -378,7 +475,7 @@ impl Worker {
     fn spawn_probe(&self, file: FileId, url: url::Url, via: Option<LinkId>) {
         let client = via
             .and_then(|link| self.link_clients.get(&link))
-            .unwrap_or(&self.default_client)
+            .map_or(&self.default_client, |held| &held.client)
             .clone();
         let config = self.state.config().clone();
         let input_tx = self.input_tx.clone();
@@ -404,7 +501,7 @@ impl Worker {
         let client = self
             .link_clients
             .get(&link)
-            .unwrap_or(&self.default_client)
+            .map_or(&self.default_client, |held| &held.client)
             .clone();
         let accepted = self
             .state

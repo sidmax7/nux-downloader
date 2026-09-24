@@ -11,7 +11,7 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use bytes::Bytes;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
@@ -115,6 +115,13 @@ struct SharedState {
     requests: Vec<LoggedRequest>,
     fault_for_request: HashMap<usize, Fault>,
     default_fault: Fault,
+    /// Per-source-address faults (Phase 3 multi-link tests): a request
+    /// from that address gets this fault unless `fault_for_request`
+    /// names one for that specific request.
+    fault_for_source: HashMap<IpAddr, Fault>,
+    /// Sources whose connections are accepted and immediately closed —
+    /// a "dead link" from the client's side.
+    blocked_sources: HashSet<IpAddr>,
     concurrent_by_source: HashMap<IpAddr, u32>,
     peak_concurrent_by_source: HashMap<IpAddr, u32>,
     /// Armed by `Origin::hold_next_request_at`: the next request's body
@@ -166,6 +173,8 @@ impl Origin {
             requests: Vec::new(),
             fault_for_request: HashMap::new(),
             default_fault: Fault::Ok,
+            fault_for_source: HashMap::new(),
+            blocked_sources: HashSet::new(),
             concurrent_by_source: HashMap::new(),
             peak_concurrent_by_source: HashMap::new(),
             hold_next_at: None,
@@ -180,6 +189,10 @@ impl Origin {
             });
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let listener = FilteringListener {
+            inner: listener,
+            state: state.clone(),
+        };
         let join = tokio::spawn(serve(listener, app, shutdown_rx));
 
         Self {
@@ -212,6 +225,29 @@ impl Origin {
     /// default fault for that one request only.
     pub fn set_fault(&self, n: usize, fault: Fault) {
         lock_state(&self.state).fault_for_request.insert(n, fault);
+    }
+
+    /// The fault every request from `source` gets, unless overridden by
+    /// `set_fault` for a specific request. Gives one "link" its own
+    /// behavior — slow, failing — when several are bound to different
+    /// loopback aliases.
+    pub fn set_source_fault(&self, source: IpAddr, fault: Fault) {
+        lock_state(&self.state)
+            .fault_for_source
+            .insert(source, fault);
+    }
+
+    /// Blackholes `source` until `unblock_source`: new connections are
+    /// dropped the moment they are accepted, and a request arriving on an
+    /// already-open connection is never answered (so a client sees a
+    /// connect failure or a header timeout — never a response). Requests
+    /// already streaming a body are not affected.
+    pub fn block_source(&self, source: IpAddr) {
+        lock_state(&self.state).blocked_sources.insert(source);
+    }
+
+    pub fn unblock_source(&self, source: IpAddr) {
+        lock_state(&self.state).blocked_sources.remove(&source);
     }
 
     /// The fault every request gets unless overridden by `set_fault`.
@@ -262,8 +298,49 @@ impl Drop for Origin {
     }
 }
 
-async fn serve(listener: TcpListener, app: Router, shutdown_rx: oneshot::Receiver<()>) {
-    let make_service = app.into_make_service_with_connect_info::<SocketAddr>();
+/// A `TcpListener` that closes connections from blocked sources as soon
+/// as they are accepted.
+struct FilteringListener {
+    inner: TcpListener,
+    state: Arc<Mutex<SharedState>>,
+}
+
+impl axum::serve::Listener for FilteringListener {
+    type Io = tokio::net::TcpStream;
+    type Addr = SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        loop {
+            let (stream, addr) = axum::serve::Listener::accept(&mut self.inner).await;
+            let blocked = lock_state(&self.state).blocked_sources.contains(&addr.ip());
+            if blocked {
+                drop(stream);
+                continue;
+            }
+            return (stream, addr);
+        }
+    }
+
+    fn local_addr(&self) -> io::Result<Self::Addr> {
+        self.inner.local_addr()
+    }
+}
+
+/// The peer address, as a type this crate owns so `Connected` can be
+/// implemented for it against `FilteringListener`.
+#[derive(Clone, Copy)]
+struct Peer(SocketAddr);
+
+impl axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, FilteringListener>>
+    for Peer
+{
+    fn connect_info(stream: axum::serve::IncomingStream<'_, FilteringListener>) -> Self {
+        Peer(*stream.remote_addr())
+    }
+}
+
+async fn serve(listener: FilteringListener, app: Router, shutdown_rx: oneshot::Receiver<()>) {
+    let make_service = app.into_make_service_with_connect_info::<Peer>();
     let server = axum::serve(listener, make_service).with_graceful_shutdown(async {
         let _ = shutdown_rx.await;
     });
@@ -282,7 +359,7 @@ fn header_str(headers: &HeaderMap, name: header::HeaderName) -> Option<String> {
 
 async fn handle_request(
     State(app): State<AppState>,
-    ConnectInfo(from): ConnectInfo<SocketAddr>,
+    ConnectInfo(Peer(from)): ConnectInfo<Peer>,
     request: Request,
 ) -> Response {
     let path = request.uri().path().to_string();
@@ -297,7 +374,16 @@ async fn handle_request(
         let fault = state
             .fault_for_request
             .remove(&n)
+            .or_else(|| state.fault_for_source.get(&from.ip()).cloned())
             .unwrap_or_else(|| state.default_fault.clone());
+        // A blocked source is a blackholed link: new connections are
+        // dropped at accept, and a request arriving over a connection
+        // that was already open never gets an answer.
+        let fault = if state.blocked_sources.contains(&from.ip()) {
+            Fault::StallHeaders
+        } else {
+            fault
+        };
         let hold_at = state.hold_next_at.take();
 
         let count = *state
@@ -556,6 +642,21 @@ fn build_content_response(
                 let delay = Duration::from_millis(100);
                 while sent < full_len {
                     let chunk_len = clip_to_hold!(chunk.min(full_len - sent));
+                    let bytes = Bytes::from(content_range(seed, serve_start + sent, chunk_len));
+                    sent += chunk_len;
+                    bytes_sent.store(sent, std::sync::atomic::Ordering::Relaxed);
+                    yield Ok(bytes);
+                    maybe_hold!();
+                    tokio::time::sleep(delay).await;
+                }
+            }
+            Fault::Throttle(rate) => {
+                let rate = (*rate).max(1);
+                let piece = 16 * 1024u64;
+                #[allow(clippy::cast_precision_loss)]
+                let delay = Duration::from_secs_f64(piece as f64 / rate as f64);
+                while sent < full_len {
+                    let chunk_len = clip_to_hold!(piece.min(full_len - sent));
                     let bytes = Bytes::from(content_range(seed, serve_start + sent, chunk_len));
                     sent += chunk_len;
                     bytes_sent.store(sent, std::sync::atomic::Ordering::Relaxed);

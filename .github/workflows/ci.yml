@@ -42,6 +42,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
+      # The multi-link tests bind to 127.0.0.2/.3/.4. Linux and Windows
+      # treat all of 127/8 as loopback; macOS needs explicit aliases.
+      - name: Add loopback aliases (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          for n in 2 3 4; do sudo ifconfig lo0 alias 127.0.0.$n up; done
       - run: cargo test --workspace --all-targets
 
   deny:

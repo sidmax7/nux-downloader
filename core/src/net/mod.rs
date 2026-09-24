@@ -5,3 +5,6 @@
 pub mod bind;
 pub mod client;
 pub mod discover;
+pub mod health;
+pub mod label;
+pub mod monitor;

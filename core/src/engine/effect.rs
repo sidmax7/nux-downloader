@@ -52,6 +52,9 @@ pub struct PreparedFile {
 /// reconstructing it from a stream of events.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EngineEvent {
+    /// The set of usable links changed (P3.4); read the new set from a
+    /// snapshot.
+    LinksChanged,
     PackageAdded {
         package: PackageId,
     },

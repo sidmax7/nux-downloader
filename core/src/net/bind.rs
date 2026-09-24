@@ -26,6 +26,37 @@ pub enum BindMode {
     Address(IpAddr),
 }
 
+/// How the driver pins connections to links.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindPolicy {
+    /// Unbound: the OS routes every connection. Tests with fake links,
+    /// and the CLI's `--unbound`.
+    Off,
+    /// The platform default (`default_bind_mode`): the interface where
+    /// that works, otherwise the source address.
+    Auto,
+    /// Always the link's source address. What loopback-alias test links
+    /// need, since they share one interface (`lo`).
+    Address,
+}
+
+impl BindPolicy {
+    /// The bind mode to use for `link`, or `None` for `Off` (and for a
+    /// link with nothing to bind to).
+    #[must_use]
+    pub fn mode_for(self, link: &Link) -> Option<BindMode> {
+        match self {
+            Self::Off => None,
+            Self::Auto => default_bind_mode(link),
+            Self::Address => link
+                .v4
+                .map(IpAddr::V4)
+                .or_else(|| link.v6.map(IpAddr::V6))
+                .map(BindMode::Address),
+        }
+    }
+}
+
 /// The platform's mode for `link`, chosen in this one place. `None` if
 /// the platform needs an address and the link has none.
 #[must_use]

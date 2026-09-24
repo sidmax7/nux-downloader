@@ -8,6 +8,8 @@ use crate::driver::Driver;
 use crate::engine::{Command, EngineEvent, EngineSnapshot, EngineState};
 use crate::error::{EngineError, StorageError};
 use crate::model::{Link, LinkId, LinkKind, PackageId, Priority};
+use crate::net::bind::BindPolicy;
+use crate::net::monitor::LinkSetup;
 use crate::storage::manifest::{
     QUEUE_SCHEMA_VERSION, QueueManifest, QueueSettings, load_all_package_manifests,
     load_queue_manifest, save_queue_manifest,
@@ -47,11 +49,9 @@ pub struct Engine {
     queue_path: PathBuf,
 }
 
-/// A single synthetic link standing in for `net::discover`'s real output
-/// until Phase 3 (`ARCHITECTURE.md` §6.1). It carries no address because
-/// nothing yet binds a connection to one (`net::bind` is P3.2) — the
-/// driver's clients just let the OS route, same as the unbound default
-/// client probes already use.
+/// The single synthetic link `Engine::start` uses (`ARCHITECTURE.md`
+/// §6.1). It carries no address and its client is unbound, so the OS
+/// routes every connection, same as the default client probes use.
 fn default_link() -> Link {
     Link {
         id: LinkId::new(1),
@@ -83,9 +83,31 @@ impl Engine {
     /// `None`), restores engine state from them, and spawns the driver.
     /// Packages that were `Downloading` resume automatically unless
     /// `config.auto_resume_on_startup` is off (§9.4, rule 9).
+    ///
+    /// Uses one synthetic link and unbound clients — the OS routes every
+    /// connection. `start_with` chooses real, monitored links instead.
     pub async fn start(
         config: EngineConfig,
         data_dir: Option<PathBuf>,
+    ) -> Result<Self, EngineError> {
+        Self::start_with(
+            config,
+            data_dir,
+            LinkSetup::Fixed {
+                links: vec![default_link()],
+                bind: BindPolicy::Off,
+            },
+        )
+        .await
+    }
+
+    /// `start`, with the links coming from `links`: a fixed list, or
+    /// `LinkSetup::Monitored(MonitorSetup::system())` to discover the
+    /// machine's interfaces, bind each one, and follow changes (§6.1).
+    pub async fn start_with(
+        config: EngineConfig,
+        data_dir: Option<PathBuf>,
+        links: LinkSetup,
     ) -> Result<Self, EngineError> {
         let data_dir = match data_dir {
             Some(dir) => dir,
@@ -126,12 +148,7 @@ impl Engine {
             .collect();
 
         let (state, initial_effects) = EngineState::restore(config, &queue, packages);
-        let driver = Driver::spawn(
-            state,
-            initial_effects,
-            vec![default_link()],
-            manifest_dir.clone(),
-        );
+        let driver = Driver::spawn_with(state, initial_effects, links, manifest_dir.clone());
 
         Ok(Self {
             driver,
@@ -223,6 +240,7 @@ impl Engine {
             packages: Vec::new(),
             next_package_id: 0,
             next_file_id: 0,
+            links: Vec::new(),
         })
     }
 

@@ -2,13 +2,17 @@
 //! from periodic `Engine::snapshot()` polls (§19: 4 Hz) rather than a
 //! live byte-level event stream, which the engine doesn't emit yet.
 
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use nuxd_core::model::{FileId, FileStatus, Package};
+use indicatif::{HumanBytes, MultiProgress, ProgressBar, ProgressStyle};
+use nuxd_core::engine::LinkStats;
+use nuxd_core::model::{FileId, FileStatus, LinkId, Package};
+use nuxd_core::net::health::LinkState;
 use std::collections::HashMap;
 
 pub struct Bars {
     multi: MultiProgress,
     by_file: HashMap<FileId, ProgressBar>,
+    by_link: HashMap<LinkId, ProgressBar>,
+    warned_no_links: bool,
 }
 
 fn style() -> ProgressStyle {
@@ -23,6 +27,8 @@ impl Bars {
         Self {
             multi: MultiProgress::new(),
             by_file: HashMap::new(),
+            by_link: HashMap::new(),
+            warned_no_links: false,
         }
     }
 
@@ -48,7 +54,49 @@ impl Bars {
         }
     }
 
+    /// One status line per link: name, speed, bytes, health.
+    pub fn update_links(&mut self, links: &[LinkStats]) {
+        if links.is_empty() && !self.warned_no_links {
+            self.warned_no_links = true;
+            let _ = self
+                .multi
+                .println("nuxd: no usable network links yet — waiting for one (see `nuxd links`)");
+        }
+        for stats in links {
+            let bar = self.by_link.entry(stats.link.id).or_insert_with(|| {
+                let bar = self.multi.add(ProgressBar::new_spinner());
+                bar.set_style(
+                    ProgressStyle::with_template("{msg}")
+                        .unwrap_or_else(|_| ProgressStyle::default_spinner()),
+                );
+                bar
+            });
+            let health = match stats.state {
+                LinkState::Up => "up".to_string(),
+                LinkState::Degraded { .. } => "degraded".to_string(),
+            };
+            bar.set_message(format!(
+                "  {:<12} {:>12}/s {:>10}  {} conn  {health}",
+                truncate(&stats.link.name, 12),
+                HumanBytes(stats.speed as u64).to_string(),
+                HumanBytes(stats.bytes).to_string(),
+                stats.active,
+            ));
+        }
+        // A link that went away: drop its line.
+        self.by_link.retain(|id, bar| {
+            let present = links.iter().any(|stats| stats.link.id == *id);
+            if !present {
+                bar.finish_and_clear();
+            }
+            present
+        });
+    }
+
     pub fn finish(&self) {
+        for bar in self.by_link.values() {
+            bar.finish();
+        }
         for bar in self.by_file.values() {
             if !bar.is_finished() {
                 bar.finish();

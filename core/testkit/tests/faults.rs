@@ -573,3 +573,71 @@ async fn extra_headers_are_added_to_every_response() {
     let response = reqwest::get(origin.url()).await.unwrap();
     assert_eq!(response.headers().get("content-encoding").unwrap(), "gzip");
 }
+
+#[tokio::test]
+async fn throttle_serves_the_correct_body_at_a_limited_rate() {
+    let origin = origin(OriginOptions {
+        size: 200_000,
+        seed: 9,
+        ..Default::default()
+    })
+    .await;
+    origin.set_default_fault(Fault::Throttle(1_000_000));
+    let started = std::time::Instant::now();
+    let body = reqwest::get(origin.url())
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    assert_eq!(body.as_ref(), content_range(9, 0, 200_000).as_slice());
+    // 200 KB at 1 MB/s is ~200 ms; allow generous slack either way.
+    assert!(started.elapsed() >= Duration::from_millis(120));
+}
+
+#[tokio::test]
+async fn a_source_fault_applies_to_that_source_only_and_a_request_fault_wins() {
+    let origin = origin(OriginOptions {
+        size: 100,
+        seed: 3,
+        ..Default::default()
+    })
+    .await;
+    let from_2 = reqwest::Client::builder()
+        .local_address("127.0.0.2".parse::<std::net::IpAddr>().unwrap())
+        .build()
+        .unwrap();
+    origin.set_source_fault("127.0.0.2".parse().unwrap(), Fault::Status(503));
+
+    assert_eq!(from_2.get(origin.url()).send().await.unwrap().status(), 503);
+    assert_eq!(reqwest::get(origin.url()).await.unwrap().status(), 200);
+
+    origin.set_fault(3, Fault::Ok);
+    assert_eq!(from_2.get(origin.url()).send().await.unwrap().status(), 200);
+    assert_eq!(from_2.get(origin.url()).send().await.unwrap().status(), 503);
+}
+
+#[tokio::test]
+async fn a_blocked_source_gets_no_answer_until_unblocked() {
+    let origin = origin(OriginOptions {
+        size: 100,
+        seed: 4,
+        ..Default::default()
+    })
+    .await;
+    let source: std::net::IpAddr = "127.0.0.3".parse().unwrap();
+    let client = reqwest::Client::builder()
+        .local_address(source)
+        .timeout(Duration::from_millis(300))
+        .build()
+        .unwrap();
+    assert_eq!(client.get(origin.url()).send().await.unwrap().status(), 200);
+
+    origin.block_source(source);
+    assert!(client.get(origin.url()).send().await.is_err());
+    // Other sources are unaffected.
+    assert_eq!(reqwest::get(origin.url()).await.unwrap().status(), 200);
+
+    origin.unblock_source(source);
+    assert_eq!(client.get(origin.url()).send().await.unwrap().status(), 200);
+}

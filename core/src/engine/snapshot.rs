@@ -4,7 +4,8 @@
 //! `EngineState`, without going through `Input`/`Effect` at all, since a
 //! query changes nothing.
 
-use crate::model::Package;
+use crate::model::{Link, Package};
+use crate::net::health::LinkState;
 
 /// A cheap, point-in-time copy of everything a UI or CLI needs to render
 /// the queue: the packages, in queue order, plus the id counters
@@ -16,4 +17,20 @@ pub struct EngineSnapshot {
     pub packages: Vec<Package>,
     pub next_package_id: u64,
     pub next_file_id: u64,
+    /// The links the engine is currently scheduling onto, with their
+    /// health and throughput.
+    pub links: Vec<LinkStats>,
+}
+
+/// One link's live numbers.
+#[derive(Debug, Clone)]
+pub struct LinkStats {
+    pub link: Link,
+    pub state: LinkState,
+    /// Attempts currently running on this link.
+    pub active: u32,
+    /// Durable bytes this link has delivered since the engine started.
+    pub bytes: u64,
+    /// Smoothed delivery rate, bytes per second.
+    pub speed: f64,
 }

@@ -12,6 +12,7 @@ use crate::model::{
     AttemptId, FileEntry, FileError, FileId, FileStatus, Link, LinkId, Package, PackageError,
     PackageId, PackageStatus, PartStatus,
 };
+use crate::net::health::{LinkHealth, LinkState};
 use crate::plan;
 use crate::sched;
 use crate::storage::manifest::{PackageManifest, QueueManifest};
@@ -44,6 +45,14 @@ struct AttemptState {
     range_start: u64,
 }
 
+/// Smoothed delivery rate of one link, sampled on ticks.
+#[derive(Debug, Clone, Copy, Default)]
+struct Meter {
+    last_bytes: u64,
+    last_at: Option<Instant>,
+    speed: f64,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 struct CheckpointState {
     bytes_since: u64,
@@ -60,6 +69,11 @@ pub struct EngineState {
     package_index: HashMap<PackageId, usize>,
     file_index: HashMap<FileId, (PackageId, usize)>,
     links: Vec<Link>,
+    /// Circuit-breaker state per link (§6.4); absent means healthy.
+    health: HashMap<LinkId, LinkHealth>,
+    /// Durable bytes credited to each link since this engine started.
+    link_bytes: HashMap<LinkId, u64>,
+    meters: HashMap<LinkId, Meter>,
     attempts: HashMap<AttemptId, AttemptState>,
     blocks: HashMap<(FileId, u32), BlockRuntime>,
     checkpoints: HashMap<PackageId, CheckpointState>,
@@ -77,6 +91,9 @@ impl EngineState {
             package_index: HashMap::new(),
             file_index: HashMap::new(),
             links: Vec::new(),
+            health: HashMap::new(),
+            link_bytes: HashMap::new(),
+            meters: HashMap::new(),
             attempts: HashMap::new(),
             blocks: HashMap::new(),
             checkpoints: HashMap::new(),
@@ -117,6 +134,35 @@ impl EngineState {
         self.attempts.len()
     }
 
+    /// A link's circuit-breaker state (§6.4).
+    #[must_use]
+    pub fn link_state(&self, id: LinkId) -> LinkState {
+        self.health
+            .get(&id)
+            .map_or(LinkState::Up, LinkHealth::state)
+    }
+
+    /// Durable bytes credited to `id` since this engine started.
+    #[must_use]
+    pub fn link_bytes(&self, id: LinkId) -> u64 {
+        self.link_bytes.get(&id).copied().unwrap_or(0)
+    }
+
+    /// Test-only peeks at scheduler bookkeeping the public API doesn't
+    /// expose.
+    #[cfg(test)]
+    pub(crate) fn attempt_link(&self, id: AttemptId) -> LinkId {
+        self.attempts
+            .get(&id)
+            .unwrap_or_else(|| panic!("no attempt {id:?}"))
+            .link
+    }
+
+    #[cfg(test)]
+    pub(crate) fn block_retries(&self, file: FileId, block: u32) -> u32 {
+        self.blocks.get(&(file, block)).map_or(0, |b| b.retries)
+    }
+
     /// The id counters as of right now — persisted in `queue.json` so a
     /// restart never reuses an id a completed or removed package's
     /// leftover state might still reference (§9.4).
@@ -131,6 +177,20 @@ impl EngineState {
             packages: self.packages.clone(),
             next_package_id: self.next_package_id,
             next_file_id: self.next_file_id,
+            links: self
+                .links
+                .iter()
+                .map(|link| super::LinkStats {
+                    link: link.clone(),
+                    state: self.link_state(link.id),
+                    active: u32::try_from(
+                        self.attempts.values().filter(|a| a.link == link.id).count(),
+                    )
+                    .unwrap_or(u32::MAX),
+                    bytes: self.link_bytes(link.id),
+                    speed: self.meters.get(&link.id).map_or(0.0, |m| m.speed),
+                })
+                .collect(),
         }
     }
 
@@ -251,10 +311,54 @@ impl EngineState {
             Input::CheckpointDone { package, result } => {
                 self.handle_checkpoint_done(package, result, &mut effects);
             }
-            Input::LinksChanged(links) => self.links = links,
+            Input::LinksChanged(links) => self.handle_links_changed(links, &mut effects),
         }
         self.fill_slots(now, &mut effects);
         effects
+    }
+
+    /// Folds a fresh link scan in (§6.1). An attempt on a link that
+    /// vanished — or whose addresses changed, which breaks a connection
+    /// bound to the old ones — is aborted with `LinkLost`. Its block goes
+    /// straight back to pending: no retry is counted and the link isn't
+    /// added to the block's avoid set, because the link did nothing
+    /// wrong that a healthy link wouldn't repeat. New links get slots
+    /// from the `fill_slots` pass that ends every `handle` call.
+    fn handle_links_changed(&mut self, links: Vec<Link>, effects: &mut Vec<Effect>) {
+        if links == self.links {
+            return;
+        }
+        let lost: Vec<AttemptId> = self
+            .attempts
+            .iter()
+            .filter(|(_, attempt)| {
+                let before = self.links.iter().find(|l| l.id == attempt.link);
+                let after = links.iter().find(|l| l.id == attempt.link);
+                match (before, after) {
+                    (_, None) => true,
+                    (Some(before), Some(after)) => before.v4 != after.v4 || before.v6 != after.v6,
+                    (None, Some(_)) => false,
+                }
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in lost {
+            if let Some(attempt) = self.attempts.remove(&id) {
+                if let Some(block) = self.blocks.get_mut(&(attempt.file, attempt.block)) {
+                    block.in_flight = None;
+                }
+                effects.push(Effect::AbortAttempt {
+                    id,
+                    reason: AbortReason::LinkLost,
+                });
+            }
+        }
+        self.health
+            .retain(|id, _| links.iter().any(|link| link.id == *id));
+        self.meters
+            .retain(|id, _| links.iter().any(|link| link.id == *id));
+        self.links = links;
+        effects.push(Effect::Emit(EngineEvent::LinksChanged));
     }
 
     // --- id allocation (§9.4: "the engine owns the counters") ---
@@ -680,6 +784,9 @@ impl EngineState {
             part.durable = delta_from_block_start;
             part.link = Some(link);
             self.checkpoints.entry(package_id).or_default().bytes_since += delta;
+            // Bytes arrived over this link: it works (§6.4).
+            self.health.entry(link).or_default().record_success();
+            *self.link_bytes.entry(link).or_default() += delta;
         }
     }
 
@@ -700,6 +807,7 @@ impl EngineState {
             self.apply_position(package_id, index, attempt.block, attempt.link, position);
             touched.insert(package_id);
         }
+        self.update_meters(now);
         for package_id in &touched {
             self.maybe_checkpoint(*package_id, now, effects);
         }
@@ -711,6 +819,24 @@ impl EngineState {
             .collect();
         for package_id in due {
             self.maybe_checkpoint(package_id, now, effects);
+        }
+    }
+
+    /// Folds each link's byte total into its smoothed speed.
+    fn update_meters(&mut self, now: Instant) {
+        const SMOOTHING: f64 = 0.3;
+        for link in &self.links {
+            let bytes = self.link_bytes.get(&link.id).copied().unwrap_or(0);
+            let meter = self.meters.entry(link.id).or_default();
+            if let Some(last_at) = meter.last_at {
+                let secs = now.duration_since(last_at).as_secs_f64();
+                if secs > 0.0 {
+                    let instant = bytes.saturating_sub(meter.last_bytes) as f64 / secs;
+                    meter.speed += SMOOTHING * (instant - meter.speed);
+                }
+            }
+            meter.last_bytes = bytes;
+            meter.last_at = Some(now);
         }
     }
 
@@ -780,6 +906,12 @@ impl EngineState {
                 }
             }
             AttemptOutcome::Failed(error) => {
+                if blame(&error) == Blame::Link {
+                    let health = self.health.entry(attempt.link).or_default();
+                    if let Some(until) = health.record_failure(now, &self.config) {
+                        effects.push(Effect::WakeAt(until));
+                    }
+                }
                 self.handle_attempt_failure(package_id, index, block_key, &error, now, effects);
             }
         }
@@ -832,8 +964,10 @@ impl EngineState {
         effects: &mut Vec<Effect>,
     ) {
         match blame(error) {
-            // §16: link health/backoff is Phase 3's job (§6.4); for now
-            // the block simply retries, uncounted and without delay.
+            // §16: the block retries at once and uncounted — the link,
+            // not the block, is what's suspect. The link's circuit
+            // breaker (§6.4) is what stops a dead link from being tried
+            // forever.
             Blame::Link => {}
             Blame::Attempt | Blame::Host => {
                 let retries = {
@@ -1044,95 +1178,112 @@ impl EngineState {
             .collect()
     }
 
-    /// Fills every free slot on every link, in one pass, per `pick_work`
-    /// (§7.2) — called at the end of every `handle` call so the engine
-    /// stays work-conserving regardless of which input triggered it.
+    /// Fills every free slot on every link (§7.2), one attempt per link
+    /// per round so the links' first blocks interleave instead of the
+    /// first link taking everything — called at the end of every
+    /// `handle` call so the engine stays work-conserving regardless of
+    /// which input triggered it.
     fn fill_slots(&mut self, now: Instant, effects: &mut Vec<Effect>) {
         let links = self.links.clone();
-        for link in links {
-            loop {
-                let active_on_link = u32::try_from(
-                    self.attempts
-                        .values()
-                        .filter(|attempt| attempt.link == link.id)
-                        .count(),
-                )
-                .unwrap_or(u32::MAX);
-                if active_on_link >= u32::from(link.max_slots) {
-                    break;
-                }
-                if u32::try_from(self.attempts.len()).unwrap_or(u32::MAX)
-                    >= self.config.max_connections_total
-                {
-                    break;
-                }
-
-                let candidates = self.build_candidates(now);
-                if candidates.is_empty() {
-                    break;
-                }
-                let host_map = self.active_attempt_hosts();
-                let active: Vec<sched::ActiveAttempt<'_>> = self
-                    .attempts
-                    .iter()
-                    .filter_map(|(id, attempt)| {
-                        let host = host_map.get(id)?;
-                        Some(sched::ActiveAttempt {
-                            file: attempt.file,
-                            link: attempt.link,
-                            host: host.as_str(),
-                        })
-                    })
-                    .collect();
-                let view = sched::SchedulerView {
-                    files: &candidates,
-                    active: &active,
-                    hosts: &self.config.hosts,
-                    config: &self.config,
-                };
-                let Some(work) = sched::pick_work(&view, link.id) else {
-                    break;
-                };
-                match work {
-                    sched::Work::Primary {
-                        file,
-                        block,
-                        range,
-                        file_offset,
-                    } => {
-                        let Some(&(package_id, index)) = self.file_index.get(&file) else {
-                            break;
-                        };
-                        let Some(url) = self
-                            .package_ref(package_id)
-                            .and_then(|p| p.files[index].url.clone())
-                        else {
-                            break;
-                        };
-                        let id = self.alloc_attempt_id();
-                        self.attempts.insert(
-                            id,
-                            AttemptState {
-                                package: package_id,
-                                file,
-                                block,
-                                link: link.id,
-                                range_start: range.start,
-                            },
-                        );
-                        self.blocks.entry((file, block)).or_default().in_flight = Some(id);
-                        effects.push(Effect::StartAttempt {
-                            id,
-                            file,
-                            url,
-                            range,
-                            file_offset,
-                            link: link.id,
-                        });
-                    }
-                }
+        loop {
+            let mut started = false;
+            for link in &links {
+                started |= self.start_one_on(link, now, effects);
+            }
+            if !started {
+                break;
             }
         }
+    }
+
+    /// Starts at most one attempt on `link`, if it has a free slot (its
+    /// own cap, narrowed by its health) and the scheduler has work for
+    /// it. Returns whether one was started.
+    fn start_one_on(&mut self, link: &Link, now: Instant, effects: &mut Vec<Effect>) -> bool {
+        let cap = self
+            .health
+            .get(&link.id)
+            .map_or(u32::from(link.max_slots), |health| {
+                health.slot_cap(u32::from(link.max_slots), now)
+            });
+        let active_on_link = u32::try_from(
+            self.attempts
+                .values()
+                .filter(|attempt| attempt.link == link.id)
+                .count(),
+        )
+        .unwrap_or(u32::MAX);
+        if active_on_link >= cap {
+            return false;
+        }
+        if u32::try_from(self.attempts.len()).unwrap_or(u32::MAX)
+            >= self.config.max_connections_total
+        {
+            return false;
+        }
+
+        let candidates = self.build_candidates(now);
+        if candidates.is_empty() {
+            return false;
+        }
+        let host_map = self.active_attempt_hosts();
+        let active: Vec<sched::ActiveAttempt<'_>> = self
+            .attempts
+            .iter()
+            .filter_map(|(id, attempt)| {
+                let host = host_map.get(id)?;
+                Some(sched::ActiveAttempt {
+                    file: attempt.file,
+                    link: attempt.link,
+                    host: host.as_str(),
+                })
+            })
+            .collect();
+        let view = sched::SchedulerView {
+            files: &candidates,
+            active: &active,
+            hosts: &self.config.hosts,
+            config: &self.config,
+        };
+        let Some(work) = sched::pick_work(&view, link.id) else {
+            return false;
+        };
+        let sched::Work::Primary {
+            file,
+            block,
+            range,
+            file_offset,
+        } = work;
+        let Some(&(package_id, index)) = self.file_index.get(&file) else {
+            return false;
+        };
+        let Some(url) = self
+            .package_ref(package_id)
+            .and_then(|p| p.files[index].url.clone())
+        else {
+            return false;
+        };
+        let id = self.alloc_attempt_id();
+        self.attempts.insert(
+            id,
+            AttemptState {
+                package: package_id,
+                file,
+                block,
+                link: link.id,
+                range_start: range.start,
+            },
+        );
+        self.blocks.entry((file, block)).or_default().in_flight = Some(id);
+        effects.push(Effect::StartAttempt {
+            id,
+            file,
+            url,
+            range,
+            file_offset,
+            link: link.id,
+        });
+        true
     }
 }
 

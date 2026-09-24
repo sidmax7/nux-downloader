@@ -19,7 +19,7 @@ pub struct RawAddr {
 
 /// Where interface addresses come from. `SystemLinkSource` is the real
 /// one; tests supply their own.
-pub trait LinkSource {
+pub trait LinkSource: Send + Sync {
     fn addresses(&self) -> io::Result<Vec<RawAddr>>;
 }
 

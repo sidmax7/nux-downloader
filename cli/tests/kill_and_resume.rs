@@ -48,6 +48,8 @@ async fn kill_nine_mid_download_then_resume_is_byte_exact() {
         // the default 256 KiB buffer wouldn't flush at all for a file
         // this size before the kill below.
         .args(["--write-buffer-bytes", "8192"])
+        // The origin is on loopback, which no discovered link reaches.
+        .arg("--unbound")
         .args(["get", &origin.url(), "-o"])
         .arg(dest_dir.path())
         .stdout(Stdio::null())
@@ -94,6 +96,7 @@ async fn kill_nine_mid_download_then_resume_is_byte_exact() {
     let status = nuxd()
         .args(["--data-dir"])
         .arg(data_dir.path())
+        .arg("--unbound")
         .arg("resume")
         .stdout(Stdio::null())
         .stderr(Stdio::null())

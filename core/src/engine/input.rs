@@ -50,9 +50,8 @@ pub enum AttemptOutcome {
 }
 
 /// Why the driver should abort an in-flight attempt (§14.1's `Effect`
-/// doc comment). `Refresh`, `Lost` and `LinkLost` are unused until
-/// hedging and link monitoring land (P7.1, P3.4) but are part of the
-/// type now so `Effect::AbortAttempt` doesn't need to change shape then.
+/// doc comment). `Refresh` and `Lost` are unused until hedging lands
+/// (P7.1) but are part of the type now so `Effect::AbortAttempt` doesn't need to change shape then.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AbortReason {
     Pause,
@@ -97,8 +96,8 @@ pub enum Input {
         package: PackageId,
         result: Result<(), StorageError>,
     },
-    /// A fresh interface scan (P3.1/P3.4). M1's driver calls this once at
-    /// startup with a single synthetic link; nothing else produces it
-    /// until Phase 3's `net::discover` exists.
+    /// A fresh interface scan (P3.4): the complete set of usable links
+    /// now. The driver sends it once at startup and again whenever the
+    /// link monitor sees the set change.
     LinksChanged(Vec<Link>),
 }

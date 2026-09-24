@@ -6,6 +6,7 @@ mod progress;
 use clap::{Parser, Subcommand};
 use nuxd_core::config::EngineConfig;
 use nuxd_core::model::{PackageId, PackageStatus};
+use nuxd_core::net::monitor::{self, LinkSetup, MonitorSetup};
 use nuxd_core::{AddOptions, Engine};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -33,6 +34,19 @@ struct Cli {
     /// worth of already-received bytes.
     #[arg(long, global = true, value_name = "BYTES")]
     write_buffer_bytes: Option<usize>,
+    /// Don't discover or bind to network interfaces: use one link and let
+    /// the OS route every connection.
+    #[arg(long, global = true)]
+    unbound: bool,
+}
+
+/// The global options that shape how the engine starts.
+struct StartOpts {
+    data_dir: Option<PathBuf>,
+    write_buffer_bytes: Option<usize>,
+    unbound: bool,
+    /// Restrict to these interface names (`get --links`).
+    only_links: Option<Vec<String>>,
 }
 
 #[derive(Subcommand)]
@@ -46,7 +60,13 @@ enum Command {
         /// Destination directory (default: the current directory).
         #[arg(short = 'o', long = "output", value_name = "DIR")]
         output: Option<PathBuf>,
+        /// Use only these network interfaces (comma-separated names, as
+        /// `nuxd links` shows them). Default: every usable link.
+        #[arg(long, value_delimiter = ',', value_name = "NAMES")]
+        links: Option<Vec<String>>,
     },
+    /// Lists the network links (interfaces) downloads can use.
+    Links,
     /// Lists every package the engine knows about.
     List,
     /// Resumes any interrupted packages and waits for them to finish.
@@ -57,24 +77,42 @@ enum Command {
 async fn main() -> ExitCode {
     let _ = tracing_subscriber::fmt::try_init();
     let cli = Cli::parse();
+    let opts = StartOpts {
+        data_dir: cli.data_dir,
+        write_buffer_bytes: cli.write_buffer_bytes,
+        unbound: cli.unbound,
+        only_links: None,
+    };
+    let mut opts = opts;
     match cli.command {
-        Command::Get { urls, output } => {
-            run_get(urls, output, cli.data_dir, cli.write_buffer_bytes).await
+        Command::Get {
+            urls,
+            output,
+            links,
+        } => {
+            opts.only_links = links;
+            run_get(urls, output, opts).await
         }
-        Command::List => run_list(cli.data_dir, cli.write_buffer_bytes).await,
-        Command::Resume => run_resume(cli.data_dir, cli.write_buffer_bytes).await,
+        Command::Links => run_links().await,
+        Command::List => run_list(opts).await,
+        Command::Resume => run_resume(opts).await,
     }
 }
 
-async fn start_engine(
-    data_dir: Option<PathBuf>,
-    write_buffer_bytes: Option<usize>,
-) -> Option<Engine> {
+async fn start_engine(opts: StartOpts) -> Option<Engine> {
     let mut config = EngineConfig::default();
-    if let Some(write_buffer_bytes) = write_buffer_bytes {
+    if let Some(write_buffer_bytes) = opts.write_buffer_bytes {
         config.write_buffer_bytes = write_buffer_bytes;
     }
-    match Engine::start(config, data_dir).await {
+    let started = if opts.unbound {
+        Engine::start(config, opts.data_dir).await
+    } else {
+        let mut setup = MonitorSetup::system();
+        setup.only = opts.only_links;
+        let links = LinkSetup::Monitored(setup);
+        Engine::start_with(config, opts.data_dir, links).await
+    };
+    match started {
         Ok(engine) => Some(engine),
         Err(error) => {
             eprintln!("nuxd: couldn't start the engine: {error}");
@@ -83,17 +121,78 @@ async fn start_engine(
     }
 }
 
-async fn run_get(
-    urls: Vec<String>,
-    output: Option<PathBuf>,
-    data_dir: Option<PathBuf>,
-    write_buffer_bytes: Option<usize>,
-) -> ExitCode {
+/// `nuxd links`: what discovery finds right now, with friendly labels.
+async fn run_links() -> ExitCode {
+    let setup = MonitorSetup::system();
+    let links = match monitor::scan(&setup, &EngineConfig::default(), &[]).await {
+        Ok(links) => links,
+        Err(error) => {
+            eprintln!("nuxd: couldn't list network interfaces: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    if links.is_empty() {
+        println!(
+            "nuxd: no usable network links (need an up interface with a non-loopback, non-link-local address)"
+        );
+        return ExitCode::SUCCESS;
+    }
+    println!("{:<14} {:<10} {:<28} ADDRESSES", "NAME", "KIND", "LABEL");
+    for link in &links {
+        let addresses: Vec<String> = link
+            .v4
+            .map(|ip| ip.to_string())
+            .into_iter()
+            .chain(link.v6.map(|ip| ip.to_string()))
+            .collect();
+        println!(
+            "{:<14} {:<10} {:<28} {}",
+            link.name,
+            format!("{:?}", link.kind),
+            link.label,
+            addresses.join(", ")
+        );
+    }
+    ExitCode::SUCCESS
+}
+
+/// Checks `--links` against what discovery finds, so a typo is an error
+/// up front instead of a download that silently waits for a link that
+/// will never exist. Returns whether to go on.
+async fn check_requested_links(names: &[String]) -> bool {
+    let setup = MonitorSetup::system();
+    let Ok(found) = monitor::scan(&setup, &EngineConfig::default(), &[]).await else {
+        return true; // can't tell; let the engine try
+    };
+    let missing: Vec<&String> = names
+        .iter()
+        .filter(|name| !found.iter().any(|link| link.name == **name))
+        .collect();
+    if missing.len() == names.len() {
+        eprintln!(
+            "nuxd: none of the requested links ({}) exist — see `nuxd links`",
+            names.join(", ")
+        );
+        return false;
+    }
+    for name in missing {
+        eprintln!("nuxd: warning: link {name} not found; continuing without it");
+    }
+    true
+}
+
+async fn run_get(urls: Vec<String>, output: Option<PathBuf>, opts: StartOpts) -> ExitCode {
     if urls.is_empty() {
         eprintln!("nuxd get: at least one URL is required");
         return ExitCode::from(2);
     }
-    let Some(engine) = start_engine(data_dir, write_buffer_bytes).await else {
+    if let Some(names) = &opts.only_links
+        && !opts.unbound
+        && !check_requested_links(names).await
+    {
+        return ExitCode::from(2);
+    }
+    let Some(engine) = start_engine(opts).await else {
         return ExitCode::from(2);
     };
 
@@ -129,8 +228,8 @@ async fn run_get(
     wait_for_packages(engine, ids).await
 }
 
-async fn run_resume(data_dir: Option<PathBuf>, write_buffer_bytes: Option<usize>) -> ExitCode {
-    let Some(engine) = start_engine(data_dir, write_buffer_bytes).await else {
+async fn run_resume(opts: StartOpts) -> ExitCode {
+    let Some(engine) = start_engine(opts).await else {
         return ExitCode::from(2);
     };
 
@@ -157,8 +256,8 @@ async fn run_resume(data_dir: Option<PathBuf>, write_buffer_bytes: Option<usize>
     wait_for_packages(engine, ids).await
 }
 
-async fn run_list(data_dir: Option<PathBuf>, write_buffer_bytes: Option<usize>) -> ExitCode {
-    let Some(engine) = start_engine(data_dir, write_buffer_bytes).await else {
+async fn run_list(opts: StartOpts) -> ExitCode {
+    let Some(engine) = start_engine(opts).await else {
         return ExitCode::from(2);
     };
     let snapshot = engine.snapshot().await;
@@ -217,6 +316,7 @@ async fn wait_for_packages(engine: Engine, ids: Vec<PackageId>) -> ExitCode {
         }
 
         let snapshot = engine.snapshot().await;
+        bars.update_links(&snapshot.links);
         let mut all_settled = true;
         for &id in &ids {
             let Some(package) = snapshot.packages.iter().find(|package| package.id == id) else {

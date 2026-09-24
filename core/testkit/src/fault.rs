@@ -30,6 +30,11 @@ pub enum Fault {
     /// Trickle the body at this rate (bytes/sec) in small pieces — slow,
     /// but never silent long enough on its own to look stalled.
     Crawl(u64),
+    /// Serve the correct body at up to this many bytes/sec — a link of a
+    /// given speed, for multi-link tests. Unlike `Crawl` (which stays
+    /// under ~40 KB/s so a stall test can outlast a timeout) this can
+    /// model megabytes per second.
+    Throttle(u64),
     /// Reply with this status and no body.
     Status(u16),
     /// Redirect to this URL (a `302`).

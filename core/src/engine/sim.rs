@@ -7,6 +7,8 @@
 use super::{Effect, EngineEvent, EngineState};
 use crate::error::ProbeError;
 use crate::model::{Link, LinkId, LinkKind, PackageStatus};
+#[cfg(test)]
+use crate::net::health::LinkState;
 use crate::probe::ProbeResult;
 use std::net::Ipv4Addr;
 
@@ -696,5 +698,495 @@ mod tests {
         );
         let new_package = package_added(&effects).unwrap();
         assert_eq!(new_package, crate::model::PackageId::new(4));
+    }
+
+    fn link(id: u64, name: &str, slots: u8) -> Link {
+        Link {
+            id: LinkId::new(id),
+            name: name.to_string(),
+            label: name.to_string(),
+            kind: LinkKind::Other,
+            v4: Some(Ipv4Addr::new(10, 0, u8::try_from(id).unwrap_or(0), 2)),
+            v6: None,
+            max_slots: slots,
+            limit: None,
+        }
+    }
+
+    #[test]
+    fn a_link_lost_mid_block_aborts_uncounted_and_moves_the_block() {
+        let mut state = EngineState::new(EngineConfig::default());
+        let now = Instant::now();
+        state.handle(
+            Input::LinksChanged(vec![link(1, "a0", 4), link(2, "b0", 4)]),
+            now,
+        );
+        let (_, file) = add_single_file(&mut state, now, "http://example.com/f.bin");
+        let (attempt, _) =
+            activate_and_start(&mut state, now, file, "http://example.com/f.bin", 1000);
+        let on_link = state.attempt_link(attempt);
+
+        let survivors: Vec<Link> = state
+            .links()
+            .iter()
+            .filter(|l| l.id != on_link)
+            .cloned()
+            .collect();
+        let effects = state.handle(Input::LinksChanged(survivors.clone()), now);
+        check_invariants(&state);
+
+        assert!(effects.iter().any(|e| matches!(
+            e,
+            Effect::AbortAttempt { id, reason: AbortReason::LinkLost } if *id == attempt
+        )));
+        let (restarted, _) = find_start_attempt(&effects, file)
+            .unwrap_or_else(|| panic!("block should restart on the surviving link: {effects:?}"));
+        assert_ne!(restarted, attempt);
+        assert_eq!(state.attempt_link(restarted), survivors[0].id);
+        assert_eq!(state.block_retries(file, 0), 0, "LinkLost must not count");
+        assert!(effects.contains(&Effect::Emit(EngineEvent::LinksChanged)));
+    }
+
+    #[test]
+    fn losing_the_only_link_parks_the_block_until_a_link_returns() {
+        let mut state = EngineState::new(EngineConfig::default());
+        let now = Instant::now();
+        state.handle(Input::LinksChanged(vec![link(1, "a0", 4)]), now);
+        let (_, file) = add_single_file(&mut state, now, "http://example.com/f.bin");
+        activate_and_start(&mut state, now, file, "http://example.com/f.bin", 1000);
+
+        let effects = state.handle(Input::LinksChanged(Vec::new()), now);
+        assert_eq!(state.attempt_count(), 0);
+        assert!(find_start_attempt(&effects, file).is_none());
+
+        let effects = state.handle(Input::LinksChanged(vec![link(1, "a0", 4)]), now);
+        assert!(find_start_attempt(&effects, file).is_some());
+        assert_eq!(state.block_retries(file, 0), 0);
+    }
+
+    #[test]
+    fn a_link_added_mid_download_takes_pending_blocks_immediately() {
+        let mut state = EngineState::new(EngineConfig::default());
+        let now = Instant::now();
+        state.handle(Input::LinksChanged(vec![link(1, "a0", 1)]), now);
+        let (_, file) = add_single_file(&mut state, now, "http://example.com/big.bin");
+        // Several blocks, but link a0 only has one slot.
+        activate_and_start(
+            &mut state,
+            now,
+            file,
+            "http://example.com/big.bin",
+            64 * 1024 * 1024,
+        );
+        assert_eq!(state.attempt_count(), 1);
+
+        let effects = state.handle(
+            Input::LinksChanged(vec![link(1, "a0", 1), link(2, "b0", 3)]),
+            now,
+        );
+        check_invariants(&state);
+        let started_on_new: Vec<_> = effects
+            .iter()
+            .filter(|e| matches!(e, Effect::StartAttempt { link, .. } if *link == LinkId::new(2)))
+            .collect();
+        assert_eq!(started_on_new.len(), 3, "new link's slots fill at once");
+        assert_eq!(state.attempt_count(), 4);
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::AbortAttempt { .. })),
+            "existing attempts are untouched"
+        );
+    }
+
+    #[test]
+    fn a_link_whose_address_changed_is_treated_as_lost_and_replaced() {
+        let mut state = EngineState::new(EngineConfig::default());
+        let now = Instant::now();
+        state.handle(Input::LinksChanged(vec![link(1, "a0", 4)]), now);
+        let (_, file) = add_single_file(&mut state, now, "http://example.com/f.bin");
+        let (attempt, _) =
+            activate_and_start(&mut state, now, file, "http://example.com/f.bin", 1000);
+
+        let mut moved = link(1, "a0", 4);
+        moved.v4 = Some(Ipv4Addr::new(192, 168, 9, 9));
+        let effects = state.handle(Input::LinksChanged(vec![moved]), now);
+        assert!(effects.iter().any(|e| matches!(
+            e,
+            Effect::AbortAttempt { id, reason: AbortReason::LinkLost } if *id == attempt
+        )));
+        assert!(find_start_attempt(&effects, file).is_some());
+    }
+
+    #[test]
+    fn an_unchanged_scan_does_nothing() {
+        let mut state = EngineState::new(EngineConfig::default());
+        let now = Instant::now();
+        state.handle(Input::LinksChanged(vec![link(1, "a0", 4)]), now);
+        let effects = state.handle(Input::LinksChanged(vec![link(1, "a0", 4)]), now);
+        assert!(effects.is_empty());
+    }
+
+    // --- link health (P3.5) ---
+
+    fn fail_connect(
+        state: &mut EngineState,
+        now: Instant,
+        attempt: crate::model::AttemptId,
+        position: u64,
+    ) -> Vec<Effect> {
+        let effects = state.handle(
+            Input::AttemptEnded {
+                id: attempt,
+                outcome: AttemptOutcome::Failed(TransferError::Connect("refused".to_string())),
+                position,
+            },
+            now,
+        );
+        check_invariants(state);
+        effects
+    }
+
+    #[test]
+    fn a_dead_link_degrades_and_never_burns_the_blocks_retries() {
+        let mut state = EngineState::new(EngineConfig::default());
+        let now = Instant::now();
+        state.handle(Input::LinksChanged(vec![link(1, "usb0", 4)]), now);
+        let (_, file) = add_single_file(&mut state, now, "http://example.com/f.bin");
+        let (mut attempt, range) =
+            activate_and_start(&mut state, now, file, "http://example.com/f.bin", 1000);
+
+        for failure in 1..=2 {
+            let effects = fail_connect(&mut state, now, attempt, range.start);
+            (attempt, _) = find_start_attempt(&effects, file)
+                .unwrap_or_else(|| panic!("failure {failure} should retry at once"));
+        }
+        let effects = fail_connect(&mut state, now, attempt, range.start);
+        assert!(
+            find_start_attempt(&effects, file).is_none(),
+            "3rd failure degrades"
+        );
+        let until = now + Duration::from_secs(5);
+        assert_eq!(
+            state.link_state(LinkId::new(1)),
+            LinkState::Degraded { until }
+        );
+        assert!(effects.contains(&Effect::WakeAt(until)));
+        assert_eq!(
+            state.block_retries(file, 0),
+            0,
+            "link blame is never counted"
+        );
+
+        // Still skipped just before the backoff ends…
+        let effects = state.handle(
+            Input::Tick {
+                progress: Vec::new(),
+            },
+            now + Duration::from_secs(4),
+        );
+        assert!(find_start_attempt(&effects, file).is_none());
+        // …and one trial afterwards.
+        let effects = state.handle(
+            Input::Tick {
+                progress: Vec::new(),
+            },
+            until,
+        );
+        let (trial, _) = find_start_attempt(&effects, file)
+            .unwrap_or_else(|| panic!("half-open trial expected: {effects:?}"));
+
+        // The trial fails too: degraded again, twice as long.
+        let effects = fail_connect(&mut state, until, trial, range.start);
+        assert!(find_start_attempt(&effects, file).is_none());
+        let until2 = until + Duration::from_secs(10);
+        assert_eq!(
+            state.link_state(LinkId::new(1)),
+            LinkState::Degraded { until: until2 }
+        );
+        assert_eq!(state.block_retries(file, 0), 0);
+    }
+
+    #[test]
+    fn a_recovering_link_returns_to_up_after_a_successful_trial() {
+        let mut state = EngineState::new(EngineConfig::default());
+        let now = Instant::now();
+        state.handle(Input::LinksChanged(vec![link(1, "usb0", 4)]), now);
+        let (_, file) = add_single_file(&mut state, now, "http://example.com/f.bin");
+        let (mut attempt, range) =
+            activate_and_start(&mut state, now, file, "http://example.com/f.bin", 1000);
+        for _ in 0..2 {
+            let effects = fail_connect(&mut state, now, attempt, range.start);
+            (attempt, _) = find_start_attempt(&effects, file).unwrap_or_else(|| panic!("retry"));
+        }
+        fail_connect(&mut state, now, attempt, range.start);
+        let until = now + Duration::from_secs(5);
+
+        let effects = state.handle(
+            Input::Tick {
+                progress: Vec::new(),
+            },
+            until,
+        );
+        let (trial, _) = find_start_attempt(&effects, file).unwrap_or_else(|| panic!("trial"));
+        // Bytes flow: the circuit closes.
+        state.handle(
+            Input::Tick {
+                progress: vec![(trial, range.start + 100)],
+            },
+            until + Duration::from_millis(250),
+        );
+        assert_eq!(state.link_state(LinkId::new(1)), LinkState::Up);
+        assert_eq!(state.link_bytes(LinkId::new(1)), 100);
+    }
+
+    #[test]
+    fn a_degraded_link_is_skipped_while_a_healthy_one_carries_on() {
+        let mut state = EngineState::new(EngineConfig::default());
+        let now = Instant::now();
+        state.handle(
+            Input::LinksChanged(vec![link(1, "dead0", 1), link(2, "good0", 1)]),
+            now,
+        );
+        let (_, file) = add_single_file(&mut state, now, "http://example.com/big.bin");
+        state.handle(
+            Input::ProbeDone {
+                file,
+                result: ok_probe("http://example.com/big.bin", 64 * 1024 * 1024),
+            },
+            now,
+        );
+        let mut effects = state.handle(
+            Input::FilePrepared {
+                file,
+                result: Ok(PreparedFile {
+                    final_name: "big.bin".to_string(),
+                    frontiers_valid: true,
+                }),
+            },
+            now,
+        );
+        // Kill link 1 by failing its attempts three times over.
+        for _ in 0..3 {
+            let (id, on_dead, range) = effects
+                .iter()
+                .find_map(|e| match e {
+                    Effect::StartAttempt {
+                        id, link, range, ..
+                    } if *link == LinkId::new(1) => Some((*id, *link, *range)),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("dead link should have an attempt: {effects:?}"));
+            assert_eq!(on_dead, LinkId::new(1));
+            effects = fail_connect(&mut state, now, id, range.start);
+        }
+        assert!(matches!(
+            state.link_state(LinkId::new(1)),
+            LinkState::Degraded { .. }
+        ));
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::StartAttempt { link, .. } if *link == LinkId::new(1)))
+        );
+        // The healthy link still holds its own attempt.
+        assert_eq!(
+            state
+                .snapshot()
+                .links
+                .iter()
+                .map(|l| l.active)
+                .collect::<Vec<_>>(),
+            [0, 1]
+        );
+    }
+
+    // --- multi-link scheduling and attribution (P3.6, P3.7) ---
+
+    struct Run {
+        id: crate::model::AttemptId,
+        link: LinkId,
+        range: crate::model::ByteRange,
+        started: Duration,
+        finishes: Duration,
+    }
+
+    /// Runs one 64 MiB file over three 2-slot links whose speeds
+    /// (bytes/s) are `speeds`, in virtual time, checking after every
+    /// event that per-link byte attribution equals the parts' frontiers.
+    /// Returns how many blocks each link completed.
+    fn simulate_three_links(speeds: [u64; 3]) -> [u32; 3] {
+        let size = 64 * 1024 * 1024;
+        let mut state = EngineState::new(EngineConfig::default());
+        let base = Instant::now();
+        let links: Vec<Link> = (1..=3u64)
+            .map(|id| link(id, &format!("l{id}"), 2))
+            .collect();
+        state.handle(Input::LinksChanged(links), base);
+        let (_, file) = add_single_file(&mut state, base, "http://example.com/big.bin");
+        state.handle(
+            Input::ProbeDone {
+                file,
+                result: ok_probe("http://example.com/big.bin", size),
+            },
+            base,
+        );
+        let mut effects = state.handle(
+            Input::FilePrepared {
+                file,
+                result: Ok(PreparedFile {
+                    final_name: "big.bin".to_string(),
+                    frontiers_valid: true,
+                }),
+            },
+            base,
+        );
+
+        let speed_of = |link: LinkId| speeds[usize::try_from(link.get() - 1).unwrap_or(0)];
+        let mut running: Vec<Run> = Vec::new();
+        let mut done = [0u32; 3];
+        let mut clock = Duration::ZERO;
+
+        let launch = |effects: &[Effect], clock: Duration, running: &mut Vec<Run>| {
+            for effect in effects {
+                if let Effect::StartAttempt {
+                    id, link, range, ..
+                } = effect
+                {
+                    let len = range.end.map_or(0, |end| end - range.start + 1);
+                    let secs = len as f64 / speed_of(*link) as f64;
+                    running.push(Run {
+                        id: *id,
+                        link: *link,
+                        range: *range,
+                        started: clock,
+                        finishes: clock + Duration::from_secs_f64(secs),
+                    });
+                }
+            }
+        };
+        launch(&effects, clock, &mut running);
+
+        while !running.is_empty() {
+            let next = running
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, run)| run.finishes)
+                .map(|(index, _)| index)
+                .unwrap_or_else(|| panic!("running is non-empty"));
+            let finished = running.remove(next);
+            clock = finished.finishes;
+            let now = base + clock;
+
+            // A tick with every other attempt's partial progress first.
+            let progress: Vec<_> = running
+                .iter()
+                .map(|run| {
+                    let total = (run.finishes - run.started).as_secs_f64();
+                    let frac = ((clock - run.started).as_secs_f64() / total).clamp(0.0, 1.0);
+                    let len = run.range.end.map_or(0, |end| end - run.range.start + 1);
+                    (run.id, run.range.start + (len as f64 * frac) as u64)
+                })
+                .collect();
+            state.handle(Input::Tick { progress }, now);
+            assert_attribution(&state, file);
+
+            let end = finished.range.end.map_or(0, |end| end + 1);
+            effects = state.handle(
+                Input::AttemptEnded {
+                    id: finished.id,
+                    outcome: AttemptOutcome::Success,
+                    position: end,
+                },
+                now,
+            );
+            check_invariants(&state);
+            assert_attribution(&state, file);
+            done[usize::try_from(finished.link.get() - 1).unwrap_or(0)] += 1;
+            launch(&effects, clock, &mut running);
+        }
+
+        let entry = state.file(file).unwrap_or_else(|| panic!("file vanished"));
+        let layout = entry.layout.unwrap_or_else(|| panic!("no layout"));
+        assert_eq!(
+            done.iter().sum::<u32>(),
+            layout.count,
+            "every block ran once"
+        );
+        assert_eq!(state.attempt_count(), 0);
+        done
+    }
+
+    /// Per-link byte attribution always equals the frontiers (§4).
+    fn assert_attribution(state: &EngineState, file: crate::model::FileId) {
+        let durable: u64 = state
+            .file(file)
+            .map_or(0, |entry| entry.parts.iter().map(|p| p.durable).sum());
+        let credited: u64 = state.links().iter().map(|l| state.link_bytes(l.id)).sum();
+        assert_eq!(credited, durable, "link attribution must equal frontiers");
+    }
+
+    #[test]
+    fn faster_links_take_more_blocks() {
+        let [fast, medium, slow] = simulate_three_links([8_000_000, 4_000_000, 1_000_000]);
+        assert!(fast > medium, "fast {fast} vs medium {medium}");
+        assert!(medium > slow, "medium {medium} vs slow {slow}");
+        assert!(slow >= 1, "even the slow link takes some work");
+    }
+
+    #[test]
+    fn equal_links_share_the_start_evenly() {
+        let [a, b, c] = simulate_three_links([2_000_000, 2_000_000, 2_000_000]);
+        assert!(a.abs_diff(b) <= 2 && b.abs_diff(c) <= 2, "{a} {b} {c}");
+    }
+
+    #[test]
+    fn the_first_blocks_are_interleaved_across_links() {
+        let mut state = EngineState::new(EngineConfig::default());
+        let now = Instant::now();
+        state.handle(
+            Input::LinksChanged(vec![link(1, "a", 2), link(2, "b", 2), link(3, "c", 2)]),
+            now,
+        );
+        let (_, file) = add_single_file(&mut state, now, "http://example.com/big.bin");
+        state.handle(
+            Input::ProbeDone {
+                file,
+                result: ok_probe("http://example.com/big.bin", 64 * 1024 * 1024),
+            },
+            now,
+        );
+        let effects = state.handle(
+            Input::FilePrepared {
+                file,
+                result: Ok(PreparedFile {
+                    final_name: "big.bin".to_string(),
+                    frontiers_valid: true,
+                }),
+            },
+            now,
+        );
+        let order: Vec<u64> = effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::StartAttempt { link, .. } => Some(link.get()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(order, [1, 2, 3, 1, 2, 3], "round-robin, not link-at-a-time");
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(24))]
+        #[test]
+        fn attribution_matches_frontiers_for_any_speeds(
+            a in 200_000u64..20_000_000,
+            b in 200_000u64..20_000_000,
+            c in 200_000u64..20_000_000,
+        ) {
+            // `simulate_three_links` asserts the property after every event.
+            let done = simulate_three_links([a, b, c]);
+            proptest::prop_assert!(done.iter().sum::<u32>() > 0);
+        }
     }
 }
