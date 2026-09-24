@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["core", "cli"]
+members = ["core", "core/testkit", "cli"]
 
 [workspace.package]
 version = "0.1.0"
@@ -14,8 +14,10 @@ publish = false
 # with `{ workspace = true }` so versions can't drift between them.
 [workspace.dependencies]
 nuxd-core = { path = "core", version = "0.1.0" }
+nuxd-testkit = { path = "core/testkit", version = "0.1.0" }
 
 tokio = { version = "1", features = ["full"] }
+axum = "0.8"
 reqwest = { version = "0.12", default-features = false, features = [
     "rustls-tls",
     "stream",

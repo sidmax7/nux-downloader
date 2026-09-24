@@ -8,14 +8,45 @@
 
 use thiserror::Error;
 
-/// Interface discovery and per-link binding (`net`, Phase 3).
+/// Interface discovery and per-link binding join this in Phase 3
+/// (`net::discover`, `net::bind`); `BuildClient` is used starting in
+/// Phase 2, P2.3.
 #[derive(Debug, Error)]
-pub enum NetError {}
+pub enum NetError {
+    /// `reqwest::ClientBuilder::build()` failed — a bad TLS
+    /// configuration, or (on Linux/macOS, once `net::bind` is built)
+    /// binding to an interface that no longer exists.
+    #[error("couldn't build an HTTP client: {source}")]
+    BuildClient {
+        #[source]
+        source: reqwest::Error,
+    },
+}
 
 /// The I/O half of probing (Phase 2, P2.4) — the pure parsing in
 /// `probe.rs` doesn't need this; it just returns `Option`.
 #[derive(Debug, Error)]
-pub enum ProbeError {}
+pub enum ProbeError {
+    /// Sending the ranged `GET` failed at the transport level (connect
+    /// refused, TLS failure, redirect loop past the client's limit, …).
+    #[error("probe request failed: {source}")]
+    Request {
+        #[source]
+        source: reqwest::Error,
+    },
+    /// No response at all within `EngineConfig::stall_timeout` — a
+    /// stalled connect, or a server that never sends headers.
+    #[error("probe timed out")]
+    TimedOut,
+    /// A `206` response with no `Content-Range` header, one that doesn't
+    /// parse, or one whose start doesn't match the `bytes=0-0` request.
+    #[error("206 response had a malformed or unexpected Content-Range")]
+    MalformedContentRange,
+    /// Any status other than `200`, `206`, or a `416` reporting
+    /// `bytes */0` (an empty file, §5).
+    #[error("unexpected probe response status: {status}")]
+    UnexpectedStatus { status: u16 },
+}
 
 /// One transfer attempt's failure modes (`driver::transfer`, Phase 2).
 /// Fully specified already, unlike its neighbors here: `blame` (below)
@@ -57,9 +88,10 @@ pub enum TransferError {
     Io(String),
 }
 
-/// `storage` errors. The manifest load/save variants here are used
-/// starting in Phase 1 (P1.7); positional-write and preallocation
-/// variants are added when that I/O is built (Phase 2, P2.2).
+/// `storage` errors. The manifest load/save variants (`Read`, `Write`,
+/// `InvalidJson`, `UnsupportedSchemaVersion`) are used starting in
+/// Phase 1 (P1.7); `Io` and `NameReservationExhausted` are for the file
+/// I/O built in Phase 2, P2.2.
 #[derive(Debug, Error)]
 pub enum StorageError {
     #[error("couldn't read {path}: {source}")]
@@ -87,6 +119,28 @@ pub enum StorageError {
         path: String,
         found: u32,
         supported: u32,
+    },
+    /// Any other file operation on a download's own files: create,
+    /// preallocate, positional write, sync, rename, or a free-space
+    /// check. `operation` is a short, fixed label (`"create"`,
+    /// `"preallocate"`, …), not user input.
+    #[error("couldn't {operation} {path}: {source}")]
+    Io {
+        operation: &'static str,
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+    /// `reserve_destination_path` tried every `name (n).ext` up to its
+    /// limit and every one was already taken.
+    #[error("couldn't find an unused file name for {name} in {dir}")]
+    NameReservationExhausted { dir: String, name: String },
+    /// The upfront free-space check before activation (§9.2) failed.
+    #[error("not enough free space in {dir}: need {needed} bytes, {available} available")]
+    InsufficientSpace {
+        dir: String,
+        needed: u64,
+        available: u64,
     },
 }
 

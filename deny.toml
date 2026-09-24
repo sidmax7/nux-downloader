@@ -25,6 +25,19 @@ allow = [
     "Unicode-3.0",
     "Zlib",
     "CC0-1.0",
+    # webpki-roots (Mozilla's CA root bundle, pulled in via reqwest's
+    # rustls-tls) is licensed under this data license, not a code
+    # license — standard for a bundled certificate list, not a
+    # copyleft/attribution concern for us.
+    "CDLA-Permissive-2.0",
+    # option-ext (a tiny platform-detection shim pulled in transitively
+    # via `directories` -> `dirs-sys`, for the XDG basedir fallback on
+    # BSD/Redox). MPL-2.0's copyleft is file-scoped: it only requires
+    # sharing changes to option-ext's *own* source files, not anything
+    # that merely links against it — we consume it unmodified as a
+    # compiled dependency, so this carries no obligation on this crate's
+    # own code.
+    "MPL-2.0",
 ]
 # UnRAR (Phase 5, only if extraction ships) is proprietary and reviewed
 # separately (IMPLEMENTATION_PLAN.md P9.8) — not pre-approved here.

@@ -19,7 +19,28 @@ url = { workspace = true, features = ["serde"] }
 # here for RFC 5987 `filename*=` and URL path-segment decoding — the
 # Rust equivalent of Plexo's `decodeURIComponent`.
 percent-encoding = "2"
+fs4 = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+directories = { workspace = true }
+
+# The FSCTL_SET_SPARSE call in storage::file's windows_sparse submodule
+# (§9.1) is the one place `unsafe_code` is allowed in this crate; it only
+# exists on Windows, so this dependency is target-gated out everywhere
+# else. NOT independently verified on Windows — no Windows toolchain in
+# the environment that wrote it; check it compiles and works once CI
+# (P0.4) or a real Windows machine can run it.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+] }
 
 [dev-dependencies]
 proptest = "1"
 tempfile = "3"
+nuxd-testkit = { workspace = true }
+sha2 = "0.10"

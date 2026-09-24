@@ -1,8 +1,16 @@
-//! Pure parts of probing (`ARCHITECTURE.md` §5): parsing the headers a
-//! probe response carries, and sanitizing the filename that comes out of
-//! them. The I/O — sending the ranged `GET`, following redirects — is
-//! built in Phase 2; this module has none.
+//! Probing (`ARCHITECTURE.md` §5): parsing the headers a probe response
+//! carries, sanitizing the filename that comes out of them, and (below)
+//! the I/O that sends the ranged `GET` a probe is. Redirects are handled
+//! entirely by the `reqwest::Client`'s own policy (`net::client`);
+//! `response.url()` afterwards gives the final URL.
 
+use crate::config::EngineConfig;
+use crate::error::ProbeError;
+use crate::model::FileVersion;
+use reqwest::header::{
+    CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, ETAG, LAST_MODIFIED, RANGE,
+};
+use reqwest::{Client, StatusCode};
 use url::Url;
 
 /// A parsed `Content-Range` header (`bytes start-end/total`), used both
@@ -242,6 +250,123 @@ pub fn sanitize_filename(name: &str) -> String {
     }
 
     truncate_to_byte_limit(safe, MAX_FILENAME_BYTES)
+}
+
+/// What a probe (`GET` with `Range: bytes=0-0`, §5) learned about a
+/// file, ready to populate a `FileEntry`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProbeResult {
+    /// The URL the response actually came from, after any redirects the
+    /// client followed.
+    pub final_url: Url,
+    /// Sanitized and ready to use as a path component.
+    pub suggested_name: String,
+    /// `None` when the server never reported a total (a `200` with no
+    /// `Content-Length`, or a `206` with `bytes 0-0/*`): the file is
+    /// open-ended until proven otherwise (`plan::plan_layout` treats
+    /// this the same as an unsplittable file).
+    pub expected_size: Option<u64>,
+    /// `true` only for a `206` — the definitive "ranges work" signal
+    /// (§5). A `200` might still support `Range` on a later request (the
+    /// probe just didn't ask in a way that would show it), but nothing
+    /// here should assume so.
+    pub supports_ranges: bool,
+    pub version: FileVersion,
+}
+
+/// The literal `Content-Range` value a `416` reports for a zero-length
+/// resource (§5): `bytes */0`, not the `bytes <start>-<end>/<total>`
+/// shape `parse_content_range` handles.
+fn is_empty_file_range(value: &str) -> bool {
+    value.trim().eq_ignore_ascii_case("bytes */0")
+}
+
+fn header_str(
+    headers: &reqwest::header::HeaderMap,
+    name: reqwest::header::HeaderName,
+) -> Option<&str> {
+    headers.get(name)?.to_str().ok()
+}
+
+/// Sends the probe (`GET` with `Range: bytes=0-0`) and interprets the
+/// response per §5. `client` should be the shared, unbound default
+/// client (`net::client::build_default_client`) — probes don't belong to
+/// any one link. Bounded by `config.stall_timeout`: a server that never
+/// answers (or a network that never delivers headers) fails the probe
+/// rather than hanging it forever.
+pub async fn probe(
+    client: &Client,
+    url: Url,
+    config: &EngineConfig,
+) -> Result<ProbeResult, ProbeError> {
+    let request = client.get(url).header(RANGE, "bytes=0-0").send();
+    let response = tokio::time::timeout(config.stall_timeout, request)
+        .await
+        .map_err(|_| ProbeError::TimedOut)?
+        .map_err(|source| ProbeError::Request { source })?;
+
+    let final_url = response.url().clone();
+    let status = response.status();
+    let headers = response.headers().clone();
+
+    let disposition = header_str(&headers, CONTENT_DISPOSITION);
+    let suggested_name = sanitize_filename(&suggested_filename(disposition, &final_url));
+    let etag = header_str(&headers, ETAG).map(str::to_string);
+    let last_modified = header_str(&headers, LAST_MODIFIED).map(str::to_string);
+
+    match status {
+        StatusCode::PARTIAL_CONTENT => {
+            let content_range = header_str(&headers, CONTENT_RANGE)
+                .and_then(parse_content_range)
+                .filter(|range| range.start == 0)
+                .ok_or(ProbeError::MalformedContentRange)?;
+            let expected_size = content_range.total;
+            Ok(ProbeResult {
+                final_url,
+                suggested_name,
+                expected_size,
+                supports_ranges: true,
+                version: FileVersion {
+                    etag,
+                    last_modified,
+                    total_bytes: expected_size.unwrap_or(0),
+                },
+            })
+        }
+        StatusCode::OK => {
+            let expected_size =
+                header_str(&headers, CONTENT_LENGTH).and_then(|value| value.parse().ok());
+            Ok(ProbeResult {
+                final_url,
+                suggested_name,
+                expected_size,
+                supports_ranges: false,
+                version: FileVersion {
+                    etag,
+                    last_modified,
+                    total_bytes: expected_size.unwrap_or(0),
+                },
+            })
+        }
+        StatusCode::RANGE_NOT_SATISFIABLE
+            if header_str(&headers, CONTENT_RANGE).is_some_and(is_empty_file_range) =>
+        {
+            Ok(ProbeResult {
+                final_url,
+                suggested_name,
+                expected_size: Some(0),
+                supports_ranges: false,
+                version: FileVersion {
+                    etag,
+                    last_modified,
+                    total_bytes: 0,
+                },
+            })
+        }
+        other => Err(ProbeError::UnexpectedStatus {
+            status: other.as_u16(),
+        }),
+    }
 }
 
 #[cfg(test)]

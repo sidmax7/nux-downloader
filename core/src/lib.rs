@@ -1,10 +1,17 @@
 //! `nuxd-core`: the Nux Downloader engine. No UI or Tauri types live here —
 //! see `ARCHITECTURE.md` for the design this crate is being built towards.
 
+mod api;
 pub mod config;
+pub mod driver;
+pub mod engine;
 pub mod error;
 pub mod model;
+pub mod net;
 pub mod plan;
 pub mod probe;
+pub mod sched;
 pub mod storage;
 pub mod version;
+
+pub use api::{AddOptions, Engine, Target};
