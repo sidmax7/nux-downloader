@@ -21,6 +21,10 @@ pub enum NetError {
         #[source]
         source: reqwest::Error,
     },
+    /// A link has nothing to bind a connection to on this platform: no
+    /// usable address for `BindMode::Address`.
+    #[error("link {link} has no address to bind to")]
+    NoBindAddress { link: String },
 }
 
 /// The I/O half of probing (Phase 2, P2.4) — the pure parsing in

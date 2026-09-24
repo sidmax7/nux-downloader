@@ -2,4 +2,6 @@
 //! (Phase 2); interface discovery, per-link binding and health tracking
 //! join this module in Phase 3.
 
+pub mod bind;
 pub mod client;
+pub mod discover;

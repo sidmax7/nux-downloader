@@ -25,6 +25,7 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 directories = { workspace = true }
+if-addrs = { workspace = true }
 
 # The FSCTL_SET_SPARSE call in storage::file's windows_sparse submodule
 # (§9.1) is the one place `unsafe_code` is allowed in this crate; it only

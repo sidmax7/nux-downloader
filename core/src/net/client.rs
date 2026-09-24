@@ -34,7 +34,7 @@ const MAX_REDIRECTS: usize = 5;
 /// Binding to a specific network link is layered on top of this builder
 /// in Phase 3 (`net::bind`); this function has no link-specific
 /// behavior at all.
-fn base_client_builder(config: &EngineConfig) -> ClientBuilder {
+pub(super) fn base_client_builder(config: &EngineConfig) -> ClientBuilder {
     let mut headers = HeaderMap::new();
     headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
 
