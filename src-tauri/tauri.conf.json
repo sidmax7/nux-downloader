@@ -22,7 +22,7 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IENERUZCNUE0MUJFRjNGQTEKUldTaFArOGJwTFh2elZ0d3pUejdSb1k4WUJLeHRUSzY2L2FxVFpoYmZ3SWZwUVRMM2hHNTE0WDQK",
       "endpoints": ["https://github.com/sidmax7/nux-downloader/releases/latest/download/latest.json"],
       "requireSignedVersion": true,
       "windows": { "installMode": "passive" }
