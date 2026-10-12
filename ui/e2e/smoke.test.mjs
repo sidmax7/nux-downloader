@@ -88,8 +88,12 @@ describe("app", () => {
 
   it("opens and closes the add dialog", async () => {
     await click(await button("Add links"));
-    const dialog = await eventually(() => find("css selector", "[role='dialog']"), "the add dialog");
-    assert.match(await text(dialog), /Paste one or more links/);
+    // The dialog fades in from opacity 0, and WebDriver reports no text
+    // for an element it can't see, so wait for the text, not the element.
+    await eventually(async () => {
+      const dialog = await find("css selector", "[role='dialog']");
+      assert.match(await text(dialog), /Paste one or more links/);
+    }, "the add dialog");
     await click(await button("Cancel"));
     await eventually(async () => {
       try {
