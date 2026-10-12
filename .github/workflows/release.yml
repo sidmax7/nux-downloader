@@ -88,7 +88,10 @@ jobs:
       - name: Both macOS architectures
         if: runner.os == 'macOS'
         run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
-      - uses: Swatinem/rust-cache@v2
+      # No Rust build cache in releases: every release is built from
+      # scratch. A cache also can't tell Ubuntu 22.04 from CI's 24.04 (both
+      # are "Linux"), and v0.1.0's first build restored CI's 24.04 build,
+      # whose compiler plugins need a newer glibc than 22.04 has.
       - uses: pnpm/action-setup@v4
         with:
           package_json_file: ui/package.json
@@ -130,9 +133,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup target add ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.target }}
       - run: cargo build --release --locked -p nuxd --target ${{ matrix.target }}
       - name: Package
         env:
@@ -160,10 +160,5 @@ jobs:
       - name: SHA256SUMS and latest.json
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          mkdir assets && cd assets
-          gh release download "$GITHUB_REF_NAME" --pattern '*'
-          rm -f SHA256SUMS latest.json
-          python3 ../scripts/update-manifest.py "${{ needs.prepare.outputs.version }}" "$GITHUB_REF_NAME" > latest.json
-          sha256sum -- * > SHA256SUMS
-          gh release upload "$GITHUB_REF_NAME" SHA256SUMS latest.json --clobber
+        # In a script so the step can be redone by hand if it fails.
+        run: bash scripts/finish-release.sh "$GITHUB_REF_NAME"

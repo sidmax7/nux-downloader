@@ -47,7 +47,11 @@ The release workflow refuses to run while the public key is empty.
 6. The **Release** workflow builds the Linux AppImage, `.deb` and `.rpm`
    and the Linux `nuxd` archive, and attaches them, `SHA256SUMS` and
    `latest.json` to a **draft** release. Tags with a `-` become
-   pre-releases.
+   pre-releases. If a build job fails, re-run the failed jobs from the
+   run's page. If only the last step (checksums and update manifest)
+   fails, you can also redo it by hand:
+   `bash scripts/finish-release.sh vX.Y.Z` (`DRY_RUN=1` to only print
+   the two files).
 7. Download and try at least the Linux AppImage and `.deb` from the
    draft. Then publish it. Only a published, non-pre-release is "latest",
    so only then do installed apps see the update.
