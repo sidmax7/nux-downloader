@@ -3,17 +3,22 @@ import { computed } from "vue";
 import { formatSpeed } from "../format";
 import { useEngineStore } from "../stores/engine";
 import LinkCard from "./LinkCard.vue";
+import ThroughputBar from "./ThroughputBar.vue";
 
 const engine = useEngineStore();
+const enabledCount = computed(() => engine.links.filter((link) => link.enabled).length);
 const peak = computed(() => Math.max(0, ...engine.links.map((link) => link.speed)));
 </script>
 
 <template>
   <section aria-label="Network links">
-    <p class="muted intro">
-      Each network link downloads at once. Together:
-      <strong class="num">{{ formatSpeed(engine.totalSpeed) }}</strong>
-    </p>
+    <div class="total">
+      <div class="figure">
+        <strong class="num">{{ formatSpeed(engine.totalSpeed) }}</strong>
+        <span class="muted">across {{ enabledCount }} link{{ enabledCount === 1 ? "" : "s" }}</span>
+      </div>
+      <ThroughputBar :links="engine.links" />
+    </div>
     <p v-if="engine.links.length === 0" class="empty muted">
       No usable network link found yet.
     </p>
@@ -24,15 +29,31 @@ const peak = computed(() => Math.max(0, ...engine.links.map((link) => link.speed
 </template>
 
 <style scoped>
-.intro {
-  margin: 0 0 12px;
+.total {
+  display: grid;
+  gap: 10px;
+  padding: 14px 16px;
+  margin-bottom: 14px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+}
+
+.figure {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+}
+
+.figure strong {
+  font-size: 20px;
 }
 
 .cards {
   margin: 0;
   padding: 0;
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
   gap: 10px;
 }
 

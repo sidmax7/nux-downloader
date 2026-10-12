@@ -3,6 +3,7 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { api } from "../api";
 import type { BlockDto } from "../bindings";
 import { useLinkColors } from "../composables";
+import { useEngineStore } from "../stores/engine";
 import { bucketBlocks, cellBudget, gridGeometry } from "../grid";
 
 const props = defineProps<{ packageId: number; fileId: number; live: boolean }>();
@@ -15,6 +16,13 @@ const canvas = ref<HTMLCanvasElement | null>(null);
 const blocks = ref<BlockDto[]>([]);
 const width = ref(0);
 const colors = useLinkColors();
+const engine = useEngineStore();
+
+// Links that delivered at least one block of this file, for the key.
+const used = computed(() => {
+  const ids = new Set(blocks.value.map((b) => b.link).filter((id): id is number => id !== null));
+  return engine.links.filter((link) => ids.has(link.id));
+});
 let timer: ReturnType<typeof setInterval> | undefined;
 let observer: ResizeObserver | undefined;
 
@@ -99,12 +107,19 @@ watch([blocks, width, colors], draw, { flush: "post" });
   <div class="grid">
     <canvas ref="canvas" role="img" :aria-label="label" />
     <p v-if="blocks.length === 0" class="muted">No block map yet.</p>
+    <ul v-else class="key muted">
+      <li v-for="link in used" :key="link.id">
+        <span class="sw" :style="{ background: colors.get(link.id) }" />{{ link.label }}
+      </li>
+      <li><span class="sw empty" />not yet</li>
+    </ul>
   </div>
 </template>
 
 <style scoped>
 .grid {
   width: 100%;
+  padding: 6px 0 8px;
 }
 
 canvas {
@@ -115,5 +130,32 @@ canvas {
 p {
   margin: 0;
   font-size: 12px;
+}
+
+.key {
+  list-style: none;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  margin: 8px 0 4px;
+  padding: 0;
+  font-size: 12px;
+}
+
+.key li {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.sw {
+  width: 9px;
+  height: 9px;
+  border-radius: 2px;
+}
+
+.sw.empty {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
 }
 </style>

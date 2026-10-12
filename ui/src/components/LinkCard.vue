@@ -5,6 +5,8 @@ import { linkColor } from "../colors";
 import { formatBytes, formatSpeed, parseRate, rateText } from "../format";
 import { useSettingsStore } from "../stores/settings";
 import { useToastStore } from "../stores/toasts";
+import UiIcon from "./UiIcon.vue";
+import type { IconName } from "../icons";
 
 const props = defineProps<{ link: LinkDto; peak: number }>();
 
@@ -14,6 +16,14 @@ const toasts = useToastStore();
 const label = ref(props.link.label);
 const limit = ref(rateText(props.link.limit));
 const color = computed(() => linkColor(props.link.name, props.link.color));
+const KIND_ICON: Record<LinkDto["kind"], IconName> = {
+  wifi: "wifi",
+  ethernet: "ethernet",
+  usb: "usb",
+  bridge: "links",
+  other: "globe",
+};
+
 const share = computed(() =>
   props.peak > 0 ? Math.min(100, Math.round((props.link.speed / props.peak) * 100)) : 0,
 );
@@ -64,6 +74,7 @@ async function saveLimit() {
     </div>
 
     <p class="muted meta">
+      <UiIcon :name="KIND_ICON[link.kind]" :size="14" />
       {{ link.name }} · {{ link.kind }}<template v-if="link.address"> · {{ link.address }}</template>
     </p>
     <p v-if="link.degraded" class="warn" role="alert">
@@ -72,9 +83,9 @@ async function saveLimit() {
 
     <div class="speed">
       <div class="meter" aria-hidden="true">
-        <div class="meter-fill" :style="{ width: `${share}%`, background: color }" />
+        <div class="meter-fill" :style="{ '--p': share / 100, background: color }" />
       </div>
-      <strong class="num">{{ formatSpeed(link.speed) }}</strong>
+      <strong class="num">{{ formatSpeed(link.active > 0 ? link.speed : 0) }}</strong>
     </div>
     <p class="muted num stats">
       {{ link.active }} connection{{ link.active === 1 ? "" : "s" }} · {{ formatBytes(link.bytes) }} this session
@@ -98,8 +109,8 @@ async function saveLimit() {
   list-style: none;
   background: var(--surface);
   border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 12px;
+  border-radius: 10px;
+  padding: 14px;
 }
 
 .card.off {
@@ -130,8 +141,14 @@ async function saveLimit() {
 
 .meta,
 .stats {
-  margin: 6px 0 0;
-  font-size: 12px;
+  margin: 8px 0 0;
+  font-size: 12.5px;
+}
+
+.meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
 }
 
 .warn {
@@ -155,8 +172,11 @@ async function saveLimit() {
 }
 
 .meter-fill {
+  width: 100%;
   height: 100%;
-  transition: width 0.25s linear;
+  transform-origin: left;
+  transform: scaleX(var(--p, 0));
+  transition: transform 0.25s linear;
 }
 
 .limit {

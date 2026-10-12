@@ -181,7 +181,7 @@ async function copyReport() {
 fieldset {
   border: 1px solid var(--border);
   background: var(--surface);
-  border-radius: 8px;
+  border-radius: 10px;
   padding: 10px 14px 14px;
   display: grid;
   gap: 10px;
@@ -230,6 +230,12 @@ legend {
 .buttons {
   display: flex;
   gap: 8px;
+  position: sticky;
+  bottom: -32px;
+  margin: 0 -24px -32px;
+  padding: 12px 24px;
+  background: color-mix(in srgb, var(--bg) 92%, transparent);
+  border-top: 1px solid var(--border);
 }
 
 .report {

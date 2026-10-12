@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { nextTick, onBeforeUnmount, onMounted, ref } from "vue";
+import UiIcon from "./UiIcon.vue";
 
 const props = defineProps<{ title: string; wide?: boolean }>();
 const emit = defineEmits<{ close: [] }>();
@@ -57,8 +58,8 @@ onBeforeUnmount(() => {
     >
       <header>
         <h2>{{ props.title }}</h2>
-        <button class="btn small" type="button" aria-label="Close" @click="emit('close')">
-          ✕
+        <button class="icon-btn" type="button" aria-label="Close" @click="emit('close')">
+          <UiIcon name="close" />
         </button>
       </header>
       <div class="body"><slot /></div>
@@ -71,7 +72,8 @@ onBeforeUnmount(() => {
 .backdrop {
   position: fixed;
   inset: 0;
-  background: rgb(0 0 0 / 45%);
+  background: rgb(8 10 16 / 55%);
+  animation: fade 0.15s ease-out;
   display: grid;
   place-items: center;
   padding: 16px;
@@ -81,7 +83,9 @@ onBeforeUnmount(() => {
 .dialog {
   background: var(--surface);
   border: 1px solid var(--border);
-  border-radius: 10px;
+  border-radius: 12px;
+  box-shadow: var(--shadow);
+  animation: rise 0.18s cubic-bezier(0.16, 1, 0.3, 1);
   width: min(560px, 100%);
   max-height: calc(100vh - 32px);
   display: flex;
@@ -96,7 +100,7 @@ header {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 12px 16px;
+  padding: 10px 12px 10px 18px;
   border-bottom: 1px solid var(--border);
 }
 
@@ -116,5 +120,18 @@ footer {
   gap: 8px;
   padding: 12px 16px;
   border-top: 1px solid var(--border);
+}
+
+@keyframes fade {
+  from {
+    opacity: 0;
+  }
+}
+
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
 }
 </style>

@@ -36,15 +36,16 @@ describe("PackageRow", () => {
   it("shows name, size and progress", () => {
     const wrapper = mountRow();
     expect(wrapper.text()).toContain("Movie pack");
-    expect(wrapper.text()).toContain("250 B / 1000 B");
+    expect(wrapper.text()).toContain("250 B of 1000 B");
     expect(wrapper.find("[role=progressbar]").attributes("aria-valuenow")).toBe("25");
   });
 
   it("offers Pause while downloading and Resume while paused", () => {
-    expect(mountRow().text()).toContain("Pause");
-    expect(mountRow().text()).not.toContain("Resume");
+    const running = mountRow();
+    expect(running.find('button[aria-label="Pause Movie pack"]').exists()).toBe(true);
+    expect(running.find('button[aria-label="Resume Movie pack"]').exists()).toBe(false);
     const paused = mountRow({ state: "paused" });
-    expect(paused.text()).toContain("Resume");
+    expect(paused.find('button[aria-label="Resume Movie pack"]').exists()).toBe(true);
     expect(paused.find('button[aria-label="Pause Movie pack"]').exists()).toBe(false);
   });
 
@@ -57,10 +58,12 @@ describe("PackageRow", () => {
     );
   });
 
-  it("disables moving past either end of the queue", () => {
+  it("disables moving past either end of the queue", async () => {
     const first = mount(PackageRow, { props: { pkg: pkg(), index: 0, count: 3 } });
+    await first.find('button[aria-label^="Expand"]').trigger("click");
     expect(first.find('button[aria-label="Move Movie pack up"]').attributes("disabled")).toBeDefined();
     const last = mount(PackageRow, { props: { pkg: pkg(), index: 2, count: 3 } });
+    await last.find('button[aria-label^="Expand"]').trigger("click");
     expect(last.find('button[aria-label="Move Movie pack down"]').attributes("disabled")).toBeDefined();
   });
 

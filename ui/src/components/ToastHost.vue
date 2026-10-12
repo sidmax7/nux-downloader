@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { useToastStore } from "../stores/toasts";
+import UiIcon from "./UiIcon.vue";
 
 const toasts = useToastStore();
 </script>
@@ -8,8 +9,8 @@ const toasts = useToastStore();
   <div class="host" role="status" aria-live="polite">
     <div v-for="toast in toasts.toasts" :key="toast.id" class="toast" :class="toast.level">
       <span>{{ toast.message }}</span>
-      <button class="btn small" type="button" aria-label="Dismiss" @click="toasts.dismiss(toast.id)">
-        ✕
+      <button class="icon-btn" type="button" aria-label="Dismiss" @click="toasts.dismiss(toast.id)">
+        <UiIcon name="close" :size="14" />
       </button>
     </div>
   </div>
@@ -30,17 +31,16 @@ const toasts = useToastStore();
   display: flex;
   justify-content: space-between;
   gap: 8px;
-  align-items: start;
-  padding: 10px 12px;
+  align-items: center;
+  padding: 8px 8px 8px 14px;
   background: var(--surface);
   border: 1px solid var(--border);
-  border-left: 4px solid var(--accent);
-  border-radius: 6px;
-  box-shadow: 0 4px 16px rgb(0 0 0 / 20%);
+  border-radius: 9px;
+  box-shadow: var(--shadow);
   overflow-wrap: anywhere;
 }
 
 .toast.error {
-  border-left-color: var(--danger);
+  border-color: var(--danger);
 }
 </style>

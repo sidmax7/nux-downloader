@@ -2,14 +2,14 @@
 // palette entry picked from the interface name.
 
 const PALETTE = [
-  "#2f6fed",
-  "#e0603a",
-  "#2aa876",
-  "#b45be0",
-  "#d9a31c",
-  "#16a2c4",
-  "#d94f8c",
-  "#7a8b2e",
+  "#3b82f6",
+  "#f0662d",
+  "#1fa971",
+  "#a855f7",
+  "#c98500",
+  "#0b97b8",
+  "#e0457f",
+  "#6a9a1f",
 ];
 
 function hash(text: string): number {

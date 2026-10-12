@@ -6,9 +6,11 @@ import { etaSeconds, formatBytes, formatEta, formatSpeed, parseRate, percent, ra
 import { useEngineStore } from "../stores/engine";
 import { useToastStore } from "../stores/toasts";
 import BlockGrid from "./BlockGrid.vue";
+import UiIcon from "./UiIcon.vue";
+import type { IconName } from "../icons";
 import ModalDialog from "./ModalDialog.vue";
 
-const props = defineProps<{ pkg: PackageDto; index: number; count: number }>();
+const props = defineProps<{ pkg: PackageDto; index: number; count: number; first?: boolean }>();
 
 const engine = useEngineStore();
 const toasts = useToastStore();
@@ -35,16 +37,27 @@ const STATE_TEXT: Record<PackageDto["state"], string> = {
   failed: "Failed",
 };
 
+const STATE_ICON: Record<PackageDto["state"], IconName> = {
+  queued: "clock",
+  downloading: "download",
+  paused: "pause",
+  verifying: "check",
+  extracting: "archive",
+  done: "check",
+  failed: "alert",
+};
+
 const canPause = computed(() => ["queued", "downloading"].includes(props.pkg.state));
 const canResume = computed(() => props.pkg.state === "paused");
 
 const statusLine = computed(() => {
   const state = STATE_TEXT[props.pkg.state];
-  if (props.pkg.state === "downloading") {
-    return `${state} · ${formatSpeed(speed.value)} · ETA ${eta.value}`;
-  }
   return props.pkg.error ? `${state}: ${props.pkg.error}` : state;
 });
+
+const hasProblem = computed(
+  () => props.pkg.state === "failed" || (props.pkg.state === "paused" && !!props.pkg.error),
+);
 
 function fileSpeed(file: FileDto): string {
   return file.state === "active" ? formatSpeed(engine.fileSpeeds.get(file.id) ?? 0) : "";
@@ -85,24 +98,22 @@ const moveDown = () => engine.run(() => api.move(props.pkg.id, props.index + 1))
 </script>
 
 <template>
-  <li class="pkg" :class="pkg.state">
+  <li class="pkg" :class="[pkg.state, { open }]">
     <div class="row">
       <button
-        class="btn small twisty"
+        class="icon-btn twisty"
         type="button"
         :aria-expanded="open"
         :aria-label="`${open ? 'Collapse' : 'Expand'} ${pkg.name}`"
         @click="open = !open"
       >
-        {{ open ? "▾" : "▸" }}
+        <UiIcon :name="open ? 'chevronDown' : 'chevronRight'" />
       </button>
+
       <div class="main">
         <div class="title">
-          <strong class="name">{{ pkg.name }}</strong>
+          <strong class="name" :title="pkg.name">{{ pkg.name }}</strong>
           <span v-if="pkg.priority !== 'normal'" class="tag">{{ pkg.priority }}</span>
-          <span class="muted num size">
-            {{ formatBytes(pkg.downloaded) }}<template v-if="pkg.size !== null"> / {{ formatBytes(pkg.size) }}</template>
-          </span>
         </div>
         <div
           class="bar"
@@ -112,23 +123,54 @@ const moveDown = () => engine.run(() => api.move(props.pkg.id, props.index + 1))
           aria-valuemax="100"
           :aria-valuenow="pct ?? undefined"
         >
-          <div class="fill" :style="{ width: `${pct ?? (pkg.state === 'done' ? 100 : 0)}%` }" />
+          <div class="fill" :style="{ '--p': (pct ?? (pkg.state === 'done' ? 100 : 0)) / 100 }" />
         </div>
-        <div class="status" :class="{ bad: pkg.state === 'failed' || (pkg.state === 'paused' && pkg.error) }">
-          {{ statusLine }}
+        <div class="meta num">
+          <span class="state" :class="{ bad: hasProblem }">
+            <UiIcon :name="STATE_ICON[pkg.state]" :size="13" />
+            {{ statusLine }}
+          </span>
+          <span class="muted size">
+            {{ formatBytes(pkg.downloaded) }}<template v-if="pkg.size !== null"> of {{ formatBytes(pkg.size) }}</template>
+            <template v-if="pct !== null && pkg.state !== 'done'"> · {{ pct }}%</template>
+          </span>
         </div>
       </div>
+
+      <div v-if="pkg.state === 'downloading'" class="live num">
+        <strong>{{ speed > 0 ? formatSpeed(speed) : "–" }}</strong>
+        <span class="muted">{{ eta === "–" ? "starting" : `${eta} left` }}</span>
+      </div>
+
       <div class="actions">
-        <button v-if="canPause" class="btn small" type="button" :aria-label="`Pause ${pkg.name}`" @click="engine.pause(pkg.id)">
-          Pause
+        <button
+          v-if="canPause"
+          class="icon-btn"
+          type="button"
+          :title="`Pause ${pkg.name}`"
+          :aria-label="`Pause ${pkg.name}`"
+          @click="engine.pause(pkg.id)"
+        >
+          <UiIcon name="pause" />
         </button>
-        <button v-if="canResume" class="btn small" type="button" :aria-label="`Resume ${pkg.name}`" @click="engine.resume(pkg.id)">
-          Resume
+        <button
+          v-if="canResume"
+          class="icon-btn"
+          type="button"
+          :title="`Resume ${pkg.name}`"
+          :aria-label="`Resume ${pkg.name}`"
+          @click="engine.resume(pkg.id)"
+        >
+          <UiIcon name="play" />
         </button>
-        <button class="btn small" type="button" :disabled="index === 0" :aria-label="`Move ${pkg.name} up`" @click="moveUp">↑</button>
-        <button class="btn small" type="button" :disabled="index === count - 1" :aria-label="`Move ${pkg.name} down`" @click="moveDown">↓</button>
-        <button class="btn small danger" type="button" :aria-label="`Remove ${pkg.name}`" @click="confirmRemove = true">
-          Remove
+        <button
+          class="icon-btn danger"
+          type="button"
+          :title="`Remove ${pkg.name}`"
+          :aria-label="`Remove ${pkg.name}`"
+          @click="confirmRemove = true"
+        >
+          <UiIcon name="trash" />
         </button>
       </div>
     </div>
@@ -153,13 +195,34 @@ const moveDown = () => engine.run(() => api.move(props.pkg.id, props.index + 1))
             @blur="saveLimit"
           />
         </label>
+        <span class="order">
+          Queue position
+          <button
+            class="icon-btn"
+            type="button"
+            :disabled="index === 0"
+            :aria-label="`Move ${pkg.name} up`"
+            @click="moveUp"
+          >
+            <UiIcon name="up" />
+          </button>
+          <button
+            class="icon-btn"
+            type="button"
+            :disabled="index === count - 1"
+            :aria-label="`Move ${pkg.name} down`"
+            @click="moveDown"
+          >
+            <UiIcon name="down" />
+          </button>
+        </span>
         <template v-if="pkg.is_archive">
           <label class="check">
             <input
               type="checkbox"
               :checked="pkg.extract"
               @change="setPost(($event.target as HTMLInputElement).checked, pkg.delete_archives)"
-            />
+            >
             Extract after download
           </label>
           <label class="check" :class="{ muted: !pkg.extract }">
@@ -168,41 +231,46 @@ const moveDown = () => engine.run(() => api.move(props.pkg.id, props.index + 1))
               :checked="pkg.delete_archives"
               :disabled="!pkg.extract"
               @change="setPost(pkg.extract, ($event.target as HTMLInputElement).checked)"
-            />
+            >
             Delete archive after extraction
           </label>
         </template>
       </div>
-      <p class="muted dest">Saving to {{ pkg.dest_dir }}</p>
+      <p class="muted dest">Saving to <span>{{ pkg.dest_dir }}</span></p>
 
       <ul class="files">
         <li v-for="file in pkg.files" :key="file.id">
           <div class="frow">
             <span class="fname" :title="file.name">{{ file.name }}</span>
-            <span class="muted num">
+            <span class="muted num fsize">
               {{ formatBytes(file.downloaded) }}<template v-if="file.size !== null"> / {{ formatBytes(file.size) }}</template>
             </span>
             <span class="num fspeed">{{ fileSpeed(file) }}</span>
             <span class="fstatus" :class="{ bad: file.state === 'failed' }">{{ fileStatus(file) }}</span>
-            <button
-              v-if="file.blocks > 0"
-              class="btn small"
-              type="button"
-              :aria-expanded="gridFile === file.id"
-              :aria-label="`${gridFile === file.id ? 'Hide' : 'Show'} block map of ${file.name}`"
-              @click="gridFile = gridFile === file.id ? null : file.id"
-            >
-              Blocks
-            </button>
-            <button
-              v-if="file.state === 'failed'"
-              class="btn small"
-              type="button"
-              :aria-label="`Restart ${file.name}`"
-              @click="engine.restartFile(file.id)"
-            >
-              Restart
-            </button>
+            <span class="fbtns">
+              <button
+                v-if="file.blocks > 0"
+                class="icon-btn"
+                type="button"
+                :class="{ on: gridFile === file.id }"
+                :aria-expanded="gridFile === file.id"
+                :title="`Block map of ${file.name}`"
+                :aria-label="`${gridFile === file.id ? 'Hide' : 'Show'} block map of ${file.name}`"
+                @click="gridFile = gridFile === file.id ? null : file.id"
+              >
+                <UiIcon name="blocks" />
+              </button>
+              <button
+                v-if="file.state === 'failed'"
+                class="icon-btn"
+                type="button"
+                :title="`Restart ${file.name}`"
+                :aria-label="`Restart ${file.name}`"
+                @click="engine.restartFile(file.id)"
+              >
+                <UiIcon name="restart" />
+              </button>
+            </span>
           </div>
           <BlockGrid
             v-if="gridFile === file.id"
@@ -217,7 +285,7 @@ const moveDown = () => engine.run(() => api.move(props.pkg.id, props.index + 1))
     <ModalDialog v-if="confirmRemove" :title="`Remove ${pkg.name}?`" @close="confirmRemove = false">
       <p>This takes the package out of the queue.</p>
       <label class="check">
-        <input v-model="deleteFiles" type="checkbox" data-autofocus />
+        <input v-model="deleteFiles" type="checkbox" data-autofocus>
         Also delete the downloaded files from disk
       </label>
       <template #footer>
@@ -233,14 +301,20 @@ const moveDown = () => engine.run(() => api.move(props.pkg.id, props.index + 1))
   list-style: none;
   background: var(--surface);
   border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 10px 12px;
+  border-radius: 10px;
+  padding: 10px 12px 10px 6px;
+  transition: border-color 0.15s ease-out;
+}
+
+.pkg:hover,
+.pkg.open {
+  border-color: color-mix(in srgb, var(--border), var(--fg) 18%);
 }
 
 .row {
   display: grid;
-  grid-template-columns: auto 1fr auto;
-  gap: 10px;
+  grid-template-columns: auto minmax(0, 1fr) auto auto;
+  gap: 6px 12px;
   align-items: center;
 }
 
@@ -250,41 +324,43 @@ const moveDown = () => engine.run(() => api.move(props.pkg.id, props.index + 1))
 
 .title {
   display: flex;
-  gap: 10px;
-  align-items: baseline;
+  gap: 8px;
+  align-items: center;
 }
 
 .name {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-.size {
-  margin-left: auto;
-  white-space: nowrap;
+  font-weight: 600;
 }
 
 .tag {
   font-size: 11px;
   text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
   border: 1px solid var(--border);
   border-radius: 4px;
-  padding: 0 4px;
+  padding: 0 5px;
 }
 
 .bar {
-  height: 6px;
-  background: var(--surface-2);
+  height: 5px;
+  background: var(--track);
   border-radius: 3px;
   overflow: hidden;
-  margin: 6px 0 4px;
+  margin: 7px 0 6px;
 }
 
 .fill {
+  width: 100%;
   height: 100%;
+  border-radius: 3px;
   background: var(--accent);
-  transition: width 0.25s linear;
+  transform-origin: left;
+  transform: scaleX(var(--p, 0));
+  transition: transform 0.25s linear;
 }
 
 .done .fill {
@@ -295,22 +371,67 @@ const moveDown = () => engine.run(() => api.move(props.pkg.id, props.index + 1))
   background: var(--danger);
 }
 
-.status {
-  font-size: 12px;
-  color: var(--muted);
+.paused .fill,
+.queued .fill {
+  background: color-mix(in srgb, var(--muted) 60%, var(--track));
 }
 
+.meta {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 2px 12px;
+  font-size: 12.5px;
+}
+
+.state {
+  display: inline-flex;
+  gap: 5px;
+  align-items: center;
+  color: var(--muted);
+  min-width: 0;
+  overflow-wrap: break-word;
+}
+
+.downloading .state,
+.verifying .state,
+.extracting .state {
+  color: var(--accent);
+}
+
+.done .state {
+  color: var(--ok);
+}
+
+.state.bad,
 .bad {
   color: var(--danger);
 }
 
+.size {
+  white-space: nowrap;
+}
+
+.live {
+  display: grid;
+  justify-items: end;
+  font-size: 12.5px;
+  min-width: 6.5em;
+}
+
+.live strong {
+  font-size: 14px;
+}
+
 .actions {
   display: flex;
-  gap: 4px;
+  justify-content: flex-end;
+  gap: 2px;
+  min-width: 62px;
 }
 
 .details {
-  margin-top: 10px;
+  margin: 10px 0 0 30px;
   padding-top: 10px;
   border-top: 1px solid var(--border);
 }
@@ -318,13 +439,14 @@ const moveDown = () => engine.run(() => api.move(props.pkg.id, props.index + 1))
 .options {
   display: flex;
   flex-wrap: wrap;
-  gap: 8px 20px;
+  gap: 10px 22px;
   align-items: center;
 }
 
-.options label {
+.options label,
+.order {
   display: flex;
-  gap: 6px;
+  gap: 8px;
   align-items: center;
 }
 
@@ -333,9 +455,13 @@ const moveDown = () => engine.run(() => api.move(props.pkg.id, props.index + 1))
 }
 
 .dest {
-  margin: 8px 0;
-  font-size: 12px;
+  margin: 10px 0;
+  font-size: 12.5px;
   overflow-wrap: anywhere;
+}
+
+.dest span {
+  color: var(--fg);
 }
 
 .files {
@@ -345,14 +471,20 @@ const moveDown = () => engine.run(() => api.move(props.pkg.id, props.index + 1))
 }
 
 .files > li {
-  padding: 4px 0;
+  padding: 3px 0;
+  border-top: 1px solid var(--border);
+}
+
+.files > li:first-child {
+  border-top: 0;
 }
 
 .frow {
   display: grid;
-  grid-template-columns: 1fr auto 6.5em 8em auto auto;
+  grid-template-columns: minmax(0, 1fr) auto 6.5em 7em 64px;
   gap: 10px;
   align-items: center;
+  min-height: 34px;
 }
 
 .fname {
@@ -361,17 +493,44 @@ const moveDown = () => engine.run(() => api.move(props.pkg.id, props.index + 1))
   white-space: nowrap;
 }
 
+.fsize {
+  font-size: 12.5px;
+}
+
 .fspeed {
   text-align: right;
 }
 
 .fstatus {
-  font-size: 12px;
+  font-size: 12.5px;
+}
+
+.fbtns {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.icon-btn.on {
+  background: var(--accent-soft);
+  color: var(--accent);
 }
 
 @media (max-width: 760px) {
+  .live {
+    display: none;
+  }
+
   .frow {
-    grid-template-columns: 1fr auto;
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .fsize,
+  .fspeed {
+    display: none;
+  }
+
+  .details {
+    margin-left: 0;
   }
 }
 </style>
