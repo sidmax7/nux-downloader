@@ -223,6 +223,26 @@ pub enum NoticeLevel {
 #[derive(Debug, Clone, Serialize, Deserialize, Type, tauri_specta::Event)]
 pub struct SnapshotEvent(pub SnapshotDto);
 
+/// A newer version on GitHub Releases.
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct UpdateDto {
+    pub version: String,
+    /// The release notes, as written on the release.
+    pub notes: Option<String>,
+}
+
+/// Announced once after launch when an update is available.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, tauri_specta::Event)]
+pub struct UpdateEvent(pub UpdateDto);
+
+/// What the About section shows.
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct AboutDto {
+    pub version: String,
+    /// Whether this copy can update itself (else the package manager does).
+    pub can_self_update: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct SettingsResult {
     pub settings: Settings,

@@ -7,6 +7,11 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+# The installed program is `nux-downloader`; the CLI owns `nuxd`.
+[[bin]]
+name = "nux-downloader"
+path = "src/main.rs"
+
 [lib]
 name = "nuxd_app_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
@@ -14,12 +19,18 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 [lints]
 workspace = true
 
+[features]
+default = ["self-update"]
+# In-app updates from GitHub Releases. Package-manager builds (AUR, distro
+# packages) turn it off: `--no-default-features`.
+self-update = ["dep:tauri-plugin-updater"]
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
 nuxd-core = { workspace = true }
-tauri = { version = "2", features = ["tray-icon"] }
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-notification = "2"
 serde = { workspace = true }
@@ -33,3 +44,4 @@ tauri-specta = { version = "=2.0.0-rc.25", features = ["derive", "typescript"] }
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-single-instance = "2"
+tauri-plugin-updater = { version = "2", optional = true }

@@ -175,12 +175,34 @@ pub fn suggested_filename(disposition: Option<&str>, url: &Url) -> String {
         .unwrap_or_else(|| filename_from_url(url))
 }
 
-/// Filesystem name-length limits vary (255 bytes is the common ext4 /
-/// most-filesystems `NAME_MAX`, and comfortably under Windows' 260-char
-/// `MAX_PATH` minus a directory prefix); this keeps every sanitized name
-/// safely under all of them rather than tracking each platform's exact
-/// limit.
-const MAX_FILENAME_BYTES: usize = 255;
+/// The longest name a download may get. One path component is limited to
+/// 255 bytes (ext4, APFS) or 255 UTF-16 units (NTFS), and a download's
+/// name also carries a ` (12)` collision suffix and the `.nuxdpart`
+/// extension while it runs, so the budget leaves room for both.
+const MAX_FILENAME_BYTES: usize = 200;
+
+/// An extension longer than this is not treated as one when shortening a
+/// name (it is more likely part of the name).
+const MAX_KEPT_EXTENSION_BYTES: usize = 24;
+
+/// Shortens `name` to `MAX_FILENAME_BYTES`, keeping its extension so a
+/// long `….iso` still ends in `.iso`.
+fn shorten_keeping_extension(name: String) -> String {
+    if name.len() <= MAX_FILENAME_BYTES {
+        return name;
+    }
+    let ext = name
+        .rfind('.')
+        .filter(|&dot| dot > 0 && name.len() - dot <= MAX_KEPT_EXTENSION_BYTES)
+        .map(|dot| name[dot..].to_string())
+        .unwrap_or_default();
+    let stem = truncate_to_byte_limit(
+        name[..name.len() - ext.len()].to_string(),
+        MAX_FILENAME_BYTES - ext.len(),
+    );
+    let stem = stem.trim_end_matches([' ', '.']).to_string();
+    format!("{stem}{ext}")
+}
 
 /// Whether `name`'s part before its first `.` (or the whole name, if it
 /// has none) is a Windows-reserved device name: `CON`, `PRN`, `AUX`,
@@ -241,7 +263,7 @@ pub fn sanitize_filename(name: &str) -> String {
 
     // Truncate first, then trim: cutting a long name can itself leave a
     // trailing space or dot, which Windows would silently strip.
-    let mut safe = truncate_to_byte_limit(safe, MAX_FILENAME_BYTES);
+    let mut safe = shorten_keeping_extension(safe);
     let trimmed_len = safe.trim_end_matches([' ', '.']).len();
     safe.truncate(trimmed_len);
 
@@ -579,6 +601,23 @@ mod tests {
     fn replaces_control_characters_including_nul() {
         let sanitized = sanitize_filename("file\u{0}name.txt");
         assert_eq!(sanitized, "file_name.txt");
+    }
+
+    #[test]
+    fn shortening_keeps_the_extension() {
+        let long_name = format!("{}.iso", "a".repeat(400));
+        let sanitized = sanitize_filename(&long_name);
+        assert!(sanitized.len() <= MAX_FILENAME_BYTES);
+        assert!(sanitized.ends_with(".iso"), "{sanitized}");
+        // Room for the collision suffix and the in-progress extension.
+        assert!(format!("{sanitized} (99).nuxdpart").len() <= 255);
+    }
+
+    #[test]
+    fn a_long_tail_after_the_last_dot_is_not_kept_as_an_extension() {
+        let long_name = format!("x.{}", "b".repeat(400));
+        let sanitized = sanitize_filename(&long_name);
+        assert!(sanitized.len() <= MAX_FILENAME_BYTES);
     }
 
     #[test]

@@ -38,6 +38,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 
+# Release binaries ship without debug symbols (smaller downloads).
+[profile.release]
+strip = true
+
 [workspace.lints.clippy]
 unwrap_used = "deny"
 expect_used = "deny"

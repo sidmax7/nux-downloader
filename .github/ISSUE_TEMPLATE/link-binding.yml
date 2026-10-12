@@ -1,0 +1,36 @@
+name: Connection problem
+description: A network connection isn't found, isn't used, or downloads over the wrong one.
+labels: ["links"]
+body:
+  - type: textarea
+    id: setup
+    attributes:
+      label: Your connections
+      description: Which connections you expected to be used (for example "home Wi-Fi + Android phone over USB").
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What the Links page shows, and what you expected.
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options: [Linux, Windows, macOS]
+    validations:
+      required: true
+  - type: textarea
+    id: links
+    attributes:
+      label: Output of `nuxd links`
+      render: text
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics
+      description: Settings → Diagnostics → Copy.
+      render: text

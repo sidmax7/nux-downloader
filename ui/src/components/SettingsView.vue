@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { onMounted, reactive, ref } from "vue";
+import type { AboutDto } from "../bindings";
 import { api } from "../api";
 import type { Settings } from "../bindings";
 import { parseRate, rateText } from "../format";
@@ -21,7 +22,11 @@ const form = reactive({
   hostRules: "",
   notifications: true,
   closeToTray: false,
+  checkUpdates: true,
 });
+const about = ref<AboutDto | null>(null);
+const notices = ref<string | null>(null);
+const checking = ref(false);
 const report = ref<string | null>(null);
 const saving = ref(false);
 
@@ -36,11 +41,23 @@ function fill(settings: Settings) {
   form.hostRules = settings.host_rules.join("\n");
   form.notifications = settings.notifications;
   form.closeToTray = settings.close_to_tray;
+  form.checkUpdates = settings.check_updates;
 }
 
-onMounted(() => {
+onMounted(async () => {
   if (store.settings) fill(store.settings);
+  about.value = await api.about();
 });
+
+async function checkNow() {
+  checking.value = true;
+  await store.checkNow();
+  checking.value = false;
+}
+
+async function showNotices() {
+  notices.value = await api.notices();
+}
 
 async function browse() {
   const picked = await api.pickFolder();
@@ -70,6 +87,7 @@ async function save() {
       .filter(Boolean),
     notifications: form.notifications,
     close_to_tray: form.closeToTray,
+    check_updates: form.checkUpdates,
   });
   saving.value = false;
   if (ok) toasts.info("Settings saved.");
@@ -155,10 +173,41 @@ async function copyReport() {
       <label class="check"><input v-model="form.closeToTray" type="checkbox" /> Keep running in the tray when the window is closed</label>
     </fieldset>
 
+    <fieldset>
+      <legend>About</legend>
+      <p class="about">
+        <strong>Nux Downloader</strong>
+        <span v-if="about" class="muted num">version {{ about.version }}</span>
+      </p>
+      <template v-if="about?.can_self_update">
+        <label class="check"><input v-model="form.checkUpdates" type="checkbox"> Check for updates when the app starts</label>
+        <div class="row">
+          <button class="btn" type="button" :disabled="checking" @click="checkNow">
+            {{ checking ? "Checking…" : "Check for updates now" }}
+          </button>
+          <span v-if="store.update" class="muted">Version {{ store.update.version }} is available.</span>
+        </div>
+      </template>
+      <p v-else-if="about" class="muted small">
+        Updates for this copy come from your package manager.
+      </p>
+      <div class="row">
+        <button class="btn" type="button" @click="showNotices">Third-party licences…</button>
+        <span class="muted small">Licensed under Apache-2.0.</span>
+      </div>
+    </fieldset>
+
     <div class="buttons">
       <button class="btn primary" type="submit" :disabled="saving">Save settings</button>
       <button class="btn" type="button" @click="showReport">Diagnostics…</button>
     </div>
+
+    <ModalDialog v-if="notices !== null" title="Third-party licences" wide @close="notices = null">
+      <pre class="report">{{ notices }}</pre>
+      <template #footer>
+        <button class="btn primary" type="button" @click="notices = null">Close</button>
+      </template>
+    </ModalDialog>
 
     <ModalDialog v-if="report !== null" title="Diagnostics" wide @close="report = null">
       <p class="muted">Links in this report are cut down to host and path. Nothing is sent anywhere.</p>
@@ -219,6 +268,24 @@ legend {
 
 .short {
   width: 11em;
+}
+
+.about {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  margin: 0;
+}
+
+.row {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.small {
+  font-size: 12.5px;
 }
 
 .check {

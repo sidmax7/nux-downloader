@@ -108,12 +108,17 @@ pub async fn scan(
         .await
         .map_err(io::Error::other)??;
 
-    let discovered = match &setup.only {
+    // Named links are used as asked; otherwise networks that exist only
+    // inside this machine (Docker, VM bridges) are left out.
+    let discovered: Vec<Link> = match &setup.only {
         Some(names) => discovered
             .into_iter()
             .filter(|link| names.contains(&link.name))
             .collect(),
-        None => discovered,
+        None => discovered
+            .into_iter()
+            .filter(|link| !super::discover::is_host_virtual(&link.name))
+            .collect(),
     };
     let discovered: Vec<Link> = discovered
         .into_iter()
@@ -264,6 +269,19 @@ mod tests {
         let links = scan(&setup, &EngineConfig::default(), &[]).await.unwrap();
         let names: Vec<_> = links.iter().map(|l| l.name.as_str()).collect();
         assert_eq!(names, ["usb0", "wlan0"]);
+    }
+
+    #[tokio::test]
+    async fn container_bridges_are_skipped_unless_named() {
+        let shared = Arc::new(Shared::default());
+        shared.set(&[("docker0", "172.17.0.1"), ("eth0", "10.0.0.2")]);
+        let mut setup = setup(shared, Vec::new());
+        let links = scan(&setup, &EngineConfig::default(), &[]).await.unwrap();
+        let names: Vec<_> = links.iter().map(|l| l.name.as_str()).collect();
+        assert_eq!(names, ["eth0"]);
+        setup.only = Some(vec!["docker0".into()]);
+        let links = scan(&setup, &EngineConfig::default(), &[]).await.unwrap();
+        assert_eq!(links[0].name, "docker0");
     }
 
     #[tokio::test]

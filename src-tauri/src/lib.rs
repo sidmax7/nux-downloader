@@ -7,6 +7,7 @@ mod dto;
 mod host;
 mod settings;
 mod tray;
+mod update;
 
 use host::AppState;
 use std::sync::Arc;
@@ -37,8 +38,16 @@ fn specta_builder() -> Builder<tauri::Wry> {
             commands::restart_engine,
             commands::pick_folder,
             commands::diagnostics_report,
+            commands::about,
+            commands::check_for_update,
+            commands::install_update,
+            commands::third_party_notices,
         ])
-        .events(collect_events![dto::SnapshotEvent, dto::NoticeEvent])
+        .events(collect_events![
+            dto::SnapshotEvent,
+            dto::NoticeEvent,
+            dto::UpdateEvent
+        ])
         .dangerously_cast_bigints_to_number()
 }
 
@@ -116,7 +125,10 @@ pub fn run() {
             tray::show_window(app);
         }))
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_notification::init());
+    #[cfg(feature = "self-update")]
+    let app = app.plugin(tauri_plugin_updater::Builder::new().build());
+    let app = app
         .manage(Arc::clone(&state))
         .invoke_handler(builder.invoke_handler())
         .setup(move |app| {
@@ -125,6 +137,7 @@ pub fn run() {
             quit_on_signals(&handle);
             let has_tray = tray::install(&handle);
             tauri::async_runtime::block_on(host::start(&handle, &state, false));
+            update::check_in_background(&handle, &state);
             if has_tray && let Some(window) = app.get_webview_window("main") {
                 let close_handle = handle.clone();
                 let close_state = Arc::clone(&state);

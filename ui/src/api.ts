@@ -36,4 +36,8 @@ export const api = {
   restartEngine: () => unwrap(commands.restartEngine()),
   pickFolder: () => commands.pickFolder(),
   diagnostics: () => unwrap(commands.diagnosticsReport()),
+  about: () => commands.about(),
+  checkForUpdate: () => unwrap(commands.checkForUpdate()),
+  installUpdate: () => unwrap(commands.installUpdate()),
+  notices: () => commands.thirdPartyNotices(),
 };

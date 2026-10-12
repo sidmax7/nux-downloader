@@ -3,12 +3,12 @@
 //! engine — a running download or a management session — holds an
 //! exclusive advisory lock on `<data dir>/nuxd.lock` for as long as it
 //! lives. The OS drops the lock if the process dies, so a crash never
-//! leaves a stale one; the file also records the holder's process id for
-//! the error message.
+//! leaves a stale one. The holder's process id goes in a separate
+//! `nuxd.pid`, for the error message: Windows locks are mandatory, so a
+//! second process could not read it from the locked file itself.
 
 use crate::error::StorageError;
 use fs4::fs_std::FileExt;
-use std::io::{Read, Write};
 use std::path::Path;
 
 /// Held for the engine's lifetime; dropping it releases the lock.
@@ -25,7 +25,7 @@ impl DataDirLock {
             path: path.display().to_string(),
             source,
         };
-        let mut file = std::fs::OpenOptions::new()
+        let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
@@ -35,8 +35,7 @@ impl DataDirLock {
         match file.try_lock_exclusive() {
             Ok(()) => {}
             Err(e) if e.raw_os_error() == fs4::lock_contended_error().raw_os_error() => {
-                let mut holder = String::new();
-                let _ = file.read_to_string(&mut holder);
+                let holder = std::fs::read_to_string(data_dir.join("nuxd.pid")).unwrap_or_default();
                 return Err(StorageError::Locked {
                     dir: data_dir.display().to_string(),
                     holder: holder.trim().parse().ok(),
@@ -44,11 +43,8 @@ impl DataDirLock {
             }
             Err(e) => return Err(io("lock", e)),
         }
-        // Ours now: record who we are.
-        let _ = file.set_len(0);
-        let _ = std::io::Seek::rewind(&mut file);
-        let _ = write!(file, "{}", std::process::id());
-        let _ = file.flush();
+        // Ours now: record who we are (best effort; only for messages).
+        let _ = std::fs::write(data_dir.join("nuxd.pid"), std::process::id().to_string());
         Ok(Self { _file: file })
     }
 }

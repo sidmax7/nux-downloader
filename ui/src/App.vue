@@ -8,6 +8,7 @@ import QueueView from "./components/QueueView.vue";
 import SettingsView from "./components/SettingsView.vue";
 import ThroughputBar from "./components/ThroughputBar.vue";
 import ToastHost from "./components/ToastHost.vue";
+import markUrl from "./assets/mark.png";
 import { formatSpeed } from "./format";
 import { useEngineStore } from "./stores/engine";
 import { useSettingsStore } from "./stores/settings";
@@ -80,6 +81,7 @@ onMounted(async () => {
   window.addEventListener("keydown", onKey);
   try {
     await settings.load();
+    await settings.listenForUpdates();
     await engine.start();
   } catch (error) {
     startError.value = error instanceof Error ? error.message : String(error);
@@ -96,24 +98,9 @@ onBeforeUnmount(() => {
 <template>
   <div class="shell">
     <aside class="rail">
-      <div class="brand">
-        <svg class="mark" viewBox="0 0 32 32" width="26" height="26" aria-hidden="true">
-          <rect width="32" height="32" rx="8" fill="var(--accent)" />
-          <path
-            d="M9 10.5h14M9 16h14M9 21.5h14"
-            stroke="var(--accent-fg)"
-            stroke-width="2.4"
-            stroke-linecap="round"
-            opacity="0.45"
-          />
-          <path
-            d="M9 10.5h9M9 16h14M9 21.5h6"
-            stroke="var(--accent-fg)"
-            stroke-width="2.4"
-            stroke-linecap="round"
-          />
-        </svg>
-        <span class="word">Nux</span>
+      <div class="brand" role="img" aria-label="Nux Downloader">
+        <img class="mark" :src="markUrl" alt="" width="38" height="24" />
+        <span class="word"><span class="nux">Nux</span><span class="dl">Downloader</span></span>
       </div>
 
       <nav role="tablist" aria-label="Sections" aria-orientation="vertical" class="tabs" @keydown="onTabKey">
@@ -163,6 +150,21 @@ onBeforeUnmount(() => {
         </div>
       </header>
 
+      <div v-if="settings.update" class="banner" role="status">
+        <UiIcon name="download" />
+        <span>Nux Downloader {{ settings.update.version }} is available.</span>
+        <button
+          class="btn small primary"
+          type="button"
+          :disabled="settings.installing"
+          @click="settings.installUpdate()"
+        >
+          {{ settings.installing ? "Updating…" : "Update and restart" }}
+        </button>
+        <button class="icon-btn" type="button" aria-label="Not now" @click="settings.update = null">
+          <UiIcon name="close" />
+        </button>
+      </div>
       <div v-if="settings.restartNeeded" class="banner" role="status">
         <UiIcon name="restart" />
         <span>Some settings apply after the engine restarts.</span>
@@ -214,10 +216,22 @@ onBeforeUnmount(() => {
   padding: 2px 6px;
 }
 
+.mark {
+  display: block;
+  flex: none;
+}
+
+/* The wordmark as in the logo: "Nux" in the text colour, "Downloader"
+   in the brand violet. Live text, so it follows the theme. */
 .word {
-  font-size: 16px;
-  font-weight: 700;
-  letter-spacing: -0.01em;
+  font-size: 15.5px;
+  font-weight: 800;
+  letter-spacing: -0.02em;
+  white-space: nowrap;
+}
+
+.dl {
+  color: var(--brand);
 }
 
 .tabs {
@@ -378,6 +392,10 @@ main {
   .word,
   .meter {
     display: none;
+  }
+
+  .brand {
+    padding: 0;
   }
 
   /* Icon-only rail, but the names stay available to screen readers. */

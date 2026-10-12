@@ -375,3 +375,37 @@ async fn a_symlink_planted_where_the_partial_file_goes_is_never_written_through(
     assert_eq!(std::fs::read(&victim).unwrap(), b"do not touch");
     engine.shutdown().await;
 }
+
+/// A destination far past Windows' old 260-character `MAX_PATH`. Rust's
+/// standard library turns long paths into `\\?\` form on Windows, so this
+/// must work on every platform (CI runs it on all three).
+#[tokio::test]
+async fn a_destination_path_longer_than_260_characters_works() {
+    let size = 3 * 1024 * 1024;
+    let origin = Origin::start(OriginOptions {
+        size,
+        seed: 43,
+        ..Default::default()
+    })
+    .await;
+    let data = tempdir().unwrap();
+    let outer = tempdir().unwrap();
+    let mut dest = outer.path().to_path_buf();
+    for level in 0..6 {
+        dest.push(format!("{level}-{}", "deep-folder-name".repeat(4)));
+    }
+    assert!(dest.as_os_str().len() > 300, "{}", dest.display());
+    std::fs::create_dir_all(&dest).unwrap();
+
+    let engine = engine(data.path(), EngineConfig::default()).await;
+    engine.add(vec![origin.url()], opts(&dest)).await.unwrap();
+    wait_for(&engine, "the package to finish", |p| {
+        p.status == PackageStatus::Done
+    })
+    .await;
+    assert_eq!(
+        std::fs::read(only_file(&dest)).unwrap(),
+        content_range(43, 0, size)
+    );
+    engine.shutdown().await;
+}

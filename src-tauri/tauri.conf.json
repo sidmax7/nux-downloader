@@ -2,7 +2,8 @@
   "$schema": "../ui/node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "Nux Downloader",
   "version": "0.1.0",
-  "identifier": "dev.nuxd.downloader",
+  "identifier": "io.github.sidmax7.nuxd",
+  "mainBinaryName": "nux-downloader",
   "build": {
     "beforeDevCommand": "pnpm --dir ui dev",
     "beforeBuildCommand": "pnpm --dir ui build",
@@ -19,9 +20,28 @@
       "freezePrototype": true
     }
   },
+  "plugins": {
+    "updater": {
+      "pubkey": "",
+      "endpoints": ["https://github.com/sidmax7/nux-downloader/releases/latest/download/latest.json"],
+      "requireSignedVersion": true,
+      "windows": { "installMode": "passive" }
+    }
+  },
   "bundle": {
     "active": true,
+    "category": "Utility",
+    "shortDescription": "Download manager that uses every network connection at once",
+    "longDescription": "Nux Downloader splits downloads across all your network links at once and manages many downloads as packages, with crash-safe resume and archive extraction.",
     "targets": "all",
-    "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.icns", "icons/icon.ico"]
+    "icon": [
+      "icons/32x32.png",
+      "icons/64x64.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
   }
 }

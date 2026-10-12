@@ -2,8 +2,8 @@
 //! boundary as readable strings.
 
 use crate::dto::{
-    BlocksDto, DraftDto, EnqueueRequest, PriorityDto, SettingsResult, SnapshotDto, blocks_of,
-    draft_dto,
+    AboutDto, BlocksDto, DraftDto, EnqueueRequest, PriorityDto, SettingsResult, SnapshotDto,
+    UpdateDto, blocks_of, draft_dto,
 };
 use crate::host::{self, AppState};
 use crate::settings::Settings;
@@ -283,4 +283,36 @@ pub async fn pick_folder(app: AppHandle) -> Option<String> {
 #[specta::specta]
 pub async fn diagnostics_report(state: Shared<'_>) -> AppResult<String> {
     Ok(state.engine().await?.diagnostics().await)
+}
+
+/// Version and update capability, for Settings → About.
+#[tauri::command]
+#[specta::specta]
+pub fn about(app: AppHandle) -> AboutDto {
+    AboutDto {
+        version: app.package_info().version.to_string(),
+        can_self_update: crate::update::supported(),
+    }
+}
+
+/// Asks GitHub Releases for a newer version.
+#[tauri::command]
+#[specta::specta]
+pub async fn check_for_update(app: AppHandle) -> AppResult<Option<UpdateDto>> {
+    crate::update::check(&app).await
+}
+
+/// Installs the newer version and restarts into it.
+#[tauri::command]
+#[specta::specta]
+pub async fn install_update(app: AppHandle, state: Shared<'_>) -> AppResult<()> {
+    let state = Arc::clone(&state);
+    crate::update::install(&app, &state).await
+}
+
+/// The licences of everything the app is built from.
+#[tauri::command]
+#[specta::specta]
+pub fn third_party_notices() -> String {
+    include_str!("../../THIRD_PARTY_NOTICES.md").to_string()
 }

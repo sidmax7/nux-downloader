@@ -1,21 +1,23 @@
 :root {
   color-scheme: light dark;
   /* Neutrals carry a hint of the accent's blue so surfaces feel related. */
-  --bg: #f3f4f7;
-  --rail: #e8eaf0;
+  --bg: #f4f4f8;
+  --rail: #ebeaf2;
   --surface: #ffffff;
-  --surface-2: #eceef3;
-  --track: #dfe2ea;
-  --border: #d5d9e2;
-  --fg: #171a21;
-  --muted: #555e70;
-  --accent: #2250e0;
-  --accent-soft: #e4ebff;
+  --surface-2: #eeedf4;
+  --track: #e0deea;
+  --border: #d7d5e1;
+  --fg: #17161f;
+  --muted: #565470;
+  --accent: #5a38e0;
+  --accent-soft: #ebe6ff;
   --accent-fg: #ffffff;
+  /* The logo's violet, for the wordmark. */
+  --brand: #6d47f0;
   --danger: #b3261e;
   --ok: #17724a;
   --warn: #8a5a00;
-  --focus: #2250e0;
+  --focus: #5a38e0;
   --shadow: 0 8px 28px rgb(20 24 40 / 18%);
   font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   font-size: 14px;
@@ -24,42 +26,44 @@
 
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
-    --bg: #111318;
-    --rail: #0c0e12;
-    --surface: #181b22;
-    --surface-2: #21252e;
-    --track: #262b35;
-    --border: #2b303b;
-    --fg: #e9ebf0;
-    --muted: #9aa3b4;
-    --accent: #7ba3ff;
-    --accent-soft: #1d2745;
-    --accent-fg: #0b1020;
+    --bg: #0f0f17;
+    --rail: #0a0a12;
+    --surface: #17161f;
+    --surface-2: #201e2b;
+    --track: #262433;
+    --border: #2d2a3b;
+    --fg: #ecebf2;
+    --muted: #a19eb6;
+    --accent: #a68cff;
+    --accent-soft: #241d45;
+    --accent-fg: #120c2b;
+  --brand: #a07dff;
     --danger: #ff8f86;
     --ok: #71d6a2;
     --warn: #f1c35e;
-    --focus: #9dbbff;
+    --focus: #c2b2ff;
     --shadow: 0 8px 28px rgb(0 0 0 / 55%);
   }
 }
 
 :root[data-theme="dark"] {
   color-scheme: dark;
-  --bg: #111318;
-  --rail: #0c0e12;
-  --surface: #181b22;
-  --surface-2: #21252e;
-  --track: #262b35;
-  --border: #2b303b;
-  --fg: #e9ebf0;
-  --muted: #9aa3b4;
-  --accent: #7ba3ff;
-  --accent-soft: #1d2745;
-  --accent-fg: #0b1020;
+  --bg: #0f0f17;
+  --rail: #0a0a12;
+  --surface: #17161f;
+  --surface-2: #201e2b;
+  --track: #262433;
+  --border: #2d2a3b;
+  --fg: #ecebf2;
+  --muted: #a19eb6;
+  --accent: #a68cff;
+  --accent-soft: #241d45;
+  --accent-fg: #120c2b;
+  --brand: #a07dff;
   --danger: #ff8f86;
   --ok: #71d6a2;
   --warn: #f1c35e;
-  --focus: #9dbbff;
+  --focus: #c2b2ff;
   --shadow: 0 8px 28px rgb(0 0 0 / 55%);
 }
 

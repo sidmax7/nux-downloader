@@ -88,6 +88,39 @@ pub fn kind_from_name(name: &str) -> LinkKind {
     }
 }
 
+/// Whether `name` is a network that only exists inside this machine: a
+/// container or virtual-machine bridge (Docker, Podman, libvirt, LXC,
+/// VirtualBox, VMware, Hyper-V/WSL). Traffic sent there never reaches the
+/// internet, so such links are left out unless asked for by name. A plain
+/// user bridge like `br0` usually is the real LAN and is kept; VPN
+/// tunnels (`tun0`, `wg0`, `utun3`) do reach the internet and are kept.
+#[must_use]
+pub fn is_host_virtual(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    let docker_network = n
+        .strip_prefix("br-")
+        .is_some_and(|rest| rest.len() >= 8 && rest.chars().all(|c| c.is_ascii_hexdigit()));
+    docker_network
+        || [
+            "docker",
+            "veth",
+            "virbr",
+            "vmnet",
+            "vboxnet",
+            "cni",
+            "flannel",
+            "podman",
+            "lxcbr",
+            "lxdbr",
+            "incusbr",
+            "vethernet",
+            "virtualbox",
+            "vmware network adapter",
+        ]
+        .iter()
+        .any(|prefix| n.starts_with(prefix))
+}
+
 /// Groups usable addresses into links: no loopback, no unspecified, no
 /// link-local; one link per interface name, carrying its first IPv4 and
 /// first IPv6 address. Sorted by name so the order is stable.
@@ -147,6 +180,27 @@ mod tests {
     impl LinkSource for Broken {
         fn addresses(&self) -> io::Result<Vec<RawAddr>> {
             Err(io::Error::other("no interfaces"))
+        }
+    }
+
+    #[test]
+    fn host_virtual_networks_are_recognised() {
+        for name in [
+            "docker0",
+            "br-3f2a9c1d0e4b",
+            "veth12ab",
+            "virbr0",
+            "vboxnet0",
+            "vEthernet (WSL)",
+            "VMware Network Adapter VMnet8",
+            "podman1",
+        ] {
+            assert!(is_host_virtual(name), "{name}");
+        }
+        for name in [
+            "br0", "bridge0", "eth0", "wlan0", "en0", "tun0", "wg0", "utun3", "Wi-Fi",
+        ] {
+            assert!(!is_host_virtual(name), "{name}");
         }
     }
 

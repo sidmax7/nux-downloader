@@ -3,7 +3,7 @@
 // the add dialog opens. Uses only Node's built-in test runner and fetch.
 //
 //   tauri-driver &                       # listens on :4444
-//   NUXD_APP=../target/release/nuxd-app node --test e2e/
+//   NUXD_APP=../target/release/nux-downloader node --test e2e/
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -11,7 +11,7 @@ import path from "node:path";
 import { after, before, describe, it } from "node:test";
 
 const DRIVER = process.env.TAURI_DRIVER_URL ?? "http://127.0.0.1:4444";
-const APP = path.resolve(process.env.NUXD_APP ?? "../target/release/nuxd-app");
+const APP = path.resolve(process.env.NUXD_APP ?? "../target/release/nux-downloader");
 
 let session = "";
 let dataDir = "";

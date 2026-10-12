@@ -1,0 +1,165 @@
+name: Release
+
+# Pushing a `v*` tag (e.g. `v0.1.0`, or `v0.2.0-beta.1` for a pre-release)
+# builds every installer and the CLI, signs the update artefacts, and puts
+# them on a *draft* GitHub release. Publishing the draft is a manual step
+# (docs/releasing.md), and only then do installed apps see the update.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  prepare:
+    name: prepare the draft release
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check the tag matches the version everywhere
+        id: version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          cargo_version=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          conf_version=$(python3 -c "import json; print(json.load(open('src-tauri/tauri.conf.json'))['version'])")
+          ui_version=$(python3 -c "import json; print(json.load(open('ui/package.json'))['version'])")
+          for v in "$cargo_version" "$conf_version" "$ui_version"; do
+            if [ "$v" != "$tag" ]; then
+              echo "::error::tag $GITHUB_REF_NAME does not match a version in the repo ($cargo_version / $conf_version / $ui_version)"
+              exit 1
+            fi
+          done
+          pubkey=$(python3 -c "import json; print(json.load(open('src-tauri/tauri.conf.json'))['plugins']['updater']['pubkey'])")
+          if [ -z "$pubkey" ]; then
+            echo "::error::plugins.updater.pubkey in src-tauri/tauri.conf.json is empty (see docs/releasing.md)"
+            exit 1
+          fi
+          echo "version=$tag" >> "$GITHUB_OUTPUT"
+      - name: Create the draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          flags="--draft --verify-tag --title ${GITHUB_REF_NAME}"
+          case "$GITHUB_REF_NAME" in *-*) flags="$flags --prerelease" ;; esac
+          notes=$(python3 scripts/changelog-section.py "${GITHUB_REF_NAME#v}")
+          gh release create "$GITHUB_REF_NAME" $flags --notes "$notes"
+
+  app:
+    name: app (${{ matrix.name }})
+    needs: prepare
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 22.04's older glibc lets the AppImage and .deb run on more systems.
+          - name: linux
+            os: ubuntu-22.04
+            args: --bundles appimage,deb,rpm
+            out: target/release/bundle
+          - name: macos
+            os: macos-latest
+            args: --target universal-apple-darwin --bundles app,dmg
+            out: target/universal-apple-darwin/release/bundle
+          - name: windows
+            os: windows-latest
+            args: --bundles nsis
+            out: target/release/bundle
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: Linux packages
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev libayatana-appindicator3-dev rpm
+      - name: Both macOS architectures
+        if: runner.os == 'macOS'
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: ui/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: ui/pnpm-lock.yaml
+      - run: pnpm --dir ui install --frozen-lockfile
+      - name: Build
+        working-directory: src-tauri
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: ../ui/node_modules/.bin/tauri build ${{ matrix.args }} --config '{"bundle":{"createUpdaterArtifacts":true}}'
+      - name: Collect the files under release names
+        run: python3 scripts/collect-release-files.py "${{ matrix.out }}" "${{ needs.prepare.outputs.version }}" dist-release
+      - name: Upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" dist-release/* --clobber
+
+  cli:
+    name: nuxd (${{ matrix.target }})
+    needs: prepare
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-22.04, target: x86_64-unknown-linux-gnu }
+          - { os: macos-latest, target: aarch64-apple-darwin }
+          - { os: macos-latest, target: x86_64-apple-darwin }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc }
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup target add ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - run: cargo build --release --locked -p nuxd --target ${{ matrix.target }}
+      - name: Package
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          name="nuxd-${{ needs.prepare.outputs.version }}-${{ matrix.target }}"
+          mkdir "$name"
+          cp LICENSE README.md THIRD_PARTY_NOTICES.md "$name/"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp "target/${{ matrix.target }}/release/nuxd.exe" "$name/"
+            7z a "$name.zip" "$name" > /dev/null
+            gh release upload "$GITHUB_REF_NAME" "$name.zip" --clobber
+          else
+            cp "target/${{ matrix.target }}/release/nuxd" "$name/"
+            tar czf "$name.tar.gz" "$name"
+            gh release upload "$GITHUB_REF_NAME" "$name.tar.gz" --clobber
+          fi
+
+  finish:
+    name: checksums and update manifest
+    needs: [prepare, app, cli]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: SHA256SUMS and latest.json
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir assets && cd assets
+          gh release download "$GITHUB_REF_NAME" --pattern '*'
+          rm -f SHA256SUMS latest.json
+          python3 ../scripts/update-manifest.py "${{ needs.prepare.outputs.version }}" "$GITHUB_REF_NAME" > latest.json
+          sha256sum -- * > SHA256SUMS
+          gh release upload "$GITHUB_REF_NAME" SHA256SUMS latest.json --clobber

@@ -52,6 +52,8 @@ pub struct Settings {
     pub notifications: bool,
     /// Closing the window keeps the app running in the tray.
     pub close_to_tray: bool,
+    /// Look for a new version a few seconds after launch.
+    pub check_updates: bool,
 }
 
 impl Default for Settings {
@@ -68,6 +70,7 @@ impl Default for Settings {
             link_prefs: BTreeMap::new(),
             notifications: true,
             close_to_tray: false,
+            check_updates: true,
         }
     }
 }

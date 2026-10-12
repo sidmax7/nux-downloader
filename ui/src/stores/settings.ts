@@ -1,7 +1,7 @@
 import { defineStore } from "pinia";
 import { ref } from "vue";
 import { api } from "../api";
-import type { LinkPref, Settings } from "../bindings";
+import { events, type LinkPref, type Settings, type UpdateDto } from "../bindings";
 import { useToastStore } from "./toasts";
 
 export type Theme = "system" | "light" | "dark";
@@ -27,6 +27,36 @@ export const useSettingsStore = defineStore("settings", () => {
   const settings = ref<Settings | null>(null);
   const restartNeeded = ref(false);
   const theme = ref<Theme>(readTheme());
+  const update = ref<UpdateDto | null>(null);
+  const installing = ref(false);
+
+  async function listenForUpdates() {
+    await events.updateEvent.listen((event) => {
+      update.value = event.payload;
+    });
+  }
+
+  async function checkNow(): Promise<UpdateDto | null> {
+    try {
+      update.value = await api.checkForUpdate();
+      if (!update.value) toasts.info("You have the latest version.");
+      return update.value;
+    } catch (error) {
+      toasts.error(`Couldn't check for updates: ${error instanceof Error ? error.message : String(error)}`);
+      return null;
+    }
+  }
+
+  async function installUpdate() {
+    installing.value = true;
+    try {
+      await api.installUpdate();
+    } catch (error) {
+      toasts.error(error instanceof Error ? error.message : String(error));
+    } finally {
+      installing.value = false;
+    }
+  }
 
   async function load() {
     settings.value = await api.getSettings();
@@ -82,5 +112,19 @@ export const useSettingsStore = defineStore("settings", () => {
     }
   }
 
-  return { settings, restartNeeded, theme, load, save, setLinkPref, setTheme, restartEngine };
+  return {
+    settings,
+    restartNeeded,
+    theme,
+    update,
+    installing,
+    load,
+    save,
+    setLinkPref,
+    setTheme,
+    restartEngine,
+    listenForUpdates,
+    checkNow,
+    installUpdate,
+  };
 });

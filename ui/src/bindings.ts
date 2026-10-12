@@ -39,15 +39,35 @@ export const commands = {
 	pickFolder: () => __TAURI_INVOKE<string | null>("pick_folder"),
 	/**  A plain-text report for bug reports; nothing is sent anywhere. */
 	diagnosticsReport: () => typedError<string, string>(__TAURI_INVOKE("diagnostics_report")),
+	/**  Version and update capability, for Settings → About. */
+	about: () => __TAURI_INVOKE<AboutDto>("about"),
+	/**  Asks GitHub Releases for a newer version. */
+	checkForUpdate: () => typedError<{
+	version: string,
+	/**  The release notes, as written on the release. */
+	notes: string | null,
+} | null, string>(__TAURI_INVOKE("check_for_update")),
+	/**  Installs the newer version and restarts into it. */
+	installUpdate: () => typedError<null, string>(__TAURI_INVOKE("install_update")),
+	/**  The licences of everything the app is built from. */
+	thirdPartyNotices: () => __TAURI_INVOKE<string>("third_party_notices"),
 };
 
 /** Events */
 export const events = {
 	noticeEvent: makeEvent<NoticeEvent>("notice-event"),
 	snapshotEvent: makeEvent<SnapshotEvent>("snapshot-event"),
+	updateEvent: makeEvent<UpdateEvent>("update-event"),
 };
 
 /* Types */
+/**  What the About section shows. */
+export type AboutDto = {
+	version: string,
+	/**  Whether this copy can update itself (else the package manager does). */
+	can_self_update: boolean,
+};
+
 /**
  *  One block of a file for the grid: how much of it is secured, and which
  *  link delivered it.
@@ -190,6 +210,8 @@ export type Settings = {
 	notifications: boolean,
 	/**  Closing the window keeps the app running in the tray. */
 	close_to_tray: boolean,
+	/**  Look for a new version a few seconds after launch. */
+	check_updates: boolean,
 };
 
 export type SettingsResult = {
@@ -211,6 +233,16 @@ export type SnapshotDto = {
 
 /**  The whole picture, pushed at up to 4 Hz and after any change. */
 export type SnapshotEvent = SnapshotDto;
+
+/**  A newer version on GitHub Releases. */
+export type UpdateDto = {
+	version: string,
+	/**  The release notes, as written on the release. */
+	notes: string | null,
+};
+
+/**  Announced once after launch when an update is available. */
+export type UpdateEvent = UpdateDto;
 
 /* Tauri Specta runtime */
 async function typedError<T, E>(result: Promise<T>): Promise<{ status: "ok"; data: T } | { status: "error"; error: E }> {

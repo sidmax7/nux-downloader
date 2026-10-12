@@ -47,6 +47,8 @@ jobs:
       - run: pnpm --dir ui install --frozen-lockfile
       - run: pnpm --dir ui build
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      # Package-manager builds of the app leave the self-updater out.
+      - run: cargo clippy -p nuxd-app --all-targets --no-default-features -- -D warnings
 
   test:
     name: test (${{ matrix.os }})
@@ -162,7 +164,7 @@ jobs:
       - name: Run
         working-directory: ui
         env:
-          NUXD_APP: ../target/release/nuxd-app
+          NUXD_APP: ../target/release/nux-downloader
           WEBKIT_DISABLE_DMABUF_RENDERER: "1"
         run: |
           tauri-driver &
