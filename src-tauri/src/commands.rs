@@ -2,8 +2,8 @@
 //! boundary as readable strings.
 
 use crate::dto::{
-    AboutDto, BlocksDto, DraftDto, EnqueueRequest, PriorityDto, SettingsResult, SnapshotDto,
-    UpdateDto, blocks_of, draft_dto,
+    AboutDto, BlocksDto, CollectOptionsDto, DraftDto, EnqueueRequest, PriorityDto, SettingsResult,
+    SnapshotDto, UpdateDto, blocks_of, draft_dto,
 };
 use crate::host::{self, AppState};
 use crate::settings::Settings;
@@ -35,13 +35,26 @@ pub async fn engine_snapshot(state: Shared<'_>) -> AppResult<SnapshotDto> {
     Ok(state.snapshot().await)
 }
 
-/// Resolves and probes the pasted links and returns drafts to review.
+/// Resolves and probes the pasted links and returns drafts to review;
+/// links that are web pages are scanned for files when asked (§13.1).
 #[tauri::command]
 #[specta::specta]
-pub async fn collect_links(state: Shared<'_>, inputs: Vec<String>) -> AppResult<Vec<DraftDto>> {
+pub async fn collect_links(
+    state: Shared<'_>,
+    inputs: Vec<String>,
+    options: CollectOptionsDto,
+) -> AppResult<Vec<DraftDto>> {
     let engine = state.engine().await?;
     state.discard_drafts();
-    let drafts = engine.collect(inputs).await;
+    let drafts = engine
+        .collect_with(
+            inputs,
+            nuxd_core::collect::CollectOptions {
+                scan_pages: options.scan_pages,
+                deep: options.deep,
+            },
+        )
+        .await;
     Ok(drafts
         .into_iter()
         .map(|draft| {
@@ -57,9 +70,15 @@ pub async fn collect_links(state: Shared<'_>, inputs: Vec<String>) -> AppResult<
 #[specta::specta]
 pub async fn enqueue_draft(state: Shared<'_>, request: EnqueueRequest) -> AppResult<u64> {
     let engine = state.engine().await?;
-    let draft = state
+    let mut draft = state
         .take_draft(request.draft_id)
         .ok_or("That draft is no longer available; add the links again.")?;
+    if let Some(keep) = &request.files {
+        draft.files.retain(|file| keep.contains(&file.source));
+        if draft.files.is_empty() {
+            return Err("Pick at least one file to add.".into());
+        }
+    }
     let name = request.name.trim();
     if name.is_empty() {
         return Err("The package needs a name.".into());

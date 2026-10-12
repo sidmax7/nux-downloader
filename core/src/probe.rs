@@ -8,7 +8,7 @@ use crate::config::EngineConfig;
 use crate::error::ProbeError;
 use crate::model::FileVersion;
 use reqwest::header::{
-    CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, ETAG, LAST_MODIFIED, RANGE,
+    CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG, LAST_MODIFIED, RANGE,
 };
 use reqwest::{Client, StatusCode};
 use url::Url;
@@ -297,6 +297,21 @@ pub struct ProbeResult {
     /// here should assume so.
     pub supports_ranges: bool,
     pub version: FileVersion,
+    /// The response's `Content-Type`, as sent. An HTML page here is what
+    /// page scanning looks for (§13.1).
+    pub content_type: Option<String>,
+}
+
+impl ProbeResult {
+    /// Whether the link is a web page rather than a file (§13.1).
+    #[must_use]
+    pub fn is_html(&self) -> bool {
+        self.content_type.as_deref().is_some_and(|value| {
+            let kind = value.split(';').next().unwrap_or("").trim();
+            kind.eq_ignore_ascii_case("text/html")
+                || kind.eq_ignore_ascii_case("application/xhtml+xml")
+        })
+    }
 }
 
 /// The literal `Content-Range` value a `416` reports for a zero-length
@@ -338,6 +353,7 @@ pub async fn probe(
     let suggested_name = sanitize_filename(&suggested_filename(disposition, &final_url));
     let etag = header_str(&headers, ETAG).map(str::to_string);
     let last_modified = header_str(&headers, LAST_MODIFIED).map(str::to_string);
+    let content_type = header_str(&headers, CONTENT_TYPE).map(str::to_string);
 
     match status {
         StatusCode::PARTIAL_CONTENT => {
@@ -347,6 +363,7 @@ pub async fn probe(
                 .ok_or(ProbeError::MalformedContentRange)?;
             let expected_size = content_range.total;
             Ok(ProbeResult {
+                content_type: content_type.clone(),
                 final_url,
                 suggested_name,
                 expected_size,
@@ -362,6 +379,7 @@ pub async fn probe(
             let expected_size =
                 header_str(&headers, CONTENT_LENGTH).and_then(|value| value.parse().ok());
             Ok(ProbeResult {
+                content_type: content_type.clone(),
                 final_url,
                 suggested_name,
                 expected_size,
@@ -377,6 +395,7 @@ pub async fn probe(
             if header_str(&headers, CONTENT_RANGE).is_some_and(is_empty_file_range) =>
         {
             Ok(ProbeResult {
+                content_type: content_type.clone(),
                 final_url,
                 suggested_name,
                 expected_size: Some(0),

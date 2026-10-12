@@ -19,6 +19,10 @@
   --warn: #8a5a00;
   --focus: #5a38e0;
   --shadow: 0 8px 28px rgb(20 24 40 / 18%);
+  /* Checkboxes: an unticked box needs more contrast than a hairline. */
+  --check-border: #a9a6bb;
+  --check-mark: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'%3E%3Cpath d='M2.6 6.3 5 8.6l4.4-5' fill='none' stroke='%23fff' stroke-width='1.9' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  --check-mixed: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'%3E%3Cpath d='M3 6h6' fill='none' stroke='%23fff' stroke-width='1.9' stroke-linecap='round'/%3E%3C/svg%3E");
   font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   font-size: 14px;
   line-height: 1.45;
@@ -43,6 +47,9 @@
     --warn: #f1c35e;
     --focus: #c2b2ff;
     --shadow: 0 8px 28px rgb(0 0 0 / 55%);
+    --check-border: #5f5b78;
+    --check-mark: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'%3E%3Cpath d='M2.6 6.3 5 8.6l4.4-5' fill='none' stroke='%23120c2b' stroke-width='1.9' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+    --check-mixed: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'%3E%3Cpath d='M3 6h6' fill='none' stroke='%23120c2b' stroke-width='1.9' stroke-linecap='round'/%3E%3C/svg%3E");
   }
 }
 
@@ -65,6 +72,9 @@
   --warn: #f1c35e;
   --focus: #c2b2ff;
   --shadow: 0 8px 28px rgb(0 0 0 / 55%);
+  --check-border: #5f5b78;
+  --check-mark: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'%3E%3Cpath d='M2.6 6.3 5 8.6l4.4-5' fill='none' stroke='%23120c2b' stroke-width='1.9' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  --check-mixed: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'%3E%3Cpath d='M3 6h6' fill='none' stroke='%23120c2b' stroke-width='1.9' stroke-linecap='round'/%3E%3C/svg%3E");
 }
 
 :root[data-theme="light"] {
@@ -99,11 +109,60 @@ textarea {
   accent-color: var(--accent);
 }
 
+/* A drawn checkbox, the same on every platform: a rounded box that fills
+   with the accent, a checkmark that matches the theme, and a dash for
+   "some of these" (indeterminate). */
 input[type="checkbox"] {
-  width: 15px;
-  height: 15px;
+  appearance: none;
+  -webkit-appearance: none;
+  width: 18px;
+  height: 18px;
   margin: 0;
   flex: none;
+  vertical-align: -4px;
+  border: 1.5px solid var(--check-border);
+  border-radius: 5px;
+  background: var(--surface) no-repeat center / 12px 12px;
+  cursor: pointer;
+  transition:
+    background-color 120ms ease,
+    border-color 120ms ease,
+    box-shadow 120ms ease;
+}
+
+input[type="checkbox"]:hover:not(:disabled) {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+input[type="checkbox"]:checked,
+input[type="checkbox"]:indeterminate {
+  border-color: var(--accent);
+  background-color: var(--accent);
+}
+
+input[type="checkbox"]:checked {
+  background-image: var(--check-mark);
+}
+
+input[type="checkbox"]:indeterminate {
+  background-image: var(--check-mixed);
+}
+
+input[type="checkbox"]:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+input[type="checkbox"]:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  input[type="checkbox"] {
+    transition: none;
+  }
 }
 
 * {

@@ -20,6 +20,10 @@ pub struct EngineSnapshot {
     /// The links the engine is currently scheduling onto, with their
     /// health and throughput.
     pub links: Vec<LinkStats>,
+    /// Bytes per second of each file that is downloading, measured by the
+    /// engine over the last few seconds on its own clock (Decision 34).
+    /// A file not listed reads 0.
+    pub file_speeds: std::collections::HashMap<crate::model::FileId, f64>,
 }
 
 /// One link's live numbers.
@@ -31,6 +35,6 @@ pub struct LinkStats {
     pub active: u32,
     /// Durable bytes this link has delivered since the engine started.
     pub bytes: u64,
-    /// Smoothed delivery rate, bytes per second.
+    /// Bytes per second over the last few seconds (Decision 34).
     pub speed: f64,
 }

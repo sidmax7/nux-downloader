@@ -60,7 +60,7 @@ const hasProblem = computed(
 );
 
 function fileSpeed(file: FileDto): string {
-  return file.state === "active" ? formatSpeed(engine.fileSpeeds.get(file.id) ?? 0) : "";
+  return file.state === "active" ? formatSpeed(engine.fileSpeedOf(file)) : "";
 }
 
 function fileStatus(file: FileDto): string {

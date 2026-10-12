@@ -15,6 +15,7 @@ export function pkg(over: Partial<PackageDto> = {}): PackageDto {
     limit: null,
     size: 1000,
     downloaded: 250,
+    speed: 0,
     files: [
       {
         id: 10,
@@ -23,6 +24,7 @@ export function pkg(over: Partial<PackageDto> = {}): PackageDto {
         error: null,
         size: 1000,
         downloaded: 250,
+        speed: 0,
         blocks: 4,
       },
     ],
@@ -38,7 +40,9 @@ export function draft(over: Partial<DraftDto> = {}): DraftDto {
   return {
     id: 1,
     name: "file",
-    files: [{ source: "https://x/file.bin", name: "file.bin", size: 2048, error: null }],
+    files: [
+      { source: "https://x/file.bin", name: "file.bin", size: 2048, error: null, found_on: null },
+    ],
     offers_extract: false,
     missing_volumes: [],
     ok_count: 1,

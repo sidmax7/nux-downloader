@@ -244,6 +244,24 @@ impl Engine {
         .await
     }
 
+    /// `collect`, choosing what happens to links that are web pages
+    /// (§13.1): scanned for the files on them, optionally one level deep.
+    pub async fn collect_with(
+        &self,
+        inputs: Vec<String>,
+        options: crate::collect::CollectOptions,
+    ) -> Vec<PackageDraft> {
+        crate::collect::collect_with(
+            inputs,
+            options,
+            &self.config,
+            &self.registry,
+            &self.client,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+    }
+
     /// Queues a reviewed draft. Its files are already probed, so nothing
     /// is probed again.
     pub async fn enqueue(
@@ -569,6 +587,7 @@ impl Engine {
             next_package_id: 0,
             next_file_id: 0,
             links: Vec::new(),
+            file_speeds: std::collections::HashMap::new(),
         })
     }
 

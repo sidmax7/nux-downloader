@@ -1,7 +1,7 @@
 // Thin layer over the generated bindings: a failed command throws an
 // Error carrying the engine's message, instead of a `{ status }` result.
 
-import { commands } from "./bindings";
+import { commands, type CollectOptionsDto } from "./bindings";
 
 type Outcome<T> = { status: "ok"; data: T } | { status: "error"; error: string };
 
@@ -13,7 +13,8 @@ export async function unwrap<T>(call: Promise<Outcome<T>>): Promise<T> {
 
 export const api = {
   snapshot: () => unwrap(commands.engineSnapshot()),
-  collect: (inputs: string[]) => unwrap(commands.collectLinks(inputs)),
+  collect: (inputs: string[], options: CollectOptionsDto) =>
+    unwrap(commands.collectLinks(inputs, options)),
   enqueue: (request: Parameters<typeof commands.enqueueDraft>[0]) =>
     unwrap(commands.enqueueDraft(request)),
   discardDrafts: () => unwrap(commands.discardDrafts()),

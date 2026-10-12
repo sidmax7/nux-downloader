@@ -86,6 +86,62 @@ impl AttemptState {
     }
 }
 
+/// A file whose attempts keep failing with nothing delivered (Decisions
+/// 32 and 33). Forgotten as soon as any attempt delivers a byte.
+#[derive(Debug, Clone, Default)]
+struct Trouble {
+    /// Failed attempts in a row, with nothing delivered.
+    failures: u32,
+    /// The protocol error the latest failures share, and the blocks it
+    /// hit; reset when a different error comes in.
+    protocol_error: Option<String>,
+    blocks: HashSet<u32>,
+}
+
+/// After this many failures in a row with nothing delivered, a file only
+/// gets slots nothing else can use (Decision 33).
+const TROUBLED_AFTER: u32 = 2;
+/// The same protocol error on this many different blocks fails the file
+/// (Decision 32): the server answers the whole file that way.
+const SAME_ERROR_BLOCKS: usize = 3;
+
+/// How far back a displayed speed looks (Decision 34): long enough that
+/// block hand-overs and write batching average out, short enough that a
+/// real change shows within a few seconds.
+const SPEED_WINDOW: Duration = Duration::from_secs(3);
+
+/// A byte counter sampled on ticks, for a displayed speed measured on the
+/// engine's own clock (Decision 34).
+#[derive(Debug, Clone, Default)]
+struct SpeedWindow {
+    samples: VecDeque<(Instant, u64)>,
+}
+
+impl SpeedWindow {
+    fn push(&mut self, now: Instant, total: u64) {
+        self.samples.push_back((now, total));
+        // Keep one sample at or before the window's start as its anchor.
+        while self.samples.len() > 2
+            && self
+                .samples
+                .get(1)
+                .is_some_and(|(at, _)| now.saturating_duration_since(*at) >= SPEED_WINDOW)
+        {
+            self.samples.pop_front();
+        }
+    }
+
+    /// Bytes per second over (up to) the window; 0 until two samples.
+    fn rate(&self) -> f64 {
+        match (self.samples.front(), self.samples.back()) {
+            (Some(&(t0, b0)), Some(&(t1, b1))) if t1 > t0 => {
+                b1.saturating_sub(b0) as f64 / t1.duration_since(t0).as_secs_f64()
+            }
+            _ => 0.0,
+        }
+    }
+}
+
 /// Smoothed delivery rate of one link, sampled on ticks.
 #[derive(Debug, Clone, Copy, Default)]
 struct Meter {
@@ -169,6 +225,14 @@ pub struct EngineState {
     /// holds an open file in the driver. Activation waits while there are
     /// `max_pending_finalizes` of them (§7.3, Decision 30).
     finalizing: HashSet<FileId>,
+    /// Last speed-trace sample per attempt (`trace_speeds`): when, and the
+    /// position then. Only used for the `debug` log.
+    trace: HashMap<AttemptId, (Instant, u64)>,
+    /// Files whose attempts keep failing (Decisions 32, 33).
+    troubled: HashMap<FileId, Trouble>,
+    /// Displayed speeds (Decision 34): per downloading file, and per link.
+    file_speeds: HashMap<FileId, SpeedWindow>,
+    link_speeds: HashMap<LinkId, SpeedWindow>,
     attempts: HashMap<AttemptId, AttemptState>,
     blocks: HashMap<(FileId, u32), BlockRuntime>,
     checkpoints: HashMap<PackageId, CheckpointState>,
@@ -199,6 +263,10 @@ impl EngineState {
             extracting: None,
             reresolved: HashSet::new(),
             finalizing: HashSet::new(),
+            trace: HashMap::new(),
+            troubled: HashMap::new(),
+            file_speeds: HashMap::new(),
+            link_speeds: HashMap::new(),
             attempts: HashMap::new(),
             blocks: HashMap::new(),
             checkpoints: HashMap::new(),
@@ -293,8 +361,16 @@ impl EngineState {
                     )
                     .unwrap_or(u32::MAX),
                     bytes: self.link_bytes(link.id),
-                    speed: self.meters.get(&link.id).map_or(0.0, |m| m.speed),
+                    speed: self
+                        .link_speeds
+                        .get(&link.id)
+                        .map_or(0.0, SpeedWindow::rate),
                 })
+                .collect(),
+            file_speeds: self
+                .file_speeds
+                .iter()
+                .map(|(id, window)| (*id, window.rate()))
                 .collect(),
         }
     }
@@ -1268,7 +1344,7 @@ impl EngineState {
             .min(HOST_BACKOFF_MAX);
         let backoff = asked.map_or(backoff, |asked| backoff.max(asked));
         let until = now + backoff;
-        tracing::debug!(
+        tracing::info!(
             host,
             ?link,
             strikes = state.strikes,
@@ -1390,6 +1466,8 @@ impl EngineState {
         };
         package.files[index].status = FileStatus::Failed(error.clone());
         let file_id = package.files[index].id;
+        tracing::warn!(file = ?file_id, reason = %error, "file failed");
+        self.troubled.remove(&file_id);
         // A failed file's other blocks have nothing left to do.
         let doomed: Vec<AttemptId> = self
             .attempts
@@ -1445,6 +1523,7 @@ impl EngineState {
             package.status = PackageStatus::Downloading;
         }
         self.blocks.retain(|(f, _), _| *f != file_id);
+        self.troubled.remove(&file_id);
         self.reresolved.remove(&file_id);
         self.refreshing.remove(&file_id);
         self.probe_waits.remove(&file_id);
@@ -1525,6 +1604,8 @@ impl EngineState {
             touched.insert(package_id);
         }
         self.update_meters(now);
+        self.sample_speeds(now);
+        self.trace_speeds(now);
         self.refresh_slow_connections(now, effects);
         for package_id in &touched {
             self.maybe_checkpoint(*package_id, now, effects);
@@ -1537,6 +1618,78 @@ impl EngineState {
             .collect();
         for package_id in due {
             self.maybe_checkpoint(package_id, now, effects);
+        }
+    }
+
+    /// Samples every downloading file's and every link's byte count for
+    /// the displayed speeds (Decision 34). A file that stops downloading
+    /// (paused, failed, finished) drops out and reads 0 at once.
+    fn sample_speeds(&mut self, now: Instant) {
+        let mut live: HashSet<FileId> = HashSet::new();
+        for package in &self.packages {
+            if package.status != PackageStatus::Downloading {
+                continue;
+            }
+            for file in &package.files {
+                if file.status != FileStatus::Active {
+                    continue;
+                }
+                let done: u64 = file.parts.iter().map(|part| part.durable).sum();
+                self.file_speeds.entry(file.id).or_default().push(now, done);
+                live.insert(file.id);
+            }
+        }
+        self.file_speeds.retain(|id, _| live.contains(id));
+        for link in &self.links {
+            let bytes = self.link_bytes.get(&link.id).copied().unwrap_or(0);
+            self.link_speeds
+                .entry(link.id)
+                .or_default()
+                .push(now, bytes);
+        }
+    }
+
+    /// With `debug` logging on, one line per connection about every second:
+    /// the speed it ran at since the last line, so a download's speed
+    /// can be followed over time (which connection dipped, and when).
+    fn trace_speeds(&mut self, now: Instant) {
+        if !tracing::enabled!(tracing::Level::DEBUG) {
+            return;
+        }
+        self.trace.retain(|id, _| self.attempts.contains_key(id));
+        let mut traced = false;
+        let mut ids: Vec<AttemptId> = self.attempts.keys().copied().collect();
+        ids.sort();
+        for id in ids {
+            let attempt = &self.attempts[&id];
+            let (since, from) = *self
+                .trace
+                .entry(id)
+                .or_insert((attempt.started_at, attempt.range_start));
+            let secs = now.saturating_duration_since(since).as_secs_f64();
+            if secs < 1.0 {
+                continue;
+            }
+            let speed = attempt.position.saturating_sub(from) as f64 / secs;
+            traced = true;
+            tracing::debug!(
+                block = attempt.block,
+                link = %self.link_name(attempt.link),
+                kb_per_s = (speed / 1024.0).round(),
+                since_start = ?now.saturating_duration_since(attempt.started_at),
+                "speed"
+            );
+            self.trace.insert(id, (now, attempt.position));
+        }
+        // The total is every link's measured speed, not the sum of the
+        // connections traced this tick (most are traced on other ticks).
+        if traced {
+            let total: f64 = self.link_speeds.values().map(SpeedWindow::rate).sum();
+            tracing::debug!(
+                connections = self.attempts.len(),
+                kb_per_s = (total / 1024.0).round(),
+                "speed, all connections"
+            );
         }
     }
 
@@ -1615,6 +1768,14 @@ impl EngineState {
                     .or_default();
                 block.in_flight.retain(|a| *a != id);
                 block.refreshes += 1;
+                tracing::info!(
+                    file = ?attempt.file,
+                    block = attempt.block,
+                    link = %self.link_name(attempt.link),
+                    age = ?now.saturating_duration_since(attempt.started_at),
+                    silent_for = ?now.saturating_duration_since(attempt.last_advance),
+                    "replacing a slow or silent connection"
+                );
                 effects.push(Effect::AbortAttempt {
                     id,
                     reason: AbortReason::Refresh,
@@ -1691,6 +1852,23 @@ impl EngineState {
         checkpoint.last = Some(now);
     }
 
+    /// The host a file is fetched from, for log lines (no path or query:
+    /// those can carry tokens).
+    fn host_of(&self, package_id: PackageId, index: usize) -> String {
+        self.package_ref(package_id)
+            .and_then(|p| p.files[index].url.as_ref())
+            .and_then(|url| url.host_str().map(str::to_string))
+            .unwrap_or_default()
+    }
+
+    /// A link's name, for log lines.
+    fn link_name(&self, link: LinkId) -> String {
+        self.links
+            .iter()
+            .find(|l| l.id == link)
+            .map_or_else(|| format!("{link:?}"), |l| l.name.clone())
+    }
+
     fn handle_attempt_ended(
         &mut self,
         id: AttemptId,
@@ -1737,13 +1915,40 @@ impl EngineState {
             self.host_delivered(package_id, index, attempt.link);
         }
 
+        let took = now.saturating_duration_since(attempt.started_at);
+        if matches!(outcome, AttemptOutcome::Success) {
+            tracing::debug!(
+                block = attempt.block,
+                link = %self.link_name(attempt.link),
+                delivered,
+                ?took,
+                kb_per_s = (delivered as f64 / took.as_secs_f64().max(0.001) / 1024.0).round(),
+                "request finished"
+            );
+        }
+        if let AttemptOutcome::Failed(error) = &outcome {
+            tracing::info!(
+                file = ?attempt.file,
+                ?took,
+                block = attempt.block,
+                host = %self.host_of(package_id, index),
+                link = %self.link_name(attempt.link),
+                delivered,
+                racing,
+                retries = self.blocks.get(&block_key).map_or(0, |b| b.retries),
+                blame = ?blame(error),
+                %error,
+                "attempt failed"
+            );
+        }
+
         let is_success = matches!(outcome, AttemptOutcome::Success);
         let is_open_ended = self
             .package_ref(package_id)
             .and_then(|package| package.files[index].layout)
             .is_some_and(|layout| layout.is_single_open_ended());
 
-        match outcome {
+        match &outcome {
             AttemptOutcome::Success => {
                 if let Some(block) = self.blocks.get_mut(&block_key) {
                     block.retries = 0;
@@ -1758,24 +1963,39 @@ impl EngineState {
                 // retry counted) while the source is resolved again.
             }
             AttemptOutcome::Failed(error) => {
-                if blame(&error) == Blame::Host {
+                if blame(error) == Blame::Host {
                     let retry_after = match &error {
                         crate::error::TransferError::Busy { retry_after, .. } => *retry_after,
                         _ => None,
                     };
                     self.host_refused(package_id, index, attempt.link, retry_after, now, effects);
                 }
-                if blame(&error) == Blame::Link {
+                if blame(error) == Blame::Link {
                     let health = self.health.entry(attempt.link).or_default();
                     if let Some(until) = health.record_failure(now, &self.config) {
                         effects.push(Effect::WakeAt(until));
                     }
                 }
-                let file_wide = matches!(blame(&error), Blame::File | Blame::Fatal);
+                let file_wide = matches!(blame(error), Blame::File | Blame::Fatal);
                 if !racing || file_wide {
-                    self.handle_attempt_failure(package_id, index, block_key, &error, now, effects);
+                    self.handle_attempt_failure(package_id, index, block_key, error, now, effects);
                 }
             }
+        }
+
+        if delivered > 0 || is_success {
+            self.troubled.remove(&attempt.file);
+        } else if let AttemptOutcome::Failed(error) = &outcome
+            && blame(error) == Blame::Attempt
+        {
+            self.note_trouble(
+                package_id,
+                index,
+                attempt.file,
+                attempt.block,
+                error,
+                effects,
+            );
         }
 
         // A bounded file is complete once every block is durable, however
@@ -1841,6 +2061,83 @@ impl EngineState {
         if self.write_checkpoint(package_id, true, effects) {
             self.mark_checkpointed(package_id, now);
         }
+    }
+
+    /// Records a failed attempt that delivered nothing (Decisions 32, 33).
+    /// A protocol error that hits `SAME_ERROR_BLOCKS` different blocks
+    /// fails the file with that error as the reason.
+    fn note_trouble(
+        &mut self,
+        package_id: PackageId,
+        index: usize,
+        file: FileId,
+        block: u32,
+        error: &crate::error::TransferError,
+        effects: &mut Vec<Effect>,
+    ) {
+        use crate::error::TransferError;
+        let protocol = matches!(
+            error,
+            TransferError::WrongRange
+                | TransferError::Overlong
+                | TransferError::MissingContentRange
+                | TransferError::Status(_)
+        );
+        let trouble = self.troubled.entry(file).or_default();
+        trouble.failures += 1;
+        if protocol {
+            let text = error.to_string();
+            if trouble.protocol_error.as_deref() != Some(text.as_str()) {
+                trouble.protocol_error = Some(text);
+                trouble.blocks.clear();
+            }
+            trouble.blocks.insert(block);
+        } else {
+            trouble.protocol_error = None;
+            trouble.blocks.clear();
+        }
+        if trouble.blocks.len() >= SAME_ERROR_BLOCKS
+            && self
+                .package_ref(package_id)
+                .is_some_and(|p| p.files[index].status == FileStatus::Active)
+        {
+            self.fail_file(
+                package_id,
+                index,
+                FileError::Other {
+                    detail: format!("the server answers every request for this file with: {error}"),
+                },
+                effects,
+            );
+        }
+    }
+
+    /// Whether `file` keeps failing (Decision 33).
+    fn is_troubled(&self, file: FileId) -> bool {
+        self.troubled
+            .get(&file)
+            .is_some_and(|t| t.failures >= TROUBLED_AFTER)
+    }
+
+    /// The files a free slot on `link` may take work from (Decision 33):
+    /// files that are downloading fine come first; a file that keeps
+    /// failing only gets a slot none of them can use, and never more than
+    /// one connection.
+    /// The second value is whether the list holds only troubled files: a
+    /// queued file is then started before they get the slot.
+    fn candidates_for_slot(&self, now: Instant, link: LinkId) -> (Vec<sched::FileCandidate>, bool) {
+        let (troubled, healthy): (Vec<_>, Vec<_>) = self
+            .build_candidates(now, link)
+            .into_iter()
+            .partition(|candidate| self.is_troubled(candidate.file));
+        if !healthy.is_empty() || troubled.is_empty() {
+            return (healthy, false);
+        }
+        let troubled: Vec<_> = troubled
+            .into_iter()
+            .filter(|candidate| !self.attempts.values().any(|a| a.file == candidate.file))
+            .collect();
+        (troubled, true)
     }
 
     fn handle_attempt_failure(
@@ -2661,7 +2958,18 @@ impl EngineState {
             return false;
         }
 
-        let candidates = self.build_candidates(now, link.id);
+        let (candidates, only_troubled) = self.candidates_for_slot(now, link.id);
+        // A file that keeps failing must not keep a queued one from
+        // starting (Decision 33): activation goes first.
+        if only_troubled {
+            if self.try_activate_one(now, effects) {
+                return true;
+            }
+            // Nor take the slot a file still being prepared will need.
+            if self.preparing_count() > 0 && self.free_slot_count(now) <= self.preparing_count() {
+                return false;
+            }
+        }
         // §7.2: spread first; then activate a queued file if one could use
         // this slot; only then focus (a lone big file taking every slot).
         // Both picks are made up front so the borrows of `self` end before
@@ -2762,6 +3070,14 @@ impl EngineState {
                 last_advance: now,
                 samples: std::collections::VecDeque::from([(now, range.start)]),
             },
+        );
+        tracing::debug!(
+            ?file,
+            block,
+            link = %link.name,
+            from = range.start,
+            hedge = is_hedge,
+            "request started"
         );
         let runtime = self.blocks.entry((file, block)).or_default();
         runtime.in_flight.push(id);

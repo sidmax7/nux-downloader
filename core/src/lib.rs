@@ -16,6 +16,7 @@ pub mod net;
 pub mod plan;
 pub mod probe;
 pub mod resolve;
+pub mod scan;
 pub mod sched;
 pub mod storage;
 pub mod verify;

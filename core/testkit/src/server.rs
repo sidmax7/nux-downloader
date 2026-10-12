@@ -677,10 +677,10 @@ fn build_content_response(
     bytes_sent: Arc<std::sync::atomic::AtomicU64>,
     guard: ConcurrencyGuard,
 ) -> (StatusCode, Headers, Body) {
-    let effective_range = if matches!(fault, Fault::IgnoreRange) {
-        None
-    } else {
-        range
+    let effective_range = match fault {
+        Fault::IgnoreRange => None,
+        Fault::RangeToEnd => range.map(|r| RequestedRange { end: None, ..r }),
+        _ => range,
     };
 
     let mut headers: Headers = Vec::new();

@@ -6,8 +6,11 @@ import * as __TAURI_EVENT from "@tauri-apps/api/event";
 /** Commands */
 export const commands = {
 	engineSnapshot: () => typedError<SnapshotDto, string>(__TAURI_INVOKE("engine_snapshot")),
-	/**  Resolves and probes the pasted links and returns drafts to review. */
-	collectLinks: (inputs: string[]) => typedError<DraftDto[], string>(__TAURI_INVOKE("collect_links", { inputs })),
+	/**
+	 *  Resolves and probes the pasted links and returns drafts to review;
+	 *  links that are web pages are scanned for files when asked (§13.1).
+	 */
+	collectLinks: (inputs: string[], options: CollectOptionsDto) => typedError<DraftDto[], string>(__TAURI_INVOKE("collect_links", { inputs, options })),
 	/**  Queues a reviewed draft; returns the new package's id. */
 	enqueueDraft: (request: EnqueueRequest) => typedError<number, string>(__TAURI_INVOKE("enqueue_draft", { request })),
 	discardDrafts: () => typedError<null, string>(__TAURI_INVOKE("discard_drafts")),
@@ -82,6 +85,14 @@ export type BlocksDto = {
 	blocks: BlockDto[],
 };
 
+/**  What to do with links that are web pages (§13.1). */
+export type CollectOptionsDto = {
+	/**  Offer the files on the page instead of the page. */
+	scan_pages: boolean,
+	/**  Also look in the same-site pages it links to, one level down. */
+	deep: boolean,
+};
+
 /**  A package waiting for review (`collect` → `enqueue`). */
 export type DraftDto = {
 	/**  Pass back to `enqueue_draft`. */
@@ -99,6 +110,8 @@ export type DraftFileDto = {
 	name: string | null,
 	size: number | null,
 	error: string | null,
+	/**  The web page it was found on, when page scanning found it. */
+	found_on: string | null,
 };
 
 export type EnqueueRequest = {
@@ -109,6 +122,8 @@ export type EnqueueRequest = {
 	priority: PriorityDto,
 	extract: boolean,
 	delete_archives: boolean,
+	/**  The files to add, by `source`; `None` adds them all. */
+	files: string[] | null,
 };
 
 export type FileDto = {
@@ -118,6 +133,11 @@ export type FileDto = {
 	error: string | null,
 	size: number | null,
 	downloaded: number,
+	/**
+	 *  Bytes per second, measured by the engine over the last few seconds
+	 *  (Decision 34); 0 when not downloading.
+	 */
+	speed: number,
 	blocks: number,
 };
 
@@ -182,6 +202,8 @@ export type PackageDto = {
 	/**  `None` while any file's size is still unknown. */
 	size: number | null,
 	downloaded: number,
+	/**  The sum of its files' speeds. */
+	speed: number,
 	files: FileDto[],
 };
 

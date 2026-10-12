@@ -128,7 +128,12 @@ remove the queue and settings too.
 - **Add downloads**: click **Add links**, press `Ctrl+N` (`⌘N` on
   macOS), or just paste a link anywhere in the window. Links are checked
   first, so you see names, sizes and archive groups before anything is
-  queued.
+  queued, and you tick exactly the files you want.
+- **Links to web pages**: paste the address of an album, a gallery or a
+  folder listing and you get the files on it. Tick **Also look in pages
+  they link to** for sites where each file has its own page. Pages that
+  only show their files after running scripts, or that ask for a browser
+  check, can't be read; use direct links there.
 - **Several connections**: open **Links** to see every network
   connection the app found, with its live speed. Untick **Use this link**
   to leave one out, for example a metered phone tether, or give it a

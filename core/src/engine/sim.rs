@@ -84,6 +84,7 @@ pub fn ok_probe(url: &str, size: u64) -> Result<ProbeResult, ProbeError> {
             last_modified: None,
             total_bytes: size,
         },
+        content_type: None,
     })
 }
 
@@ -579,6 +580,41 @@ mod tests {
         let effects = state.handle(Input::FinalizeDone { file: files[0] }, now);
         check_invariants(&state);
         assert!(find_prepare(&effects, files[1]), "{effects:?}");
+    }
+
+    /// Decision 34: the displayed speed is measured on the engine's own
+    /// tick clock, so a steady download reads steady, and a paused one
+    /// reads 0 at once.
+    #[test]
+    fn the_displayed_speed_is_measured_on_the_engine_clock() {
+        let mut state = EngineState::new(EngineConfig::default());
+        let t0 = Instant::now();
+        state.handle(Input::LinksChanged(vec![one_link()]), t0);
+        let url = "http://example.com/f.bin";
+        let (package, file) = add_single_file(&mut state, t0, url);
+        let (attempt, _) = activate_and_start(&mut state, t0, file, url, 4_000_000);
+
+        // 1 MB/s, sampled every 250 ms.
+        for i in 1..=16u64 {
+            let at = t0 + Duration::from_millis(250 * i);
+            state.handle(
+                Input::Tick {
+                    progress: vec![(attempt, i * 250_000)],
+                },
+                at,
+            );
+            if i >= 2 {
+                let snapshot = state.snapshot();
+                let speed = snapshot.file_speeds[&file];
+                assert!((speed - 1_000_000.0).abs() < 1.0, "tick {i}: {speed}");
+                assert!((snapshot.links[0].speed - 1_000_000.0).abs() < 1.0);
+            }
+        }
+
+        let after = t0 + Duration::from_millis(250 * 17);
+        state.handle(Input::Command(Command::Pause(package)), after);
+        state.handle(Input::Tick { progress: vec![] }, after);
+        assert!(!state.snapshot().file_speeds.contains_key(&file));
     }
 
     #[test]

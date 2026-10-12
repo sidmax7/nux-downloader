@@ -11,6 +11,10 @@ pub enum Fault {
     /// Reply `200` with the whole file, as a server without range
     /// support does — even though `Range` was sent.
     IgnoreRange,
+    /// `206` from the requested start to the end of the file, whatever
+    /// end was asked for (`bytes=0-99` gets `bytes 0-<last>/<size>`), as
+    /// some file hosts do.
+    RangeToEnd,
     /// `206` whose `Content-Range` starts one byte later than asked.
     WrongStart,
     /// `206` with a correct header but one byte more body than the

@@ -71,6 +71,9 @@ pub struct FileDto {
     pub error: Option<String>,
     pub size: Option<u64>,
     pub downloaded: u64,
+    /// Bytes per second, measured by the engine over the last few seconds
+    /// (Decision 34); 0 when not downloading.
+    pub speed: u64,
     pub blocks: u32,
 }
 
@@ -92,6 +95,8 @@ pub struct PackageDto {
     /// `None` while any file's size is still unknown.
     pub size: Option<u64>,
     pub downloaded: u64,
+    /// The sum of its files' speeds.
+    pub speed: u64,
     pub files: Vec<FileDto>,
 }
 
@@ -179,6 +184,17 @@ pub struct DraftFileDto {
     pub name: Option<String>,
     pub size: Option<u64>,
     pub error: Option<String>,
+    /// The web page it was found on, when page scanning found it.
+    pub found_on: Option<String>,
+}
+
+/// What to do with links that are web pages (§13.1).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type)]
+pub struct CollectOptionsDto {
+    /// Offer the files on the page instead of the page.
+    pub scan_pages: bool,
+    /// Also look in the same-site pages it links to, one level down.
+    pub deep: bool,
 }
 
 /// A package waiting for review (`collect` → `enqueue`).
@@ -203,6 +219,8 @@ pub struct EnqueueRequest {
     pub priority: PriorityDto,
     pub extract: bool,
     pub delete_archives: bool,
+    /// The files to add, by `source`; `None` adds them all.
+    pub files: Option<Vec<String>>,
 }
 
 /// Sent now and then so the UI can show a toast.
@@ -306,6 +324,7 @@ impl From<&FileEntry> for FileDto {
             error,
             size: file.expected_size,
             downloaded: downloaded(file),
+            speed: 0,
             blocks: file.layout.map_or(0, |layout| layout.count),
         }
     }
@@ -340,9 +359,27 @@ impl From<&Package> for PackageDto {
             limit: package.limit.map(nuxd_core::model::ByteRate::bytes_per_sec),
             size,
             downloaded: files.iter().map(|file| file.downloaded).sum(),
+            speed: 0,
             files,
         }
     }
+}
+
+/// A package with the engine's measured speeds filled in (Decision 34).
+fn package_dto(
+    package: &Package,
+    speeds: &std::collections::HashMap<nuxd_core::model::FileId, f64>,
+) -> PackageDto {
+    let mut dto = PackageDto::from(package);
+    for (file, entry) in dto.files.iter_mut().zip(&package.files) {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let speed = speeds
+            .get(&entry.id)
+            .map_or(0, |s| s.max(0.0).round() as u64);
+        file.speed = speed;
+    }
+    dto.speed = dto.files.iter().map(|file| file.speed).sum();
+    dto
 }
 
 /// The block grid of one file, or `None` when there is no such file.
@@ -382,12 +419,14 @@ impl From<&DraftFile> for DraftFileDto {
                 name: Some(probe.suggested_name.clone()),
                 size: probe.expected_size,
                 error: None,
+                found_on: file.found_on.clone(),
             },
             Err(error) => Self {
                 source: file.source.clone(),
                 name: None,
                 size: None,
                 error: Some(error.clone()),
+                found_on: file.found_on.clone(),
             },
         }
     }
@@ -463,7 +502,11 @@ pub fn snapshot_dto(
     }
     links.sort_by(|a, b| a.name.cmp(&b.name));
     SnapshotDto {
-        packages: snapshot.packages.iter().map(PackageDto::from).collect(),
+        packages: snapshot
+            .packages
+            .iter()
+            .map(|package| package_dto(package, &snapshot.file_speeds))
+            .collect(),
         links,
         global_limit,
         engine_error: None,

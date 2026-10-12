@@ -1,8 +1,7 @@
 import { defineStore } from "pinia";
 import { computed, shallowRef } from "vue";
 import { api } from "../api";
-import { events, type PackageDto, type SnapshotDto } from "../bindings";
-import { emptyTracker, trackSpeeds, type Tracker } from "../speed";
+import { events, type FileDto, type PackageDto, type SnapshotDto } from "../bindings";
 import { useToastStore } from "./toasts";
 
 const EMPTY: SnapshotDto = { packages: [], links: [], global_limit: null, engine_error: null };
@@ -13,30 +12,8 @@ export const useEngineStore = defineStore("engine", () => {
   // Replaced whole on every update (4 Hz): Vue tracks the reference, not
   // every file inside it.
   const snapshot = shallowRef<SnapshotDto>(EMPTY);
-  const packageSpeeds = shallowRef<Map<number, number>>(new Map());
-  const fileSpeeds = shallowRef<Map<number, number>>(new Map());
-  let packageTracker: Tracker = emptyTracker();
-  let fileTracker: Tracker = emptyTracker();
 
-  function apply(next: SnapshotDto, now = Date.now()) {
-    packageTracker = trackSpeeds(
-      packageTracker,
-      next.packages.map((p) => ({
-        id: p.id,
-        bytes: p.downloaded,
-        active: p.state === "downloading",
-      })),
-      now,
-    );
-    fileTracker = trackSpeeds(
-      fileTracker,
-      next.packages.flatMap((p) =>
-        p.files.map((f) => ({ id: f.id, bytes: f.downloaded, active: f.state === "active" })),
-      ),
-      now,
-    );
-    packageSpeeds.value = packageTracker.speeds;
-    fileSpeeds.value = fileTracker.speeds;
+  function apply(next: SnapshotDto) {
     snapshot.value = next;
   }
 
@@ -61,17 +38,20 @@ export const useEngineStore = defineStore("engine", () => {
 
   const packages = computed(() => snapshot.value.packages);
   const links = computed(() => snapshot.value.links);
-  // A link's smoothed speed fades out slowly; with no connection it is 0.
-  const totalSpeed = computed(() =>
-    links.value.reduce((sum, link) => sum + (link.active > 0 ? link.speed : 0), 0),
-  );
+  // Speeds are measured by the engine over the last few seconds on its own
+  // clock (Decision 34); the total is what the downloads are getting.
+  const totalSpeed = computed(() => packages.value.reduce((sum, p) => sum + speedOf(p), 0));
   const hasRunning = computed(() =>
     packages.value.some((p) => p.state === "downloading" || p.state === "queued"),
   );
   const hasPaused = computed(() => packages.value.some((p) => p.state === "paused"));
 
   function speedOf(pkg: PackageDto): number {
-    return packageSpeeds.value.get(pkg.id) ?? 0;
+    return pkg.state === "downloading" ? pkg.speed : 0;
+  }
+
+  function fileSpeedOf(file: FileDto): number {
+    return file.state === "active" ? file.speed : 0;
   }
 
   return {
@@ -81,9 +61,8 @@ export const useEngineStore = defineStore("engine", () => {
     totalSpeed,
     hasRunning,
     hasPaused,
-    packageSpeeds,
-    fileSpeeds,
     speedOf,
+    fileSpeedOf,
     apply,
     start,
     run,

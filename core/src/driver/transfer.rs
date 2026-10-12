@@ -98,24 +98,34 @@ fn range_header(range: ByteRange, expected_size: Option<u64>) -> Option<String> 
     })
 }
 
+/// What `validate` found out about a response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Validated {
+    /// A `206` (rather than a whole-file `200`).
+    partial: bool,
+    /// A `206` that announced more than was asked for: the server answers
+    /// ranges "from here to the end" (Decision 31). Reading stops at the
+    /// requested end, and that is success, not `Overlong`.
+    longer: bool,
+    /// `Some(version)` when only the validators (ETag, `Last-Modified`)
+    /// differ from every accepted version: a hint, settled by
+    /// `confirm_by_sampling` before any byte is written.
+    unconfirmed: Option<FileVersion>,
+}
+
 /// §8 step 2: validates status, `Content-Range` and version before any
-/// byte is written. Returns whether the response is a `206`.
-///
-/// The second value is `Some(version)` when only the validators (ETag,
-/// `Last-Modified`) differ from every accepted version: a hint, settled
-/// by `confirm_by_sampling` before any byte is written. A size change is
-/// proof and fails right here.
-fn validate(
-    response: &Response,
-    spec: &AttemptSpec,
-) -> Result<(bool, Option<FileVersion>), TransferError> {
+/// byte is written. A size change is proof of a changed file and fails
+/// right here.
+fn validate(response: &Response, spec: &AttemptSpec) -> Result<Validated, TransferError> {
     let status = response.status();
     let start = spec.range.start;
+    let mut longer = false;
     let (partial, total) = if status == StatusCode::PARTIAL_CONTENT {
         let served = header(response, CONTENT_RANGE)
             .and_then(parse_content_range)
             .ok_or(TransferError::MissingContentRange)?;
-        if served.start != start || spec.range.end.is_some_and(|end| served.end > end) {
+        longer = spec.range.end.is_some_and(|end| served.end > end);
+        if served.start != start {
             tracing::debug!(
                 requested_start = start,
                 requested_end = ?spec.range.end,
@@ -153,7 +163,11 @@ fn validate(
             VersionCheck::Validators { .. } => needs_confirmation = Some(seen),
         }
     }
-    Ok((partial, needs_confirmation))
+    Ok(Validated {
+        partial,
+        longer,
+        unconfirmed: needs_confirmation,
+    })
 }
 
 /// How many 16 KiB samples settle a validator mismatch (§10).
@@ -182,7 +196,7 @@ async fn confirm_by_sampling(spec: &AttemptSpec) -> Result<(), TransferError> {
                     "sample request timed out".to_string(),
                 ));
             }
-            Ok(Err(error)) => return Err(TransferError::Connect(error.to_string())),
+            Ok(Err(error)) => return Err(TransferError::Connect(error_chain(&error))),
             Ok(Ok(response)) => response,
         };
         let served = header(&response, CONTENT_RANGE).and_then(parse_content_range);
@@ -193,10 +207,25 @@ async fn confirm_by_sampling(spec: &AttemptSpec) -> Result<(), TransferError> {
                 "sample request wasn't answered with the requested range".to_string(),
             ));
         }
-        let fetched = match timeout(spec.stall_timeout, response.bytes()).await {
-            Err(_) | Ok(Err(_)) => return Err(TransferError::Reset),
-            Ok(Ok(bytes)) => bytes,
-        };
+        // Only `region.len` bytes are wanted, even when the server answers
+        // "to the end of the file" (Decision 31).
+        let wanted = usize::try_from(region.len).unwrap_or(0);
+        let mut response = response;
+        let mut fetched = Vec::with_capacity(wanted);
+        while fetched.len() < wanted {
+            match timeout(spec.stall_timeout, response.chunk()).await {
+                Err(_) => return Err(TransferError::Reset),
+                Ok(Err(error)) => {
+                    tracing::info!(cause = %error_chain(&error), "sample request body failed");
+                    return Err(TransferError::Reset);
+                }
+                Ok(Ok(None)) => break,
+                Ok(Ok(Some(chunk))) => {
+                    let room = wanted - fetched.len();
+                    fetched.extend_from_slice(&chunk[..chunk.len().min(room)]);
+                }
+            }
+        }
         let mut local = vec![0u8; usize::try_from(region.len).unwrap_or(0)];
         let file = spec.file.clone();
         let path = spec.path.clone();
@@ -261,6 +290,18 @@ impl Writer<'_> {
     }
 }
 
+/// An error with its whole chain of causes, as one line.
+fn error_chain(error: &dyn std::error::Error) -> String {
+    let mut text = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        text.push_str(": ");
+        text.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    text
+}
+
 async fn transfer(spec: &AttemptSpec) -> Result<(), TransferError> {
     let mut request = spec.client.get(spec.url.clone());
     if let Some(value) = range_header(spec.range, spec.expected_size) {
@@ -272,10 +313,22 @@ async fn transfer(spec: &AttemptSpec) -> Result<(), TransferError> {
                 "timed out waiting for response headers".to_string(),
             ));
         }
-        Ok(Err(error)) => return Err(TransferError::Connect(error.to_string())),
+        Ok(Err(error)) => return Err(TransferError::Connect(error_chain(&error))),
         Ok(Ok(response)) => response,
     };
-    let (partial, unconfirmed) = validate(&response, spec)?;
+    tracing::debug!(
+        status = response.status().as_u16(),
+        content_length = header(&response, CONTENT_LENGTH),
+        content_range = header(&response, CONTENT_RANGE),
+        requested_start = spec.range.start,
+        requested_end = ?spec.range.end,
+        "response headers"
+    );
+    let Validated {
+        partial,
+        longer,
+        unconfirmed,
+    } = validate(&response, spec)?;
     if let Some(version) = unconfirmed {
         confirm_by_sampling(spec).await?;
         if let Ok(mut slot) = spec.confirmed_version.lock() {
@@ -293,8 +346,25 @@ async fn transfer(spec: &AttemptSpec) -> Result<(), TransferError> {
 
     loop {
         let chunk = match timeout(spec.stall_timeout, response.chunk()).await {
-            Err(_) => return writer.fail(TransferError::Stall).await,
-            Ok(Err(_)) => return writer.fail(TransferError::Reset).await,
+            Err(_) => {
+                tracing::info!(
+                    received,
+                    timeout = ?spec.stall_timeout,
+                    "no data within the stall timeout"
+                );
+                return writer.fail(TransferError::Stall).await;
+            }
+            Ok(Err(error)) => {
+                // `Reset` is only a label; the cause (a reset, a TLS error,
+                // a malformed chunk…) is what tells a server cutting us
+                // off from a network problem.
+                tracing::info!(
+                    received,
+                    cause = %error_chain(&error),
+                    "reading the response body failed"
+                );
+                return writer.fail(TransferError::Reset).await;
+            }
             Ok(Ok(None)) => break,
             Ok(Ok(Some(chunk))) => chunk,
         };
@@ -317,11 +387,13 @@ async fn transfer(spec: &AttemptSpec) -> Result<(), TransferError> {
 
         if past_end {
             writer.flush().await?;
-            // A `206` promised exactly this range, so more is a protocol
-            // error (§8 step 5). A `200` is the whole file from byte 0 —
-            // a server that ignored `Range` — and everything this block
-            // needs has arrived, so stopping here is success.
-            return if partial {
+            // A `206` that promised exactly this range sent more: a
+            // protocol error (§8 step 5). A `206` that announced more
+            // (Decision 31), or a `200` (the whole file from byte 0, a
+            // server that ignored `Range`), has now delivered everything
+            // this block needs: stopping here is success, and dropping
+            // the response closes the connection.
+            return if partial && !longer {
                 Err(TransferError::Overlong)
             } else {
                 Ok(())

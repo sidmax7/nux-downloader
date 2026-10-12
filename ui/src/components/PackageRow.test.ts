@@ -104,7 +104,7 @@ describe("PackageRow", () => {
   it("offers a restart for a failed file", async () => {
     const failed = pkg({
       files: [
-        { id: 11, name: "bad.bin", state: "failed", error: "gone", size: 5, downloaded: 0, blocks: 0 },
+        { id: 11, name: "bad.bin", state: "failed", error: "gone", size: 5, downloaded: 0, speed: 0, blocks: 0 },
       ],
     });
     const wrapper = mount(PackageRow, { props: { pkg: failed, index: 0, count: 1 } });
