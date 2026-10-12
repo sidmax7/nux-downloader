@@ -70,10 +70,11 @@ describe("app", () => {
   });
 
   it("renders the header and the empty queue", async () => {
-    const title = await eventually(() => find("css selector", "h1"), "the title");
-    assert.equal(await text(title), "Nux Downloader");
+    assert.equal(await call("GET", `/session/${session}/title`), "Nux Downloader");
+    const heading = await eventually(() => find("css selector", "h1"), "the heading");
+    assert.equal(await text(heading), "Downloads");
     const empty = await eventually(() => find("css selector", ".empty"), "the empty queue");
-    assert.match(await text(empty), /Nothing here yet/);
+    assert.match(await text(empty), /Nothing downloading/);
   });
 
   it("switches between tabs", async () => {

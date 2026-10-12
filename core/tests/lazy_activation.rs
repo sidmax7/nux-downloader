@@ -7,7 +7,9 @@ use nuxd_core::driver::Driver;
 use nuxd_core::engine::sim::one_link;
 use nuxd_core::engine::{Command, EngineEvent};
 use nuxd_core::model::Priority;
-use nuxd_testkit::{Fault, Origin, OriginOptions, content_range};
+use nuxd_testkit::{Origin, OriginOptions, content_range};
+use std::path::Path;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tempfile::tempdir;
 
@@ -20,8 +22,15 @@ async fn twenty_files_through_three_slots_all_complete() {
         ..Default::default()
     })
     .await;
-    // Slow enough that files overlap, so the slot limit matters.
-    origin.set_default_fault(Fault::Throttle(400_000));
+    // Every transfer stops halfway until released (a probe is one byte, so
+    // it isn't held). With nothing finished, the placeholders on disk are
+    // exactly the files activated so far. Counted while files were
+    // finishing, they also included files whose rename was still queued
+    // behind `fsync`s on the durability lane, and how many that is depends
+    // on the disk (8 or 9 on the macOS and Windows CI runners), not on
+    // activation.
+    let halfway = size / 2;
+    origin.hold_every_request_at(halfway);
 
     let dest = tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
     let manifests = tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
@@ -44,23 +53,31 @@ async fn twenty_files_through_three_slots_all_complete() {
         .await
         .unwrap_or_else(|e| panic!("AddPackage: {e}"));
 
-    // While it runs, count how many `.nuxdpart` placeholders exist at
-    // once: activation is bounded by the free slots (3).
-    let mut most_placeholders = 0;
-    let watch = async {
-        loop {
-            let parts = std::fs::read_dir(dest.path())
-                .map(|entries| {
-                    entries
-                        .filter_map(Result::ok)
-                        .filter(|e| e.path().extension().is_some_and(|x| x == "nuxdpart"))
-                        .count()
-                })
-                .unwrap_or(0);
-            most_placeholders = most_placeholders.max(parts);
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+    // The three slots fill with held transfers; then nothing else may be
+    // activated, however long they stay held (well under `hedge_after`).
+    let held = || {
+        origin
+            .requests()
+            .iter()
+            .filter(|r| r.bytes_sent.load(Ordering::Relaxed) == halfway)
+            .count()
     };
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while held() < 3 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("three transfers never started, {} held", held()));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(held(), 3, "only the three slots' transfers should run");
+    assert_eq!(
+        placeholders(dest.path()),
+        3,
+        "activation should track the slots (3)"
+    );
+    origin.release();
+
     let done = async {
         loop {
             match events.recv().await {
@@ -75,12 +92,12 @@ async fn twenty_files_through_three_slots_all_complete() {
             }
         }
     };
-    tokio::select! {
-        () = watch => {}
-        result = tokio::time::timeout(Duration::from_secs(60), done) => {
-            assert!(result.is_ok(), "never finished");
-        }
-    }
+    assert!(
+        tokio::time::timeout(Duration::from_secs(60), done)
+            .await
+            .is_ok(),
+        "never finished"
+    );
 
     let expected = content_range(41, 0, size);
     let files: Vec<_> = std::fs::read_dir(dest.path())
@@ -99,12 +116,18 @@ async fn twenty_files_through_three_slots_all_complete() {
             expected
         );
     }
-    // 3 slots' worth, plus files whose rename is still queued on the
-    // durability lane — nowhere near all 20.
-    assert!(
-        most_placeholders <= 6,
-        "activation should track the slots (3), saw {most_placeholders} placeholders at once"
-    );
     driver.shutdown().await;
     origin.shutdown().await;
+}
+
+/// How many `.nuxdpart` files are in `dir`.
+fn placeholders(dir: &Path) -> usize {
+    std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter(|e| e.path().extension().is_some_and(|x| x == "nuxdpart"))
+                .count()
+        })
+        .unwrap_or(0)
 }

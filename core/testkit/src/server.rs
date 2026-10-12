@@ -17,7 +17,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::TcpListener;
-use tokio::sync::{Notify, oneshot};
+use tokio::sync::{oneshot, watch};
 
 /// What every response otherwise looks like, before any per-request
 /// fault is applied.
@@ -200,6 +200,9 @@ struct SharedState {
     /// Armed by `Origin::hold_request_at`: the `n`th request's body pauses
     /// after this many bytes (1-based, like `set_fault`).
     hold_for_request: HashMap<usize, u64>,
+    /// Armed by `Origin::hold_every_request_at`: every request's body
+    /// pauses after this many bytes, until `release()` disarms it.
+    hold_every_at: Option<u64>,
 }
 
 /// Decrements the source's concurrency counter when the response body is
@@ -231,7 +234,10 @@ pub struct Origin {
     state: Arc<Mutex<SharedState>>,
     shutdown: Option<oneshot::Sender<()>>,
     join: Option<tokio::task::JoinHandle<()>>,
-    hold_notify: Arc<Notify>,
+    /// Counts `release()` calls. A held request waits for it to move past
+    /// the value it saw when it arrived, so a release can't be missed by a
+    /// request that hasn't reached its hold point yet.
+    releases: watch::Sender<u64>,
 }
 
 impl Origin {
@@ -261,14 +267,15 @@ impl Origin {
             peak_concurrent_by_source: HashMap::new(),
             hold_next_at: None,
             hold_for_request: HashMap::new(),
+            hold_every_at: None,
         }));
-        let hold_notify = Arc::new(Notify::new());
+        let (releases, released) = watch::channel(0);
 
         let app = Router::new()
             .fallback(get(handle_request))
             .with_state(AppState {
                 shared: state.clone(),
-                hold_notify: hold_notify.clone(),
+                released,
             });
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -283,7 +290,7 @@ impl Origin {
             state,
             shutdown: Some(shutdown_tx),
             join: Some(join),
-            hold_notify,
+            releases,
         }
     }
 
@@ -416,9 +423,22 @@ impl Origin {
         lock_state(&self.state).hold_for_request.insert(n, offset);
     }
 
-    /// Releases every request currently paused by a hold.
+    /// Holds every request, probes included, after `offset` bytes, until
+    /// `release()`. A probe (`Range: bytes=0-0`) is only one byte long, so
+    /// an `offset` above zero holds only the transfers.
+    pub fn hold_every_request_at(&self, offset: u64) {
+        lock_state(&self.state).hold_every_at = Some(offset);
+    }
+
+    /// Releases every request already armed with a hold, including one
+    /// that is still on its way to the hold point, and disarms
+    /// `hold_every_request_at`.
     pub fn release(&self) {
-        self.hold_notify.notify_waiters();
+        let mut state = lock_state(&self.state);
+        state.hold_every_at = None;
+        // Under the state lock, so a request either took its hold before
+        // this (and is released) or after (and waits for the next one).
+        self.releases.send_modify(|count| *count += 1);
     }
 
     pub async fn shutdown(mut self) {
@@ -495,7 +515,15 @@ async fn serve(listener: FilteringListener, app: Router, shutdown_rx: oneshot::R
 #[derive(Clone)]
 struct AppState {
     shared: Arc<Mutex<SharedState>>,
-    hold_notify: Arc<Notify>,
+    released: watch::Receiver<u64>,
+}
+
+/// Where a request's body pauses, and the release count it must see move
+/// on before it continues.
+struct Hold {
+    at: u64,
+    releases_seen: u64,
+    released: watch::Receiver<u64>,
 }
 
 fn header_str(headers: &HeaderMap, name: header::HeaderName) -> Option<String> {
@@ -513,7 +541,7 @@ async fn handle_request(
         .and_then(parse_range_header);
     let accept_encoding = header_str(request.headers(), header::ACCEPT_ENCODING);
 
-    let (options, fault, n, hold_at, shaper) = {
+    let (options, fault, n, hold, shaper) = {
         let mut state = lock_state(&app.shared);
         state.arrived += 1;
         let n = state.arrived;
@@ -530,10 +558,16 @@ async fn handle_request(
         } else {
             fault
         };
-        let hold_at = match state.hold_for_request.remove(&n) {
-            Some(offset) => Some(offset),
-            None => state.hold_next_at.take(),
-        };
+        let hold = state
+            .hold_for_request
+            .remove(&n)
+            .or_else(|| state.hold_next_at.take())
+            .or(state.hold_every_at)
+            .map(|at| Hold {
+                at,
+                releases_seen: *app.released.borrow(),
+                released: app.released.clone(),
+            });
 
         let count = *state
             .concurrent_by_source
@@ -547,7 +581,7 @@ async fn handle_request(
         *peak = (*peak).max(count);
 
         let shaper = state.shapers.get(&from.ip()).cloned();
-        (state.options.clone(), fault, n, hold_at, shaper)
+        (state.options.clone(), fault, n, hold, shaper)
     };
 
     let bytes_sent = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -566,16 +600,8 @@ async fn handle_request(
         tokio::time::sleep(shaper.latency).await;
     }
 
-    let (status, headers, body) = build_response(
-        &options,
-        range,
-        &fault,
-        hold_at,
-        app.hold_notify.clone(),
-        bytes_sent.clone(),
-        guard,
-    )
-    .await;
+    let (status, headers, body) =
+        build_response(&options, range, &fault, hold, bytes_sent.clone(), guard).await;
 
     {
         let mut state = lock_state(&app.shared);
@@ -612,8 +638,7 @@ async fn build_response(
     options: &OriginOptions,
     range: Option<RequestedRange>,
     fault: &Fault,
-    hold_at: Option<u64>,
-    hold_notify: Arc<Notify>,
+    hold: Option<Hold>,
     bytes_sent: Arc<std::sync::atomic::AtomicU64>,
     guard: ConcurrencyGuard,
 ) -> (StatusCode, Headers, Body) {
@@ -638,15 +663,7 @@ async fn build_response(
                 .unwrap_or_default();
             (StatusCode::FOUND, headers, Body::empty())
         }
-        _ => build_content_response(
-            options,
-            range,
-            fault,
-            hold_at,
-            hold_notify,
-            bytes_sent,
-            guard,
-        ),
+        _ => build_content_response(options, range, fault, hold, bytes_sent, guard),
     }
 }
 
@@ -656,8 +673,7 @@ fn build_content_response(
     options: &OriginOptions,
     range: Option<RequestedRange>,
     fault: &Fault,
-    hold_at: Option<u64>,
-    hold_notify: Arc<Notify>,
+    hold: Option<Hold>,
     bytes_sent: Arc<std::sync::atomic::AtomicU64>,
     guard: ConcurrencyGuard,
 ) -> (StatusCode, Headers, Body) {
@@ -755,7 +771,7 @@ fn build_content_response(
         let shaper = guard.shaper.clone();
         let _guard = guard;
         let mut sent = 0u64;
-        let hold_point = hold_at;
+        let hold_point = hold.as_ref().map(|hold| hold.at);
 
         // Caps a chunk so it never crosses the hold offset — otherwise a
         // pause armed for byte 100 could sit inside one big 64 KiB chunk
@@ -771,8 +787,11 @@ fn build_content_response(
         }
         macro_rules! maybe_hold {
             () => {
-                if hold_point == Some(sent) {
-                    hold_notify.notified().await;
+                if hold_point == Some(sent)
+                    && let Some(Hold { releases_seen, released, .. }) = &hold
+                {
+                    let mut released = released.clone();
+                    let _ = released.wait_for(|count| *count != *releases_seen).await;
                 }
             };
         }
