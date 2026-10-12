@@ -144,6 +144,9 @@ async fn a_package_limit_holds_back_only_that_package() {
         ..Default::default()
     })
     .await;
+    // Nothing of the slow package's first transfer (request 2; 1 is the
+    // probe) gets through before the pause, so all of it runs limited.
+    slow_origin.hold_request_at(2, 0);
     let data = tempdir().unwrap();
     let dest = tempdir().unwrap();
     let engine = engine(data.path(), EngineConfig::default()).await;
@@ -223,6 +226,10 @@ async fn a_package_limit_survives_a_restart() {
     .await;
     let data = tempdir().unwrap();
     let dest = tempdir().unwrap();
+    // The first transfer (request 2; 1 is the probe) sends nothing until
+    // the pause lands, so the whole file is left for the limited run. On
+    // a fast machine it could otherwise finish between `add` and `pause`.
+    origin.hold_request_at(2, 0);
     {
         let engine = engine(data.path(), EngineConfig::default()).await;
         // Pause first so nothing downloads before we shut down.

@@ -230,8 +230,11 @@ async fn without_the_extract_option_the_archive_is_left_alone() {
 #[tokio::test]
 async fn the_options_can_be_switched_on_while_downloading() {
     let origin = serve("one.zip", make_zip(&payload())).await;
-    // Hold the transfer so there is time to change our mind.
-    origin.hold_next_request_at(10);
+    // Hold the transfer so there is time to change our mind. Request 1 is
+    // `collect`'s probe; the transfer is request 2. (Holding "the next
+    // request" caught the probe, and a fast machine finished the file
+    // before the options changed.)
+    origin.hold_request_at(2, 10);
     let data = tempdir().unwrap();
     let dest = tempdir().unwrap();
     let engine = engine(data.path()).await;

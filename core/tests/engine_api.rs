@@ -20,15 +20,20 @@ fn opts(name: &str, dest_dir: std::path::PathBuf) -> AddOptions {
 }
 
 async fn wait_for_done(engine: &Engine, timeout: Duration) -> bool {
-    let mut events = engine.subscribe();
+    // Polls the snapshot rather than waiting for a `PackageDone` event: a
+    // small file can finish before a subscription made after `add` exists,
+    // and that event would never be seen.
     tokio::time::timeout(timeout, async {
         loop {
-            match events.recv().await {
-                Ok(nuxd_core::engine::EngineEvent::PackageDone { .. }) => return true,
-                Ok(nuxd_core::engine::EngineEvent::PackageFailed { .. }) => return false,
-                Ok(_) => {}
-                Err(_) => return false,
+            let snapshot = engine.snapshot().await;
+            if let Some(package) = snapshot.packages.first() {
+                match package.status {
+                    nuxd_core::model::PackageStatus::Done => return true,
+                    nuxd_core::model::PackageStatus::Failed(_) => return false,
+                    _ => {}
+                }
             }
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
