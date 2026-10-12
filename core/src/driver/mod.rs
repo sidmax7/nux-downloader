@@ -130,6 +130,7 @@ enum WorkerRequest {
 /// same engine; `Engine` (P2.8) wraps this in a friendlier API.
 #[derive(Clone)]
 pub struct Driver {
+    limits: Arc<crate::limit::Limits>,
     input_tx: mpsc::Sender<Input>,
     request_tx: mpsc::Sender<WorkerRequest>,
     events_tx: broadcast::Sender<EngineEvent>,
@@ -187,8 +188,10 @@ impl Driver {
             LinkSetup::Fixed { bind, .. } => *bind,
             LinkSetup::Monitored(MonitorSetup { bind, .. }) => *bind,
         };
+        let limits = crate::limit::Limits::new(state.config().global_limit);
         let worker = Worker::new(
             state,
+            limits.clone(),
             manifest_dir,
             bind,
             input_tx.clone(),
@@ -197,10 +200,18 @@ impl Driver {
         tokio::spawn(worker.run(input_rx, request_rx, links, initial_effects));
 
         Self {
+            limits,
             input_tx,
             request_tx,
             events_tx,
         }
+    }
+
+    /// The speed limiters (§11), shared with the running engine: changing
+    /// one applies to transfers already in flight.
+    #[must_use]
+    pub fn limits(&self) -> &Arc<crate::limit::Limits> {
+        &self.limits
     }
 
     /// Sends a command into the engine. Errors only if the driver task
@@ -238,6 +249,7 @@ impl Driver {
             input_tx,
             events_tx,
             request_tx: _,
+            limits: _,
         } = self;
         let mut events = events_tx.subscribe();
         // Drop our own sender clone before waiting: the broadcast channel
@@ -262,6 +274,7 @@ impl Driver {
 /// to reach the network.
 struct Worker {
     state: EngineState,
+    limits: Arc<crate::limit::Limits>,
     default_client: Client,
     lane: mpsc::UnboundedSender<LaneJob>,
     lane_task: Option<tokio::task::JoinHandle<()>>,
@@ -280,6 +293,7 @@ struct Worker {
 impl Worker {
     fn new(
         state: EngineState,
+        limits: Arc<crate::limit::Limits>,
         manifest_dir: PathBuf,
         bind: BindPolicy,
         input_tx: mpsc::Sender<Input>,
@@ -297,6 +311,7 @@ impl Worker {
         ));
         Self {
             state,
+            limits,
             default_client,
             lane,
             lane_task: Some(lane_task),
@@ -349,6 +364,7 @@ impl Worker {
                 }
             };
             clients.insert(link.id, held);
+            self.limits.ensure_link(link.id, link.limit);
             usable.push(link);
         }
         self.link_clients = clients;
@@ -387,6 +403,10 @@ impl Worker {
             }
         };
         let links = self.sync_clients(links);
+        // Limits that outlive a restart: each package's own.
+        for package in self.state.packages() {
+            self.limits.set_package(package.id, package.limit);
+        }
         let now = Instant::now();
         let links_effects = self.state.handle(Input::LinksChanged(links), now);
         self.drain(
@@ -576,6 +596,9 @@ impl Worker {
                 files,
             } => self.spawn_verify(package, dest_dir, files),
             Effect::Extract { package, spec } => self.spawn_extract(package, spec),
+            Effect::SetPackageLimit { package, limit } => {
+                self.limits.set_package(package, limit);
+            }
             Effect::CancelPost { package } => {
                 if let Some(flag) = self.post_cancel.remove(&package) {
                     flag.store(true, Ordering::Relaxed);
@@ -765,6 +788,7 @@ impl Worker {
             warn!("driver: StartAttempt for {file:?} with no prepared file — dropping");
             return;
         };
+        let package = open.package;
         let client = self
             .link_clients
             .get(&link)
@@ -802,6 +826,7 @@ impl Worker {
             confirmed_version: confirmed_version.clone(),
             stall_timeout: config.stall_timeout,
             buffer_bytes: config.write_buffer_bytes,
+            throttle: self.limits.throttle_for(package, link),
             position,
             cancel,
         };

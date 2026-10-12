@@ -180,3 +180,44 @@ async fn bad_arguments_are_usage_errors() {
         assert!(!err.is_empty(), "{args:?} should explain why");
     }
 }
+
+#[tokio::test]
+async fn limit_command_sets_and_clears_a_package_limit_and_flags_are_validated() {
+    let origin = Origin::start(OriginOptions::default()).await;
+    let data_dir = tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
+    let mut add = nuxd(data_dir.path());
+    add.arg("add").arg(origin.url());
+    assert!(run(add).await.0);
+
+    let mut limit = nuxd(data_dir.path());
+    limit.args(["limit", "1", "2M"]);
+    let (ok, out, err) = run(limit).await;
+    assert!(ok, "{err}");
+    assert!(out.contains("2097152"), "{out}");
+
+    let manifest = std::fs::read_dir(data_dir.path().join("packages"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|e| e.path().extension().and_then(|x| x.to_str()) == Some("json"))
+        .unwrap();
+    let text = std::fs::read_to_string(manifest.path()).unwrap();
+    assert!(text.contains("2097152"), "limit not saved: {text}");
+
+    let mut clear = nuxd(data_dir.path());
+    clear.args(["limit", "1", "none"]);
+    assert!(run(clear).await.0);
+
+    let mut missing = nuxd(data_dir.path());
+    missing.args(["limit", "9", "1M"]);
+    assert!(!run(missing).await.0);
+
+    let mut bad = nuxd(data_dir.path());
+    bad.args(["limit", "1", "fast"]);
+    assert!(!run(bad).await.0);
+
+    let mut bad_flag = nuxd(data_dir.path());
+    bad_flag.args(["--limit", "zzz", "resume"]);
+    let (ok, _, err) = run(bad_flag).await;
+    assert!(!ok);
+    assert!(err.contains("--limit"), "{err}");
+}

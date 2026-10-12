@@ -80,6 +80,10 @@ pub enum EngineEvent {
     PackageDone {
         package: PackageId,
     },
+    /// A package's speed limit changed (`Command::SetPackageLimit`).
+    PackageLimitChanged {
+        package: PackageId,
+    },
     /// Every file arrived; the package is being verified (§12.3).
     PackageVerifying {
         package: PackageId,
@@ -180,6 +184,11 @@ pub enum Effect {
     Extract {
         package: PackageId,
         spec: crate::extract::ExtractSpec,
+    },
+    /// Apply a package's speed limit to its running and future transfers.
+    SetPackageLimit {
+        package: PackageId,
+        limit: Option<crate::model::ByteRate>,
     },
     /// Stop verification or extraction of a package that was cancelled
     /// or removed.

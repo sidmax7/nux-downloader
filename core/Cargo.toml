@@ -58,5 +58,6 @@ windows-sys = { version = "0.59", features = [
 proptest = "1"
 tempfile = "3"
 nuxd-testkit = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 # Tests build 7z fixtures, so they need the encoder.
 sevenz-rust2 = { version = "0.24", default-features = false, features = ["compress"] }

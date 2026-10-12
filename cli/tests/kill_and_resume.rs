@@ -36,6 +36,9 @@ async fn kill_nine_mid_download_then_resume_is_byte_exact() {
     // keeps the child process alive long enough to `kill -9` mid-body —
     // a real network would do this on its own, localhost needs help.
     origin.set_fault(2, Fault::Crawl(60_000));
+    // Hedging (after 1 s) races a slow block with request #3; it crawls
+    // too, or it would finish the file before the kill.
+    origin.set_fault(3, Fault::Crawl(60_000));
 
     let data_dir = tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
     let dest_dir = tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));

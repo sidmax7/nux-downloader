@@ -3,12 +3,13 @@
 //! "best of both worlds" assignment policy for one file or one thousand:
 //! a single active file falls through to pass 2 and gets every slot;
 //! many small single-block files each take one slot; a mix gets both at
-//! once. Hedging (pass 3, §7.5) is a later phase (P7.1); this only
-//! implements passes 1 and 2 plus the avoid rule.
+//! once. Pass 3 (`pick_hedge`, §7.5) races a slow in-flight block once
+//! nothing else is left to do.
 
 use crate::config::{EngineConfig, HostPolicy};
 use crate::model::{ByteRange, FileId, LinkId, Priority};
 use std::collections::HashSet;
+use std::time::Duration;
 
 /// One block still worth an attempt: not currently held by any in-flight
 /// attempt (the caller filters those out before building a `View` — a
@@ -88,8 +89,7 @@ pub struct SchedulerView<'a> {
     pub config: &'a EngineConfig,
 }
 
-/// What a free slot should do. Only `Primary` exists until hedging lands
-/// (P7.1 adds a `Hedge` variant).
+/// What a free slot should do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Work {
     Primary {
@@ -104,6 +104,77 @@ pub enum Work {
         /// this mirrors `Effect::StartAttempt`'s shape (§14.1) exactly.
         file_offset: u64,
     },
+    /// A second attempt at a block another attempt already holds (§7.5):
+    /// it starts at the block's durable frontier and writes the same
+    /// bytes to the same offsets; whichever finishes first wins.
+    Hedge {
+        file: FileId,
+        block: u32,
+        range: ByteRange,
+        file_offset: u64,
+    },
+}
+
+/// An in-flight block that pass 3 might race (§7.5). Built by the engine,
+/// which knows the holder's timing; only blocks with exactly one attempt
+/// running are offered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HedgeCandidate {
+    pub file: FileId,
+    pub block: u32,
+    pub host: String,
+    /// From the block's durable frontier to its end.
+    pub range: ByteRange,
+    /// The link the holder runs on.
+    pub holder_link: LinkId,
+    /// How long the holder has been running.
+    pub holder_age: Duration,
+    /// The holder's estimated time to finish; `None` if it has delivered
+    /// nothing yet (no estimate — as slow as it gets).
+    pub eta: Option<Duration>,
+    /// Hedges this block has already had.
+    pub hedges: u32,
+}
+
+/// Pass 3 (§7.5): for a free slot on `link` when no pending work exists
+/// anywhere, the slowest in-flight block worth racing — one whose holder
+/// has run for at least `hedge_after`, still needs at least that long,
+/// and has had fewer than `max_hedges_per_block` hedges. A block held on
+/// another link is preferred, so the race isn't decided by the same
+/// path. Host connection limits still apply.
+#[must_use]
+pub fn pick_hedge(
+    candidates: &[HedgeCandidate],
+    active: &[ActiveAttempt<'_>],
+    hosts: &HostPolicy,
+    config: &EngineConfig,
+    link: LinkId,
+) -> Option<Work> {
+    let worth = |c: &&HedgeCandidate| {
+        c.holder_age >= config.hedge_after
+            && c.eta.is_none_or(|eta| eta >= config.hedge_after)
+            && c.hedges < config.max_hedges_per_block
+            && c.range.end.is_some()
+            && active_count(active, |a| a.host == c.host && a.link == link)
+                < hosts.limits_for(&c.host).max_connections_per_link
+    };
+    let best = candidates.iter().filter(worth).min_by(|a, b| {
+        // Another link first, then the slowest (no estimate = slowest).
+        (a.holder_link == link)
+            .cmp(&(b.holder_link == link))
+            .then_with(|| match (a.eta, b.eta) {
+                (None, None) => std::cmp::Ordering::Equal,
+                (None, Some(_)) => std::cmp::Ordering::Less,
+                (Some(_), None) => std::cmp::Ordering::Greater,
+                (Some(x), Some(y)) => y.cmp(&x),
+            })
+    })?;
+    Some(Work::Hedge {
+        file: best.file,
+        block: best.block,
+        range: best.range,
+        file_offset: best.range.start,
+    })
 }
 
 fn active_count(
@@ -630,5 +701,100 @@ mod tests {
             avoid_links: Vec::new(),
         };
         assert_eq!(b.remaining_range(), Some(ByteRange::open_ended(4096)));
+    }
+
+    // --- pass 3: hedging (§7.5) ---
+
+    fn hedge_candidate(file: u64, holder: u64, age: u64, eta: Option<u64>) -> HedgeCandidate {
+        HedgeCandidate {
+            file: FileId::new(file),
+            block: 0,
+            host: "h".to_string(),
+            range: ByteRange::bounded(100, 999).unwrap(),
+            holder_link: LinkId::new(holder),
+            holder_age: Duration::from_secs(age),
+            eta: eta.map(Duration::from_secs),
+            hedges: 0,
+        }
+    }
+
+    fn hedge(candidates: &[HedgeCandidate], link: u64) -> Option<FileId> {
+        let config = EngineConfig::default();
+        match pick_hedge(candidates, &[], &config.hosts, &config, LinkId::new(link)) {
+            Some(Work::Hedge {
+                file,
+                range,
+                file_offset,
+                ..
+            }) => {
+                assert_eq!(file_offset, range.start);
+                Some(file)
+            }
+            Some(other) => panic!("not a hedge: {other:?}"),
+            None => None,
+        }
+    }
+
+    #[test]
+    fn a_young_or_nearly_done_holder_is_not_raced() {
+        // Defaults: hedge_after is 1 s.
+        assert_eq!(hedge(&[hedge_candidate(1, 1, 0, None)], 2), None);
+        assert_eq!(hedge(&[hedge_candidate(1, 1, 9, Some(0))], 2), None);
+        assert_eq!(
+            hedge(&[hedge_candidate(1, 1, 9, Some(20))], 2),
+            Some(FileId::new(1))
+        );
+        // No bytes yet after `hedge_after`: no estimate, worth racing.
+        assert_eq!(
+            hedge(&[hedge_candidate(1, 1, 1, None)], 2),
+            Some(FileId::new(1))
+        );
+    }
+
+    #[test]
+    fn the_hedge_budget_is_respected() {
+        let mut c = hedge_candidate(1, 1, 30, None);
+        c.hedges = 2;
+        assert_eq!(hedge(&[c], 2), None);
+    }
+
+    #[test]
+    fn the_slowest_block_is_raced_first_and_another_link_is_preferred() {
+        let fastish = hedge_candidate(1, 1, 30, Some(10));
+        let slow = hedge_candidate(2, 1, 30, Some(100));
+        let stuck = hedge_candidate(3, 1, 30, None);
+        assert_eq!(
+            hedge(&[fastish.clone(), slow.clone(), stuck.clone()], 2),
+            Some(FileId::new(3))
+        );
+        assert_eq!(
+            hedge(&[fastish.clone(), slow.clone()], 2),
+            Some(FileId::new(2))
+        );
+        // On the holder's own link, a block held elsewhere wins even if faster.
+        let elsewhere = hedge_candidate(4, 2, 30, Some(10));
+        assert_eq!(hedge(&[slow, elsewhere], 1), Some(FileId::new(4)));
+        // But the holder's own link is used when nothing else is offered.
+        assert_eq!(hedge(&[fastish], 1), Some(FileId::new(1)));
+    }
+
+    #[test]
+    fn host_limits_still_hold_for_a_hedge() {
+        let mut config = EngineConfig::default();
+        config.hosts.add_rule(
+            "h",
+            HostLimits {
+                max_connections_per_link: 1,
+                max_active_files: None,
+            },
+        );
+        let active = [ActiveAttempt {
+            file: FileId::new(9),
+            link: LinkId::new(2),
+            host: "h",
+        }];
+        let c = [hedge_candidate(1, 1, 30, None)];
+        assert!(pick_hedge(&c, &active, &config.hosts, &config, LinkId::new(2)).is_none());
+        assert!(pick_hedge(&c, &active, &config.hosts, &config, LinkId::new(3)).is_some());
     }
 }

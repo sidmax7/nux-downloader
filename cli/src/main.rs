@@ -49,6 +49,14 @@ struct Cli {
         value_name = "PATTERN=CONNS[:FILES]"
     )]
     host_limits: Vec<String>,
+    /// Overall speed limit, e.g. `5M` (bytes/s; K, M, G are binary).
+    /// Applies to commands that download.
+    #[arg(long, global = true, value_name = "RATE")]
+    limit: Option<String>,
+    /// Limit one network link: `NAME=RATE` (names from `nuxd links`),
+    /// e.g. a metered tether: `wlan0=1M`. Repeatable.
+    #[arg(long = "link-limit", global = true, value_name = "NAME=RATE")]
+    link_limits: Vec<String>,
 }
 
 /// Priority levels as typed on the command line.
@@ -75,6 +83,8 @@ struct StartOpts {
     write_buffer_bytes: Option<usize>,
     unbound: bool,
     host_limits: Vec<String>,
+    limit: Option<String>,
+    link_limits: Vec<String>,
     /// Restrict to these interface names (`get --links`).
     only_links: Option<Vec<String>>,
 }
@@ -149,6 +159,9 @@ enum Command {
         #[arg(short, long)]
         verbose: bool,
     },
+    /// Limits one package's speed (`nuxd limit 3 2M`), or removes its
+    /// limit (`nuxd limit 3 none`). Saved with the package.
+    Limit { id: u64, rate: String },
     /// Pauses a package (its id from `nuxd queue`) or `all`.
     Pause { target: String },
     /// Downloads the queue: resumes the given packages (or every paused or
@@ -188,6 +201,8 @@ async fn main() -> ExitCode {
         write_buffer_bytes: cli.write_buffer_bytes,
         unbound: cli.unbound,
         host_limits: cli.host_limits,
+        limit: cli.limit,
+        link_limits: cli.link_limits,
         only_links: None,
     };
     let mut opts = opts;
@@ -221,6 +236,10 @@ async fn main() -> ExitCode {
             )
             .await
         }
+        Command::Limit { id, rate } => match nuxd_core::model::ByteRate::parse(&rate) {
+            Ok(rate) => manage::limit(PackageId::new(id), rate, opts.data_dir).await,
+            Err(error) => usage(&error),
+        },
         Command::Options {
             id,
             extract,
@@ -262,6 +281,30 @@ async fn start_engine(opts: StartOpts) -> Option<Engine> {
     if let Some(write_buffer_bytes) = opts.write_buffer_bytes {
         config.write_buffer_bytes = write_buffer_bytes;
     }
+    match opts.limit.as_deref().map(nuxd_core::model::ByteRate::parse) {
+        Some(Ok(rate)) => config.global_limit = rate,
+        Some(Err(error)) => {
+            eprintln!("nuxd: --limit: {error}");
+            return None;
+        }
+        None => {}
+    }
+    let mut link_limits = Vec::new();
+    for text in &opts.link_limits {
+        let parsed = text
+            .split_once('=')
+            .ok_or_else(|| format!("`{text}` should look like NAME=RATE"))
+            .and_then(|(name, rate)| {
+                nuxd_core::model::ByteRate::parse(rate).map(|rate| (name.to_string(), rate))
+            });
+        match parsed {
+            Ok(entry) => link_limits.push(entry),
+            Err(error) => {
+                eprintln!("nuxd: --link-limit: {error}");
+                return None;
+            }
+        }
+    }
     for rule in &opts.host_limits {
         if let Err(error) = config.hosts.add_rule_text(rule) {
             eprintln!("nuxd: --host-limit: {error}");
@@ -277,11 +320,45 @@ async fn start_engine(opts: StartOpts) -> Option<Engine> {
         Engine::start_with(config, opts.data_dir, links).await
     };
     match started {
-        Ok(engine) => Some(engine),
+        Ok(engine) => {
+            apply_link_limits(&engine, link_limits).await;
+            Some(engine)
+        }
         Err(error) => {
             eprintln!("nuxd: couldn't start the engine: {error}");
             None
         }
+    }
+}
+
+/// Applies `--link-limit`s by link name. The first scan runs inside the
+/// engine, so give it a moment to report its links.
+async fn apply_link_limits(
+    engine: &Engine,
+    wanted: Vec<(String, Option<nuxd_core::model::ByteRate>)>,
+) {
+    if wanted.is_empty() {
+        return;
+    }
+    let mut pending = wanted;
+    for _ in 0..40 {
+        let snapshot = engine.snapshot().await;
+        pending.retain(|(name, rate)| {
+            match snapshot.links.iter().find(|stats| &stats.link.name == name) {
+                Some(stats) => {
+                    engine.set_link_limit(stats.link.id, *rate);
+                    false
+                }
+                None => true,
+            }
+        });
+        if pending.is_empty() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    for (name, _) in pending {
+        eprintln!("nuxd: --link-limit: no link named `{name}` (see `nuxd links`)");
     }
 }
 

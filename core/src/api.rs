@@ -334,6 +334,40 @@ impl Engine {
 
     /// Changes a package's "extract after download" and "delete archives
     /// after extraction" options.
+    /// Sets or clears the overall speed limit; running transfers adapt
+    /// at once.
+    pub fn set_global_limit(&self, rate: Option<crate::model::ByteRate>) {
+        self.driver.limits().set_global(rate);
+    }
+
+    #[must_use]
+    pub fn global_limit(&self) -> Option<crate::model::ByteRate> {
+        self.driver.limits().global()
+    }
+
+    /// Sets or clears one link's speed limit (a metered tether, say).
+    pub fn set_link_limit(&self, link: LinkId, rate: Option<crate::model::ByteRate>) {
+        self.driver.limits().set_link(link, rate);
+    }
+
+    #[must_use]
+    pub fn link_limit(&self, link: LinkId) -> Option<crate::model::ByteRate> {
+        self.driver.limits().link(link)
+    }
+
+    /// Sets or clears one package's speed limit. Unlike the global and
+    /// link limits it is saved with the package.
+    pub async fn set_package_limit(
+        &self,
+        package: PackageId,
+        limit: Option<crate::model::ByteRate>,
+    ) -> Result<(), EngineError> {
+        self.driver
+            .command(Command::SetPackageLimit { package, limit })
+            .await
+            .map_err(|_| shutdown_error())
+    }
+
     pub async fn set_post_options(
         &self,
         package: PackageId,

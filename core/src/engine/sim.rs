@@ -1050,7 +1050,12 @@ mod tests {
     /// Returns how many blocks each link completed.
     fn simulate_three_links(speeds: [u64; 3]) -> [u32; 3] {
         let size = 64 * 1024 * 1024;
-        let mut state = EngineState::new(EngineConfig::default());
+        // This models plain delivery; tail handling has its own tests.
+        let mut state = EngineState::new(EngineConfig {
+            max_hedges_per_block: 0,
+            max_refreshes_per_block: 0,
+            ..EngineConfig::default()
+        });
         let base = Instant::now();
         let links: Vec<Link> = (1..=3u64)
             .map(|id| link(id, &format!("l{id}"), 2))
@@ -3170,5 +3175,581 @@ mod tests {
             state.package(package).unwrap().status,
             PackageStatus::Downloading
         );
+    }
+
+    #[test]
+    fn a_package_limit_is_applied_checkpointed_and_announced_once() {
+        let mut state = EngineState::new(EngineConfig::default());
+        let now = Instant::now();
+        state.handle(Input::LinksChanged(vec![one_link()]), now);
+        let (package, _) = add_single_file(&mut state, now, "http://example.com/f.bin");
+        let limit = crate::model::ByteRate::new(2048);
+        let effects = state.handle(
+            Input::Command(Command::SetPackageLimit { package, limit }),
+            now,
+        );
+        assert!(effects.contains(&Effect::SetPackageLimit { package, limit }));
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::Checkpoint { .. }))
+        );
+        assert!(effects.contains(&Effect::Emit(EngineEvent::PackageLimitChanged { package })));
+        assert_eq!(state.package(package).unwrap().limit, limit);
+
+        // Setting the same limit again is a no-op.
+        let effects = state.handle(
+            Input::Command(Command::SetPackageLimit { package, limit }),
+            now,
+        );
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::SetPackageLimit { .. }))
+        );
+
+        let effects = state.handle(
+            Input::Command(Command::SetPackageLimit {
+                package,
+                limit: None,
+            }),
+            now,
+        );
+        assert!(effects.contains(&Effect::SetPackageLimit {
+            package,
+            limit: None
+        }));
+    }
+
+    // --- hedging (P7.1, §7.5) ---
+
+    fn two_links() -> Vec<crate::model::Link> {
+        let mut second = one_link();
+        second.id = LinkId::new(2);
+        second.name = "sim1".to_string();
+        vec![one_link(), second]
+    }
+
+    fn starts_for(
+        effects: &[Effect],
+        file: crate::model::FileId,
+    ) -> Vec<(crate::model::AttemptId, crate::model::ByteRange, LinkId)> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::StartAttempt {
+                    id,
+                    file: f,
+                    range,
+                    link,
+                    ..
+                } if *f == file => Some((*id, *range, *link)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn lost(effects: &[Effect], attempt: crate::model::AttemptId) -> bool {
+        effects.contains(&Effect::AbortAttempt {
+            id: attempt,
+            reason: AbortReason::Lost,
+        })
+    }
+
+    /// One crawling 1000-byte single-block file on link 1, ticked to
+    /// `secs` with `progress` bytes delivered. Returns the state, the
+    /// file, the holder and the tick's effects.
+    fn crawling(
+        links: Vec<crate::model::Link>,
+        secs: u64,
+        progress: u64,
+    ) -> (
+        EngineState,
+        crate::model::PackageId,
+        crate::model::FileId,
+        crate::model::AttemptId,
+        Instant,
+        Vec<Effect>,
+    ) {
+        let mut state = EngineState::new(EngineConfig::default());
+        let now = Instant::now();
+        state.handle(Input::LinksChanged(links), now);
+        let (package, file) = add_single_file(&mut state, now, "http://example.com/f.bin");
+        let (holder, _) =
+            activate_and_start(&mut state, now, file, "http://example.com/f.bin", 1000);
+        let later = now + Duration::from_secs(secs);
+        let effects = state.handle(
+            Input::Tick {
+                progress: vec![(holder, progress)],
+            },
+            later,
+        );
+        check_invariants(&state);
+        (state, package, file, holder, later, effects)
+    }
+
+    #[test]
+    fn a_crawling_block_is_finished_by_a_hedge() {
+        let (mut state, package, file, holder, later, effects) = crawling(two_links(), 9, 10);
+        let hedges = starts_for(&effects, file);
+        assert_eq!(hedges.len(), 1, "{effects:?}");
+        let (hedge, range, link) = hedges[0];
+        // From the durable frontier, on the other link.
+        assert_eq!(range.start, 10);
+        assert_eq!(range.end, Some(999));
+        assert_eq!(link, LinkId::new(2));
+
+        let effects = state.handle(
+            Input::AttemptEnded {
+                id: hedge,
+                outcome: AttemptOutcome::Success,
+                position: 1000,
+            },
+            later + Duration::from_secs(1),
+        );
+        check_invariants(&state);
+        assert!(
+            lost(&effects, holder),
+            "the slow holder must lose: {effects:?}"
+        );
+        let pkg = state.package(package).unwrap();
+        assert_eq!(pkg.files[0].status, FileStatus::Verified);
+
+        // The loser's late report changes nothing.
+        let effects = state.handle(
+            Input::AttemptEnded {
+                id: holder,
+                outcome: AttemptOutcome::Success,
+                position: 50,
+            },
+            later + Duration::from_secs(2),
+        );
+        assert!(
+            effects.is_empty()
+                || !effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::StartAttempt { .. }))
+        );
+    }
+
+    #[test]
+    fn the_holder_can_win_the_race_too() {
+        let (mut state, _, file, holder, later, effects) = crawling(two_links(), 9, 10);
+        let (hedge, _, _) = starts_for(&effects, file)[0];
+        let effects = state.handle(
+            Input::AttemptEnded {
+                id: holder,
+                outcome: AttemptOutcome::Success,
+                position: 1000,
+            },
+            later,
+        );
+        assert!(lost(&effects, hedge));
+    }
+
+    #[test]
+    fn no_hedge_before_hedge_after_or_for_a_holder_nearly_done() {
+        // Not yet `hedge_after` (1 s) old.
+        let (_, _, file, _, _, effects) = crawling(two_links(), 0, 0);
+        assert!(starts_for(&effects, file).is_empty());
+        // 990 of 1000 bytes in 9 s: a moment left — not worth racing.
+        let (_, _, file, _, _, effects) = crawling(two_links(), 9, 990);
+        assert!(starts_for(&effects, file).is_empty());
+    }
+
+    #[test]
+    fn no_hedge_while_pending_work_exists() {
+        let mut state = EngineState::new(EngineConfig::default());
+        let now = Instant::now();
+        state.handle(Input::LinksChanged(two_links()), now);
+        let (_, file) = add_single_file(&mut state, now, "http://example.com/f.bin");
+        let (holder, _) =
+            activate_and_start(&mut state, now, file, "http://example.com/f.bin", 1000);
+        // A second file is still waiting for its probe: real work remains.
+        let (_, waiting) = add_single_file(&mut state, now, "http://example.com/g.bin");
+        let effects = state.handle(
+            Input::Tick {
+                progress: vec![(holder, 10)],
+            },
+            now + Duration::from_secs(30),
+        );
+        assert!(starts_for(&effects, file).is_empty(), "{effects:?}");
+        assert!(starts_for(&effects, waiting).is_empty());
+    }
+
+    #[test]
+    fn a_hedge_on_a_single_link_uses_the_holders_link() {
+        let (_, _, file, _, _, effects) = crawling(vec![one_link()], 9, 10);
+        let hedges = starts_for(&effects, file);
+        assert_eq!(hedges.len(), 1);
+        assert_eq!(hedges[0].2, LinkId::new(1));
+    }
+
+    #[test]
+    fn failed_hedges_cost_nothing_and_the_budget_is_two() {
+        let (mut state, _, file, holder, later, effects) = crawling(two_links(), 9, 10);
+        let (first, _, _) = starts_for(&effects, file)[0];
+        let effects = state.handle(
+            Input::AttemptEnded {
+                id: first,
+                outcome: AttemptOutcome::Failed(TransferError::Reset),
+                position: 10,
+            },
+            later,
+        );
+        check_invariants(&state);
+        // No retry backoff for the block; a second hedge goes out at once.
+        assert!(
+            !effects.iter().any(|e| matches!(e, Effect::WakeAt(_))),
+            "{effects:?}"
+        );
+        let second = starts_for(&effects, file);
+        assert_eq!(second.len(), 1, "{effects:?}");
+        let effects = state.handle(
+            Input::AttemptEnded {
+                id: second[0].0,
+                outcome: AttemptOutcome::Failed(TransferError::Reset),
+                position: 10,
+            },
+            later,
+        );
+        // Budget spent: no third hedge, and the holder is untouched.
+        assert!(starts_for(&effects, file).is_empty(), "{effects:?}");
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::AbortAttempt { id, .. } if *id == holder))
+        );
+    }
+
+    #[test]
+    fn a_failing_holder_leaves_the_block_to_its_hedge() {
+        let (mut state, package, file, holder, later, effects) = crawling(two_links(), 9, 10);
+        let (hedge, _, _) = starts_for(&effects, file)[0];
+        let effects = state.handle(
+            Input::AttemptEnded {
+                id: holder,
+                outcome: AttemptOutcome::Failed(TransferError::Reset),
+                position: 10,
+            },
+            later,
+        );
+        // Nothing new starts for the block: the hedge still runs it.
+        assert!(starts_for(&effects, file).is_empty(), "{effects:?}");
+        let effects = state.handle(
+            Input::AttemptEnded {
+                id: hedge,
+                outcome: AttemptOutcome::Success,
+                position: 1000,
+            },
+            later,
+        );
+        check_invariants(&state);
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::AbortAttempt { .. }))
+        );
+        assert_eq!(
+            state.package(package).unwrap().files[0].status,
+            FileStatus::Verified
+        );
+    }
+
+    #[test]
+    fn a_server_without_ranges_is_never_raced() {
+        let mut state = EngineState::new(EngineConfig::default());
+        let now = Instant::now();
+        state.handle(Input::LinksChanged(two_links()), now);
+        let (_, file) = add_single_file(&mut state, now, "http://example.com/f.bin");
+        let mut probe = ok_probe("http://example.com/f.bin", 1000).unwrap();
+        probe.supports_ranges = false;
+        state.handle(
+            Input::ProbeDone {
+                file,
+                result: Ok(probe),
+            },
+            now,
+        );
+        let effects = state.handle(
+            Input::FilePrepared {
+                file,
+                result: Ok(PreparedFile {
+                    final_name: "f.bin".to_string(),
+                    frontiers_valid: true,
+                }),
+            },
+            now,
+        );
+        let (holder, _) = find_start_attempt(&effects, file).unwrap();
+        let effects = state.handle(
+            Input::Tick {
+                progress: vec![(holder, 10)],
+            },
+            now + Duration::from_secs(30),
+        );
+        assert!(starts_for(&effects, file).is_empty());
+    }
+
+    // --- slow-connection refresh (P7.2, §7.5) ---
+
+    /// Hedging would race a slow block before the refresh got to it.
+    fn no_hedging() -> EngineConfig {
+        EngineConfig {
+            max_hedges_per_block: 0,
+            ..EngineConfig::default()
+        }
+    }
+
+    /// `n` one-block files, each with a running attempt on the first link
+    /// (or alternating when `links` has two). Returns the state and
+    /// `(file, attempt)` pairs.
+    fn running(
+        links: Vec<crate::model::Link>,
+        n: usize,
+    ) -> (
+        EngineState,
+        Vec<(crate::model::FileId, crate::model::AttemptId)>,
+        Instant,
+    ) {
+        let mut state = EngineState::new(no_hedging());
+        let now = Instant::now();
+        state.handle(Input::LinksChanged(links), now);
+        let mut out = Vec::new();
+        for i in 0..n {
+            let url = format!("http://example.com/{i}.bin");
+            let (_, file) = add_single_file(&mut state, now, &url);
+            let (attempt, _) = activate_and_start(&mut state, now, file, &url, 3_000_000);
+            out.push((file, attempt));
+        }
+        (state, out, now)
+    }
+
+    fn refreshed(effects: &[Effect], attempt: crate::model::AttemptId) -> bool {
+        effects.contains(&Effect::AbortAttempt {
+            id: attempt,
+            reason: AbortReason::Refresh,
+        })
+    }
+
+    /// Ticks once a second for `secs` seconds. `speeds[i]` bytes/s is the
+    /// pace of attempt i (0 = silent). Returns every refreshed attempt.
+    fn run_ticks(
+        state: &mut EngineState,
+        attempts: &[(crate::model::FileId, crate::model::AttemptId)],
+        speeds: &[u64],
+        start: Instant,
+        from_sec: u64,
+        to_sec: u64,
+        refreshed_ids: &mut Vec<crate::model::AttemptId>,
+    ) {
+        for sec in from_sec..=to_sec {
+            let progress = attempts
+                .iter()
+                .zip(speeds)
+                .filter(|((_, id), _)| !refreshed_ids.contains(id))
+                .map(|((_, id), speed)| (*id, speed * sec))
+                .collect();
+            let effects = state.handle(Input::Tick { progress }, start + Duration::from_secs(sec));
+            check_invariants(state);
+            for (_, id) in attempts {
+                if refreshed(&effects, *id) {
+                    refreshed_ids.push(*id);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_connection_far_below_its_links_median_is_refreshed_after_the_grace_periods() {
+        let (mut state, attempts, start) = running(vec![one_link()], 3);
+        let mut done = Vec::new();
+        // Attempt 0 crawls at 1 kB/s; the others run at 500 kB/s.
+        run_ticks(
+            &mut state,
+            &attempts,
+            &[100, 10_000, 10_000],
+            start,
+            1,
+            7,
+            &mut done,
+        );
+        assert!(done.is_empty(), "too early: {done:?}");
+        run_ticks(
+            &mut state,
+            &attempts,
+            &[100, 10_000, 10_000],
+            start,
+            8,
+            12,
+            &mut done,
+        );
+        assert_eq!(done, vec![attempts[0].1], "only the crawler is refreshed");
+    }
+
+    #[test]
+    fn the_refreshed_block_resumes_from_its_frontier_and_is_not_a_retry() {
+        let (mut state, attempts, start) = running(vec![one_link()], 3);
+        let mut done = Vec::new();
+        let mut restart = None;
+        for sec in 1..=12u64 {
+            let progress = attempts
+                .iter()
+                .enumerate()
+                .map(|(i, (_, id))| (*id, if i == 0 { 100 * sec } else { 10_000 * sec }))
+                .collect();
+            let effects = state.handle(Input::Tick { progress }, start + Duration::from_secs(sec));
+            if refreshed(&effects, attempts[0].1) {
+                restart = Some(starts_for(&effects, attempts[0].0));
+                done.push(sec);
+                break;
+            }
+        }
+        let restart = restart.expect("never refreshed");
+        // A new attempt for the same block, from the last ticked position.
+        assert_eq!(restart.len(), 1, "{restart:?}");
+        assert_eq!(restart[0].1.start, 100 * done[0]);
+        // The restart is immediate: no backoff, no retry was spent.
+    }
+
+    #[test]
+    fn a_silent_connection_is_refreshed_while_others_progress() {
+        // Alone on its own link (so nothing on it to compare with), the
+        // connection is judged by silence alone.
+        let mut state = EngineState::new(no_hedging());
+        let now = Instant::now();
+        let mut lone = one_link();
+        lone.max_slots = 1;
+        let mut other = one_link();
+        other.id = LinkId::new(2);
+        other.name = "other".to_string();
+        state.handle(Input::LinksChanged(vec![lone, other]), now);
+        let mut attempts = Vec::new();
+        for i in 0..2 {
+            let url = format!("http://example.com/{i}.bin");
+            let (_, file) = add_single_file(&mut state, now, &url);
+            let (attempt, _) = activate_and_start(&mut state, now, file, &url, 3_000_000);
+            attempts.push((file, attempt));
+        }
+        // Work still waiting elsewhere keeps hedging (which would race the
+        // silent block instead) out of the picture.
+        add_single_file(&mut state, now, "http://example.com/waiting.bin");
+        let mut done = Vec::new();
+        run_ticks(&mut state, &attempts, &[0, 10_000], now, 1, 9, &mut done);
+        assert!(done.is_empty(), "{done:?}");
+        run_ticks(&mut state, &attempts, &[0, 10_000], now, 10, 12, &mut done);
+        assert_eq!(done, vec![attempts[0].1]);
+    }
+
+    #[test]
+    fn a_silent_connection_beside_its_peers_is_caught_as_crawling() {
+        let (mut state, attempts, start) = running(vec![one_link()], 2);
+        let mut done = Vec::new();
+        run_ticks(&mut state, &attempts, &[0, 10_000], start, 1, 12, &mut done);
+        assert_eq!(done, vec![attempts[0].1]);
+    }
+
+    #[test]
+    fn nothing_is_refreshed_when_everything_is_silent() {
+        // A dead network is the stall timeout's job, not the refresh's.
+        let (mut state, attempts, start) = running(vec![one_link()], 3);
+        let mut done = Vec::new();
+        run_ticks(&mut state, &attempts, &[0, 0, 0], start, 1, 40, &mut done);
+        assert!(done.is_empty(), "{done:?}");
+    }
+
+    #[test]
+    fn links_are_never_compared_with_each_other() {
+        // A slow cellular connection alone on its link, beside fast
+        // Ethernet ones, is exactly as expected.
+        let mut state = EngineState::new(no_hedging());
+        let now = Instant::now();
+        let mut slow_link = one_link();
+        slow_link.max_slots = 1;
+        let mut fast_link = one_link();
+        fast_link.id = LinkId::new(2);
+        fast_link.name = "fast".to_string();
+        state.handle(Input::LinksChanged(vec![slow_link, fast_link]), now);
+        let mut attempts = Vec::new();
+        for i in 0..3 {
+            let url = format!("http://example.com/{i}.bin");
+            let (_, file) = add_single_file(&mut state, now, &url);
+            let (attempt, _) = activate_and_start(&mut state, now, file, &url, 3_000_000);
+            attempts.push((file, attempt));
+        }
+        let mut done = Vec::new();
+        run_ticks(
+            &mut state,
+            &attempts,
+            &[100, 10_000, 10_000],
+            now,
+            1,
+            30,
+            &mut done,
+        );
+        // The first attempt sits on link 1 (only one slot) and nothing
+        // else is on that link.
+        assert!(done.is_empty(), "{done:?}");
+    }
+
+    #[test]
+    fn a_rate_limited_package_is_not_mistaken_for_a_crawler() {
+        let (mut state, attempts, start) = running(vec![one_link()], 3);
+        let package = state
+            .packages()
+            .iter()
+            .find(|p| p.files[0].id == attempts[0].0)
+            .unwrap()
+            .id;
+        state.handle(
+            Input::Command(Command::SetPackageLimit {
+                package,
+                limit: crate::model::ByteRate::new(100),
+            }),
+            start,
+        );
+        let mut done = Vec::new();
+        run_ticks(
+            &mut state,
+            &attempts,
+            &[100, 10_000, 10_000],
+            start,
+            1,
+            30,
+            &mut done,
+        );
+        assert!(done.is_empty(), "{done:?}");
+    }
+
+    #[test]
+    fn a_block_is_refreshed_at_most_twice() {
+        let (mut state, attempts, start) = running(vec![one_link()], 3);
+        let mut refreshes = 0;
+        let mut current = attempts[0].1;
+        let mut sec = 1u64;
+        let mut base = 0u64;
+        let mut started = start;
+        while sec <= 200 {
+            // The crawler (whatever attempt currently holds file 0's
+            // block) creeps; the others fly.
+            let progress = vec![
+                (current, base + 100 * (sec - (started - start).as_secs())),
+                (attempts[1].1, 10_000 * sec),
+                (attempts[2].1, 10_000 * sec),
+            ];
+            let effects = state.handle(Input::Tick { progress }, start + Duration::from_secs(sec));
+            if refreshed(&effects, current) {
+                refreshes += 1;
+                let next = starts_for(&effects, attempts[0].0);
+                if next.len() != 1 {
+                    break;
+                }
+                base = next[0].1.start;
+                current = next[0].0;
+                started = start + Duration::from_secs(sec);
+            }
+            sec += 1;
+        }
+        assert_eq!(refreshes, 2);
     }
 }

@@ -21,19 +21,24 @@ use std::time::{Duration, Instant};
 use url::Url;
 
 /// Runtime-only per-block bookkeeping (§4: "never persisted"): retry
-/// count and backoff, the avoid-rule's per-link zero-delivery flags, and
-/// which attempt (if any) currently holds the block.
+/// count and backoff, the avoid-rule's per-link zero-delivery flags, the
+/// attempts running on the block (the holder, plus a hedge while one
+/// races it, §7.5) and how many hedges it has had.
 #[derive(Debug, Clone, Default)]
 struct BlockRuntime {
     retries: u32,
     retry_until: Option<Instant>,
     avoid_links: HashSet<LinkId>,
-    in_flight: Option<AttemptId>,
+    in_flight: Vec<AttemptId>,
+    hedges: u32,
+    /// Times the slow-connection refresh restarted an attempt on this
+    /// block (§7.5); capped by `max_refreshes_per_block`.
+    refreshes: u32,
 }
 
 /// Runtime-only record of one in-flight attempt — just enough to route
 /// `Tick` samples and `AttemptEnded` back to the right file and block.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct AttemptState {
     package: PackageId,
     file: FileId,
@@ -43,6 +48,42 @@ struct AttemptState {
     /// `position - range_start` is how many bytes *this attempt itself*
     /// delivered, for the avoid rule.
     range_start: u64,
+    /// When it started and how far it has got (from ticks), for hedging's
+    /// age and ETA (§7.5).
+    started_at: Instant,
+    position: u64,
+    /// When `position` last advanced, and recent `(time, position)`
+    /// samples taken on ticks — the refresh's evidence (§7.5). Positions
+    /// move in write-buffer steps, so speed is judged over a window of
+    /// `refresh_slow_for`, never between two ticks.
+    last_advance: Instant,
+    samples: std::collections::VecDeque<(Instant, u64)>,
+}
+
+impl AttemptState {
+    /// Records a tick sample, keeping one anchor at or before `span` ago.
+    fn sample(&mut self, now: Instant, span: Duration) {
+        self.samples.push_back((now, self.position));
+        while self.samples.len() >= 2
+            && self
+                .samples
+                .get(1)
+                .is_some_and(|(at, _)| now.saturating_duration_since(*at) >= span)
+        {
+            self.samples.pop_front();
+        }
+    }
+
+    /// Bytes/s over the last `span`, or `None` until a full span is on
+    /// record.
+    fn window_speed(&self, now: Instant, span: Duration) -> Option<f64> {
+        let (at, position) = *self.samples.front()?;
+        let covered = now.saturating_duration_since(at);
+        if covered < span || covered.is_zero() {
+            return None;
+        }
+        Some(self.position.saturating_sub(position) as f64 / covered.as_secs_f64())
+    }
 }
 
 /// Smoothed delivery rate of one link, sampled on ticks.
@@ -452,7 +493,7 @@ impl EngineState {
         for id in lost {
             if let Some(attempt) = self.attempts.remove(&id) {
                 if let Some(block) = self.blocks.get_mut(&(attempt.file, attempt.block)) {
-                    block.in_flight = None;
+                    block.in_flight.retain(|a| *a != id);
                 }
                 effects.push(Effect::AbortAttempt {
                     id,
@@ -539,6 +580,9 @@ impl EngineState {
                 now,
                 effects,
             ),
+            Command::SetPackageLimit { package, limit } => {
+                self.set_package_limit(package, limit, now, effects);
+            }
             Command::SetPostOptions {
                 package,
                 extract,
@@ -933,7 +977,7 @@ impl EngineState {
         for id in ids {
             if let Some(attempt) = self.attempts.remove(&id) {
                 if let Some(block) = self.blocks.get_mut(&(attempt.file, attempt.block)) {
-                    block.in_flight = None;
+                    block.in_flight.retain(|a| *a != id);
                 }
                 effects.push(Effect::AbortAttempt { id, reason });
             }
@@ -1309,7 +1353,7 @@ impl EngineState {
         for id in doomed {
             if let Some(attempt) = self.attempts.remove(&id) {
                 if let Some(block) = self.blocks.get_mut(&(attempt.file, attempt.block)) {
-                    block.in_flight = None;
+                    block.in_flight.retain(|a| *a != id);
                 }
                 effects.push(Effect::AbortAttempt {
                     id,
@@ -1418,9 +1462,15 @@ impl EngineState {
     ) {
         let mut touched: HashSet<PackageId> = HashSet::new();
         for (attempt_id, position) in progress {
-            let Some(attempt) = self.attempts.get(&attempt_id).copied() else {
+            let Some(attempt) = self.attempts.get_mut(&attempt_id) else {
                 continue;
             };
+            if position > attempt.position {
+                attempt.last_advance = now;
+            }
+            attempt.position = attempt.position.max(position);
+            attempt.sample(now, self.config.refresh_slow_for);
+            let attempt = attempt.clone();
             let Some(&(package_id, index)) = self.file_index.get(&attempt.file) else {
                 continue;
             };
@@ -1428,6 +1478,7 @@ impl EngineState {
             touched.insert(package_id);
         }
         self.update_meters(now);
+        self.refresh_slow_connections(now, effects);
         for package_id in &touched {
             self.maybe_checkpoint(*package_id, now, effects);
         }
@@ -1439,6 +1490,89 @@ impl EngineState {
             .collect();
         for package_id in due {
             self.maybe_checkpoint(package_id, now, effects);
+        }
+    }
+
+    /// Slow-connection refresh (§7.5): aborts, with reason `Refresh`, a
+    /// connection that has gone silent while others progress, or one that
+    /// has run below `refresh_slow_ratio` of **its own link's** fair share
+    /// (the link's throughput over its connections) for `refresh_slow_for`
+    /// (after `refresh_warmup`). Links are never compared with each other. The
+    /// block resumes from its frontier on a new connection; no retry is
+    /// counted, and a block is refreshed at most `max_refreshes_per_block`
+    /// times.
+    fn refresh_slow_connections(&mut self, now: Instant, effects: &mut Vec<Effect>) {
+        let config = &self.config;
+        // "Others are progressing": some attempt advanced very recently.
+        let recent = config.tick_interval * 4 + Duration::from_secs(1);
+        let span = config.refresh_slow_for;
+        let ids: Vec<AttemptId> = self.attempts.keys().copied().collect();
+        let mut to_refresh = Vec::new();
+
+        for id in &ids {
+            let attempt = &self.attempts[id];
+            let key = (attempt.file, attempt.block);
+            let block = self.blocks.get(&key);
+            // A raced block is the hedge's business; a spent budget stays spent.
+            if block.is_some_and(|b| {
+                b.in_flight.len() != 1 || b.refreshes >= config.max_refreshes_per_block
+            }) {
+                continue;
+            }
+            let age = now.saturating_duration_since(attempt.started_at);
+
+            let others_progress = self.attempts.iter().any(|(other_id, other)| {
+                other_id != id && now.saturating_duration_since(other.last_advance) <= recent
+            });
+            let silent_for = now.saturating_duration_since(attempt.last_advance);
+            if silent_for >= config.refresh_silent_after && others_progress {
+                to_refresh.push(*id);
+                continue;
+            }
+
+            // Crawling relative to this link's own connections, judged
+            // over the last `refresh_slow_for` once the warm-up is past.
+            let limited = self
+                .package_ref(attempt.package)
+                .is_some_and(|p| p.limit.is_some());
+            if limited || age < config.refresh_warmup + span {
+                continue;
+            }
+            let Some(mine) = attempt.window_speed(now, span) else {
+                continue;
+            };
+            // The link's fair share per connection: its smoothed total
+            // throughput over the connections running on it. (Peers come
+            // and go every few seconds, so comparing with each peer's
+            // own window would rarely have a full window to compare.)
+            let on_link = self
+                .attempts
+                .values()
+                .filter(|other| other.link == attempt.link)
+                .count();
+            if on_link < 2 {
+                continue;
+            }
+            let link_speed = self.meters.get(&attempt.link).map_or(0.0, |m| m.speed);
+            let share = link_speed / on_link as f64;
+            if share > 0.0 && mine < config.refresh_slow_ratio * share {
+                to_refresh.push(*id);
+            }
+        }
+
+        for id in to_refresh {
+            if let Some(attempt) = self.attempts.remove(&id) {
+                let block = self
+                    .blocks
+                    .entry((attempt.file, attempt.block))
+                    .or_default();
+                block.in_flight.retain(|a| *a != id);
+                block.refreshes += 1;
+                effects.push(Effect::AbortAttempt {
+                    id,
+                    reason: AbortReason::Refresh,
+                });
+            }
         }
     }
 
@@ -1529,15 +1663,29 @@ impl EngineState {
 
         let delivered = position.saturating_sub(attempt.range_start);
         let block_key = (attempt.file, attempt.block);
-        {
+        let racing = {
             let block = self.blocks.entry(block_key).or_default();
-            block.in_flight = None;
+            block.in_flight.retain(|a| *a != id);
             if delivered == 0 {
                 block.avoid_links.insert(attempt.link);
             } else {
                 block.avoid_links.remove(&attempt.link);
             }
+            !block.in_flight.is_empty()
+        };
+        // A raced block (§7.5) that is now complete: whoever finished it
+        // won, and the rest are aborted as `Lost`.
+        if racing && self.block_complete(package_id, index, attempt.block) {
+            self.abort_block_racers(block_key, effects);
         }
+        // While another attempt still runs the block, a failure here
+        // costs the block nothing: no retry is counted and no backoff
+        // holds it up.
+        let racing = racing
+            && self
+                .blocks
+                .get(&block_key)
+                .is_some_and(|b| !b.in_flight.is_empty());
         if delivered > 0 {
             self.host_delivered(package_id, index, attempt.link);
         }
@@ -1576,7 +1724,10 @@ impl EngineState {
                         effects.push(Effect::WakeAt(until));
                     }
                 }
-                self.handle_attempt_failure(package_id, index, block_key, &error, now, effects);
+                let file_wide = matches!(blame(&error), Blame::File | Blame::Fatal);
+                if !racing || file_wide {
+                    self.handle_attempt_failure(package_id, index, block_key, &error, now, effects);
+                }
             }
         }
 
@@ -1601,6 +1752,40 @@ impl EngineState {
             self.checkpoint_now(package_id, now, effects);
         }
         effects.extend(post_effects);
+    }
+
+    /// Whether every byte of the block is durable.
+    fn block_complete(&self, package_id: PackageId, index: usize, block: u32) -> bool {
+        let Some(file) = self.package_ref(package_id).map(|p| &p.files[index]) else {
+            return false;
+        };
+        let Some(layout) = file.layout else {
+            return false;
+        };
+        let total = file.expected_size.unwrap_or(0);
+        plan::block_len(&layout, total, block).is_some_and(|len| {
+            file.parts
+                .get(block as usize)
+                .is_some_and(|part| part.durable >= len)
+        })
+    }
+
+    /// Aborts every attempt still running `block_key` — the losers of a
+    /// hedge race.
+    fn abort_block_racers(&mut self, block_key: (FileId, u32), effects: &mut Vec<Effect>) {
+        let losers = self
+            .blocks
+            .get_mut(&block_key)
+            .map(|block| std::mem::take(&mut block.in_flight))
+            .unwrap_or_default();
+        for id in losers {
+            if self.attempts.remove(&id).is_some() {
+                effects.push(Effect::AbortAttempt {
+                    id,
+                    reason: AbortReason::Lost,
+                });
+            }
+        }
     }
 
     /// An immediate checkpoint, outside the tick cadence (§9.3: "on pause,
@@ -1988,6 +2173,30 @@ impl EngineState {
         }
     }
 
+    fn set_package_limit(
+        &mut self,
+        package_id: PackageId,
+        limit: Option<crate::model::ByteRate>,
+        now: Instant,
+        effects: &mut Vec<Effect>,
+    ) {
+        let Some(package) = self.package_mut(package_id) else {
+            return;
+        };
+        if package.limit == limit {
+            return;
+        }
+        package.limit = limit;
+        effects.push(Effect::SetPackageLimit {
+            package: package_id,
+            limit,
+        });
+        self.checkpoint_now(package_id, now, effects);
+        effects.push(Effect::Emit(EngineEvent::PackageLimitChanged {
+            package: package_id,
+        }));
+    }
+
     fn set_post_options(
         &mut self,
         package_id: PackageId,
@@ -2065,7 +2274,7 @@ impl EngineState {
                         continue;
                     }
                     let runtime = self.blocks.get(&(file.id, block_index));
-                    if runtime.is_some_and(|block| block.in_flight.is_some()) {
+                    if runtime.is_some_and(|block| !block.in_flight.is_empty()) {
                         continue;
                     }
                     let retry_ok = runtime
@@ -2116,6 +2325,132 @@ impl EngineState {
                 Some((*id, host.to_string()))
             })
             .collect()
+    }
+
+    /// Whether a usable link other than `link` has a free slot.
+    fn other_link_has_room(&self, link: LinkId, now: Instant) -> bool {
+        self.links.iter().filter(|l| l.id != link).any(|l| {
+            let cap = self
+                .health
+                .get(&l.id)
+                .map_or(u32::from(l.max_slots), |health| {
+                    health.slot_cap(u32::from(l.max_slots), now)
+                });
+            let active = self.attempts.values().filter(|a| a.link == l.id).count();
+            u32::try_from(active).unwrap_or(u32::MAX) < cap
+        })
+    }
+
+    /// Whether any work short of hedging remains (§7.2 pass 3's
+    /// precondition): a file still to probe or activate, or a block of an
+    /// active file that nothing is running — including one waiting out a
+    /// retry backoff or a host cooldown, which will be real work soon.
+    fn has_pending_work(&self) -> bool {
+        for package in &self.packages {
+            if package.status != PackageStatus::Downloading {
+                continue;
+            }
+            for file in &package.files {
+                match file.status {
+                    FileStatus::Unprobed | FileStatus::Queued | FileStatus::Preparing => {
+                        return true;
+                    }
+                    FileStatus::Active => {}
+                    _ => continue,
+                }
+                if self.refreshing.contains(&file.id) {
+                    return true;
+                }
+                let Some(layout) = file.layout else { continue };
+                let total = file.expected_size.unwrap_or(0);
+                for index in 0..layout.count {
+                    let done = plan::block_len(&layout, total, index).is_some_and(|len| {
+                        file.parts
+                            .get(index as usize)
+                            .is_some_and(|part| part.durable >= len)
+                    });
+                    let running = self
+                        .blocks
+                        .get(&(file.id, index))
+                        .is_some_and(|block| !block.in_flight.is_empty());
+                    if !done && !running {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Blocks pass 3 could race on `link`: held by exactly one attempt,
+    /// on a file whose server supports ranges, with a bounded remainder.
+    fn hedge_candidates(&self, now: Instant, link: LinkId) -> Vec<sched::HedgeCandidate> {
+        let mut out = Vec::new();
+        for ((file_id, block_index), runtime) in &self.blocks {
+            let [holder_id] = runtime.in_flight.as_slice() else {
+                continue;
+            };
+            let Some(holder) = self.attempts.get(holder_id) else {
+                continue;
+            };
+            let Some(&(package_id, index)) = self.file_index.get(file_id) else {
+                continue;
+            };
+            let Some(package) = self.package_ref(package_id) else {
+                continue;
+            };
+            if package.status != PackageStatus::Downloading {
+                continue;
+            }
+            let file = &package.files[index];
+            if file.status != FileStatus::Active || !file.supports_ranges {
+                continue;
+            }
+            let (Some(layout), Some(host)) =
+                (file.layout, file.url.as_ref().and_then(|u| u.host_str()))
+            else {
+                continue;
+            };
+            if self
+                .hosts
+                .get(&(host.to_string(), Some(link)))
+                .and_then(|state| state.cooldown_until)
+                .is_some_and(|until| now < until)
+            {
+                continue;
+            }
+            let total = file.expected_size.unwrap_or(0);
+            let Some(block_range) = plan::block_range(&layout, total, *block_index) else {
+                continue;
+            };
+            let Some(end) = block_range.end else { continue };
+            let durable = file
+                .parts
+                .get(*block_index as usize)
+                .map_or(0, |part| part.durable);
+            let Some(range) = crate::model::ByteRange::bounded(block_range.start + durable, end)
+            else {
+                continue;
+            };
+            let age = now.saturating_duration_since(holder.started_at);
+            let delivered = holder.position.saturating_sub(holder.range_start);
+            let eta = (delivered > 0 && !age.is_zero()).then(|| {
+                let speed = delivered as f64 / age.as_secs_f64();
+                let left = (end + 1).saturating_sub(holder.position) as f64;
+                Duration::from_secs_f64((left / speed).min(1e9))
+            });
+            out.push(sched::HedgeCandidate {
+                file: *file_id,
+                block: *block_index,
+                host: host.to_string(),
+                range,
+                holder_link: holder.link,
+                holder_age: age,
+                eta,
+                hedges: runtime.hedges,
+            });
+        }
+        out
     }
 
     /// Fills every free slot on every link (§7.2), one attempt per link
@@ -2297,7 +2632,19 @@ impl EngineState {
             } else {
                 None
             };
-            (spread, focus)
+            // Pass 3 only when nothing at all is left to do (§7.2, §7.5).
+            let hedge = if focus.is_none() && !self.has_pending_work() {
+                let mut hedges = self.hedge_candidates(now, link.id);
+                // Race on another path when one has room (§7.5): a block
+                // held on this link waits for that link's free slot.
+                hedges.retain(|c| {
+                    c.holder_link != link.id || !self.other_link_has_room(link.id, now)
+                });
+                sched::pick_hedge(&hedges, &active, &self.config.hosts, &self.config, link.id)
+            } else {
+                None
+            };
+            (spread, focus.or(hedge))
         };
         let work = match spread {
             Some(work) => work,
@@ -2318,12 +2665,20 @@ impl EngineState {
                 }
             }
         };
-        let sched::Work::Primary {
-            file,
-            block,
-            range,
-            file_offset,
-        } = work;
+        let (file, block, range, file_offset, is_hedge) = match work {
+            sched::Work::Primary {
+                file,
+                block,
+                range,
+                file_offset,
+            } => (file, block, range, file_offset, false),
+            sched::Work::Hedge {
+                file,
+                block,
+                range,
+                file_offset,
+            } => (file, block, range, file_offset, true),
+        };
         let Some(&(package_id, index)) = self.file_index.get(&file) else {
             return false;
         };
@@ -2342,9 +2697,17 @@ impl EngineState {
                 block,
                 link: link.id,
                 range_start: range.start,
+                started_at: now,
+                position: range.start,
+                last_advance: now,
+                samples: std::collections::VecDeque::from([(now, range.start)]),
             },
         );
-        self.blocks.entry((file, block)).or_default().in_flight = Some(id);
+        let runtime = self.blocks.entry((file, block)).or_default();
+        runtime.in_flight.push(id);
+        if is_hedge {
+            runtime.hedges += 1;
+        }
         effects.push(Effect::StartAttempt {
             id,
             file,

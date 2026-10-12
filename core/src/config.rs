@@ -173,6 +173,9 @@ pub struct EngineConfig {
     /// times its own size (once past 1 GiB), or more than
     /// `max_extract_entries` entries is refused as a likely bomb.
     pub max_extract_bytes: u64,
+    /// Overall download speed limit; `None` = unlimited. Changed live
+    /// through the `Engine` API (§11).
+    pub global_limit: Option<crate::model::ByteRate>,
     pub max_extract_ratio: u64,
     pub max_extract_entries: u64,
     pub soft_max_connections_per_file: u32,
@@ -233,6 +236,7 @@ impl Default for EngineConfig {
             max_connections_total: 32,
             max_concurrent_probes: 8,
             max_probes_per_host: 2,
+            global_limit: None,
             max_extract_bytes: 512 * 1024 * 1024 * 1024,
             max_extract_ratio: 1000,
             max_extract_entries: 1_000_000,
@@ -255,7 +259,7 @@ impl Default for EngineConfig {
             link_degrade_backoff_min: Duration::from_secs(5),
             link_degrade_backoff_max: Duration::from_secs(60),
 
-            hedge_after: Duration::from_secs(8),
+            hedge_after: Duration::from_secs(1),
             max_hedges_per_block: 2,
             refresh_silent_after: Duration::from_secs(10),
             refresh_slow_ratio: 0.10,
@@ -327,7 +331,7 @@ mod tests {
         assert_eq!(config.link_degrade_after_failures, 3);
         assert_eq!(config.link_degrade_backoff_min, Duration::from_secs(5));
         assert_eq!(config.link_degrade_backoff_max, Duration::from_secs(60));
-        assert_eq!(config.hedge_after, Duration::from_secs(8));
+        assert_eq!(config.hedge_after, Duration::from_secs(1));
         assert_eq!(config.max_hedges_per_block, 2);
         assert_eq!(config.refresh_silent_after, Duration::from_secs(10));
         assert!((config.refresh_slow_ratio - 0.10).abs() < f64::EPSILON);

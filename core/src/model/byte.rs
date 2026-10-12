@@ -78,6 +78,38 @@ impl ByteRate {
     pub const fn bytes_per_sec(self) -> u64 {
         self.0
     }
+
+    /// Parses `500K`, `5M`, `1.5M`, `2G` or plain bytes, optionally
+    /// followed by `B` and/or `/s` (`5MB/s`). Units are binary (1 K =
+    /// 1024). `0`, `none`, `off` and `unlimited` mean no limit (`Ok(None)`).
+    pub fn parse(text: &str) -> Result<Option<Self>, String> {
+        let original = text.trim();
+        let lower = original.to_ascii_lowercase();
+        if matches!(lower.as_str(), "none" | "off" | "unlimited" | "0") {
+            return Ok(None);
+        }
+        let mut t = lower.as_str();
+        t = t.strip_suffix("/s").unwrap_or(t);
+        t = t.strip_suffix('b').unwrap_or(t);
+        let (number, multiplier) = match t.chars().last() {
+            Some('k') => (&t[..t.len() - 1], 1u64 << 10),
+            Some('m') => (&t[..t.len() - 1], 1 << 20),
+            Some('g') => (&t[..t.len() - 1], 1 << 30),
+            _ => (t, 1),
+        };
+        let value: f64 = number
+            .trim()
+            .parse()
+            .map_err(|_| format!("`{original}` isn't a rate like 500K, 5M or 1.5G"))?;
+        if !value.is_finite() || value < 0.0 {
+            return Err(format!("`{original}` isn't a valid rate"));
+        }
+        let bytes = (value * multiplier as f64).round();
+        if bytes >= u64::MAX as f64 {
+            return Err(format!("`{original}` is too large"));
+        }
+        Ok(Self::new(bytes as u64))
+    }
 }
 
 #[cfg(test)]
@@ -110,6 +142,23 @@ mod tests {
     #[test]
     fn zero_is_not_a_valid_rate() {
         assert_eq!(ByteRate::new(0), None);
+    }
+
+    #[test]
+    fn rates_parse_with_units_and_off_words() {
+        let rate = |t: &str| ByteRate::parse(t).unwrap().map(ByteRate::bytes_per_sec);
+        assert_eq!(rate("500K"), Some(512_000));
+        assert_eq!(rate("5M"), Some(5 << 20));
+        assert_eq!(rate("1.5m"), Some(1_572_864));
+        assert_eq!(rate("2GB/s"), Some(2 << 30));
+        assert_eq!(rate("1234"), Some(1234));
+        assert_eq!(rate("10 kb/s"), Some(10_240));
+        for off in ["0", "none", "OFF", "unlimited"] {
+            assert_eq!(rate(off), None, "{off}");
+        }
+        for bad in ["", "fast", "-5M", "M", "1.2.3K", "nanK"] {
+            assert!(ByteRate::parse(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

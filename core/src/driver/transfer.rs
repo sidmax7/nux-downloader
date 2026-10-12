@@ -44,6 +44,8 @@ pub struct AttemptSpec {
     pub confirmed_version: Arc<std::sync::Mutex<Option<FileVersion>>>,
     pub stall_timeout: Duration,
     pub buffer_bytes: usize,
+    /// Speed limits this attempt must respect (§11).
+    pub throttle: crate::limit::Throttle,
     /// Absolute file offset of the next byte this attempt will write.
     pub position: Arc<AtomicU64>,
     pub cancel: CancellationToken,
@@ -296,6 +298,10 @@ async fn transfer(spec: &AttemptSpec) -> Result<(), TransferError> {
             Ok(Ok(None)) => break,
             Ok(Ok(Some(chunk))) => chunk,
         };
+
+        // Wait for the limiters before taking the bytes in: the unread
+        // rest of the response backs up into TCP, which is the throttle.
+        spec.throttle.acquire(chunk.len()).await;
 
         let mut data: &[u8] = &chunk;
         let mut past_end = false;

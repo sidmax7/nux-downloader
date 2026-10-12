@@ -143,7 +143,40 @@ fn lock_state(state: &Arc<Mutex<SharedState>>) -> std::sync::MutexGuard<'_, Shar
         .unwrap_or_else(|poison| panic!("testkit: shared state lock poisoned: {poison}"))
 }
 
+/// A "link": one aggregate byte rate shared by every connection from a
+/// source address, plus a latency added before each response. Unlike
+/// `Fault::Throttle` (a cap on each connection), connections on a shaped
+/// link compete for its bandwidth as they do on a real access link.
+pub struct Shaper {
+    bytes_per_sec: u64,
+    latency: Duration,
+    drained_at: Mutex<std::time::Instant>,
+}
+
+impl Shaper {
+    /// How long the caller must wait before sending `bytes` more: the
+    /// link has a 20 ms burst, then bytes leave at `bytes_per_sec`.
+    fn reserve(&self, bytes: u64) -> Duration {
+        let now = std::time::Instant::now();
+        let Ok(mut drained) = self.drained_at.lock() else {
+            return Duration::ZERO;
+        };
+        let start = (*drained).max(now);
+        let cost = Duration::from_nanos(
+            u64::try_from(
+                u128::from(bytes) * 1_000_000_000 / u128::from(self.bytes_per_sec.max(1)),
+            )
+            .unwrap_or(u64::MAX),
+        );
+        *drained = start + cost;
+        (*drained)
+            .checked_sub(Duration::from_millis(20))
+            .map_or(Duration::ZERO, |due| due.saturating_duration_since(now))
+    }
+}
+
 struct SharedState {
+    shapers: HashMap<IpAddr, Arc<Shaper>>,
     options: OriginOptions,
     requests: Vec<LoggedRequest>,
     /// Requests seen so far — numbered when they arrive, not when they
@@ -173,6 +206,7 @@ struct ConcurrencyGuard {
     state: Arc<Mutex<SharedState>>,
     source: IpAddr,
     finished: Arc<Mutex<Option<std::time::Instant>>>,
+    shaper: Option<Arc<Shaper>>,
 }
 
 impl Drop for ConcurrencyGuard {
@@ -212,6 +246,7 @@ impl Origin {
         let addr = listener.local_addr().unwrap_or(options.bind_addr);
 
         let state = Arc::new(Mutex::new(SharedState {
+            shapers: HashMap::new(),
             options,
             requests: Vec::new(),
             arrived: 0,
@@ -300,6 +335,20 @@ impl Origin {
     /// already streaming a body are not affected.
     pub fn block_source(&self, source: IpAddr) {
         lock_state(&self.state).blocked_sources.insert(source);
+    }
+
+    /// Shapes `source` as one link: `bytes_per_sec` shared by all its
+    /// connections, and `latency` before every response. Combines with
+    /// any fault; `None` rate removes the shaping.
+    pub fn shape_source(&self, source: IpAddr, bytes_per_sec: u64, latency: Duration) {
+        lock_state(&self.state).shapers.insert(
+            source,
+            Arc::new(Shaper {
+                bytes_per_sec,
+                latency,
+                drained_at: Mutex::new(std::time::Instant::now()),
+            }),
+        );
     }
 
     pub fn unblock_source(&self, source: IpAddr) {
@@ -452,7 +501,7 @@ async fn handle_request(
         .and_then(parse_range_header);
     let accept_encoding = header_str(request.headers(), header::ACCEPT_ENCODING);
 
-    let (options, fault, n, hold_at) = {
+    let (options, fault, n, hold_at, shaper) = {
         let mut state = lock_state(&app.shared);
         state.arrived += 1;
         let n = state.arrived;
@@ -482,7 +531,8 @@ async fn handle_request(
             .or_insert(0);
         *peak = (*peak).max(count);
 
-        (state.options.clone(), fault, n, hold_at)
+        let shaper = state.shapers.get(&from.ip()).cloned();
+        (state.options.clone(), fault, n, hold_at, shaper)
     };
 
     let bytes_sent = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -492,9 +542,13 @@ async fn handle_request(
         state: app.shared.clone(),
         source: from.ip(),
         finished: finished.clone(),
+        shaper: shaper.clone(),
     };
     if let Fault::Delay(ms) = &fault {
         tokio::time::sleep(Duration::from_millis(*ms)).await;
+    }
+    if let Some(shaper) = &shaper {
+        tokio::time::sleep(shaper.latency).await;
     }
 
     let (status, headers, body) = build_response(
@@ -683,6 +737,7 @@ fn build_content_response(
     let body = options.body.clone();
     let fault = fault.clone();
     let stream = async_stream::stream! {
+        let shaper = guard.shaper.clone();
         let _guard = guard;
         let mut sent = 0u64;
         let hold_point = hold_at;
@@ -767,7 +822,11 @@ fn build_content_response(
             }
             _ => {
                 while sent < full_len {
-                    let chunk_len = clip_to_hold!((full_len - sent).min(64 * 1024));
+                    let piece = if shaper.is_some() { 16 * 1024 } else { 64 * 1024 };
+                    let chunk_len = clip_to_hold!((full_len - sent).min(piece));
+                    if let Some(shaper) = &shaper {
+                        tokio::time::sleep(shaper.reserve(chunk_len)).await;
+                    }
                     let bytes = Bytes::from(served_bytes(&body, seed, serve_start + sent, chunk_len));
                     sent += chunk_len;
                     bytes_sent.store(sent, std::sync::atomic::Ordering::Relaxed);

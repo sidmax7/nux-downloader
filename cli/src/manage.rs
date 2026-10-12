@@ -130,6 +130,37 @@ pub async fn add(
     code
 }
 
+/// Sets or clears a package's speed limit.
+pub async fn limit(
+    id: PackageId,
+    rate: Option<nuxd_core::model::ByteRate>,
+    data_dir: Option<PathBuf>,
+) -> ExitCode {
+    let Some(engine) = open(data_dir).await else {
+        return ExitCode::from(2);
+    };
+    if !engine.snapshot().await.packages.iter().any(|p| p.id == id) {
+        eprintln!("nuxd limit: no package {id}");
+        engine.shutdown().await;
+        return ExitCode::from(2);
+    }
+    let code = match engine.set_package_limit(id, rate).await {
+        Ok(()) => {
+            match rate {
+                Some(rate) => println!("package {id}: limited to {} bytes/s", rate.bytes_per_sec()),
+                None => println!("package {id}: no speed limit"),
+            }
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("nuxd limit: {error}");
+            ExitCode::from(2)
+        }
+    };
+    engine.shutdown().await;
+    code
+}
+
 /// Changes a package's extraction options.
 pub async fn options(
     id: PackageId,

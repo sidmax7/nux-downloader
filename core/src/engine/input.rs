@@ -35,6 +35,12 @@ pub enum Command {
         priority: Priority,
         post: PostOptions,
     },
+    /// Sets or clears a package's own speed limit (§11). Persisted with
+    /// the package; the driver applies it to running transfers.
+    SetPackageLimit {
+        package: PackageId,
+        limit: Option<crate::model::ByteRate>,
+    },
     /// Changes what happens after the package downloads (§12.4): the
     /// "extract after download" and "delete archives after extraction"
     /// checkboxes. Takes effect for the next step the package reaches.
