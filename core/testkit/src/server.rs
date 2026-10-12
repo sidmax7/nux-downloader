@@ -425,7 +425,7 @@ impl Origin {
 
     /// Holds every request, probes included, after `offset` bytes, until
     /// `release()`. A probe (`Range: bytes=0-0`) is only one byte long, so
-    /// an `offset` above zero holds only the transfers.
+    /// an `offset` above one holds only the transfers.
     pub fn hold_every_request_at(&self, offset: u64) {
         lock_state(&self.state).hold_every_at = Some(offset);
     }
@@ -795,6 +795,10 @@ fn build_content_response(
                 }
             };
         }
+
+        // A hold at byte 0 stops the body before anything is sent (the
+        // checks in the loops below only run after a piece has gone out).
+        maybe_hold!();
 
         match &fault {
             Fault::CutAfter(n) => {

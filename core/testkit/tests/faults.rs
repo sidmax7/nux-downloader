@@ -521,6 +521,50 @@ async fn hold_pauses_a_request_until_release() {
 }
 
 #[tokio::test]
+async fn a_hold_at_zero_sends_no_body_until_release() {
+    let origin = origin(OriginOptions {
+        size: 10_000,
+        seed: 25,
+        ..Default::default()
+    })
+    .await;
+    origin.hold_next_request_at(0);
+
+    let mut response = reqwest::get(origin.url()).await.unwrap();
+    let first = tokio::time::timeout(Duration::from_millis(200), response.chunk()).await;
+    assert!(first.is_err(), "a byte arrived before the release");
+
+    origin.release();
+    let body = tokio::time::timeout(Duration::from_secs(2), response.bytes())
+        .await
+        .expect("the request never finished after release")
+        .unwrap();
+    assert_eq!(body.as_ref(), content_range(25, 0, 10_000).as_slice());
+}
+
+#[tokio::test]
+async fn a_release_reaches_a_request_still_on_its_way_to_the_hold() {
+    let origin = origin(OriginOptions {
+        size: 64 * 1024,
+        seed: 26,
+        ..Default::default()
+    })
+    .await;
+    // 16 KiB pieces every 100 ms: byte 48 KiB is 300 ms away when the
+    // headers arrive, and the release comes before that.
+    origin.set_default_fault(Fault::Throttle(160 * 1024));
+    origin.hold_next_request_at(48 * 1024);
+
+    let response = reqwest::get(origin.url()).await.unwrap();
+    origin.release();
+    let body = tokio::time::timeout(Duration::from_secs(3), response.bytes())
+        .await
+        .expect("a release before the hold point was lost")
+        .unwrap();
+    assert_eq!(body.len(), 64 * 1024);
+}
+
+#[tokio::test]
 async fn shutdown_stops_the_server() {
     let origin = origin(OriginOptions {
         size: 10,
