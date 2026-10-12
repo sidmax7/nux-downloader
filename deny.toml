@@ -25,6 +25,9 @@ allow = [
     "Unicode-3.0",
     "Zlib",
     "CC0-1.0",
+    # libbz2-rs-sys (pure-Rust bzip2, pulled in by the zip / 7z readers):
+    # the bzip2 licence is a permissive BSD-style one.
+    "bzip2-1.0.6",
     # webpki-roots (Mozilla's CA root bundle, pulled in via reqwest's
     # rustls-tls) is licensed under this data license, not a code
     # license — standard for a bundled certificate list, not a

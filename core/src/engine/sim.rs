@@ -39,11 +39,15 @@ pub fn check_invariants(state: &EngineState) {
                 }
             }
         }
-        if package.status == PackageStatus::Done {
+        if matches!(
+            package.status,
+            PackageStatus::Done | PackageStatus::Verifying | PackageStatus::Extracting
+        ) {
             assert!(
                 package.all_files_verified(),
-                "package {:?}: Done but not every file is Verified",
-                package.id
+                "package {:?}: {:?} but not every file is Verified",
+                package.id,
+                package.status
             );
         }
     }
@@ -134,6 +138,7 @@ mod tests {
                 dest_dir: std::path::PathBuf::from("/tmp/nuxd-sim"),
                 sources: vec![url.to_string()],
                 priority: Priority::Normal,
+                post: Default::default(),
             }),
             now,
         );
@@ -221,7 +226,19 @@ mod tests {
         );
         let pkg = state.package(package).unwrap();
         assert_eq!(pkg.files[0].status, FileStatus::Verified);
-        assert_eq!(pkg.status, PackageStatus::Done);
+        // Every byte is in, but the package is Done only once verified.
+        assert_eq!(pkg.status, PackageStatus::Verifying);
+        assert!(!effects.contains(&Effect::Emit(EngineEvent::PackageDone { package })));
+        let effects = state.handle(
+            Input::VerifyDone {
+                package,
+                result: Ok(Default::default()),
+            },
+            now,
+        );
+        check_invariants(&state);
+        assert!(effects.contains(&Effect::Emit(EngineEvent::PackageDone { package })));
+        assert_eq!(state.package(package).unwrap().status, PackageStatus::Done);
     }
 
     #[test]
@@ -253,7 +270,12 @@ mod tests {
         assert!(find_start_attempt(&effects, file).is_none());
         let pkg = state.package(package).unwrap();
         assert_eq!(pkg.files[0].status, FileStatus::Verified);
-        assert_eq!(pkg.status, PackageStatus::Done);
+        assert_eq!(pkg.status, PackageStatus::Verifying);
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::VerifyPackage { package: p, .. } if *p == package))
+        );
     }
 
     #[test]
@@ -444,6 +466,7 @@ mod tests {
                     "http://b.example.com/f.bin".to_string(),
                 ],
                 priority: Priority::Normal,
+                post: Default::default(),
             }),
             now,
         );
@@ -511,6 +534,7 @@ mod tests {
                     "http://example.com/f.bin".to_string(),
                 ],
                 priority: Priority::Normal,
+                post: Default::default(),
             }),
             now,
         );
@@ -701,6 +725,7 @@ mod tests {
                 dest_dir: std::path::PathBuf::from("/tmp/nuxd-sim"),
                 sources: vec!["http://example.com/g.bin".to_string()],
                 priority: Priority::Normal,
+                post: Default::default(),
             }),
             now,
         );
@@ -1802,6 +1827,7 @@ mod tests {
                 dest_dir: std::path::PathBuf::from("/tmp/nuxd-sim"),
                 sources: urls.to_vec(),
                 priority: Priority::Normal,
+                post: Default::default(),
             }),
             now,
         );
@@ -2092,6 +2118,7 @@ mod tests {
                 dest_dir: std::path::PathBuf::from("/tmp/nuxd-sim"),
                 sources,
                 priority: Priority::Normal,
+                post: Default::default(),
             }),
             now,
         );
@@ -2135,6 +2162,7 @@ mod tests {
                 dest_dir: std::path::PathBuf::from("/tmp/nuxd-sim"),
                 sources,
                 priority: Priority::Normal,
+                post: Default::default(),
             }),
             now,
         );
@@ -2178,6 +2206,7 @@ mod tests {
                 dest_dir: std::path::PathBuf::from("/tmp/nuxd-sim"),
                 files: vec![good, bad],
                 priority: Priority::Normal,
+                post: Default::default(),
             }),
             now,
         );
@@ -2322,6 +2351,7 @@ mod tests {
                 dest_dir: std::path::PathBuf::from("/tmp/nuxd-sim"),
                 sources: vec!["ftp://example.com/a.bin".to_string()],
                 priority: Priority::Normal,
+                post: Default::default(),
             }),
             now,
         );
@@ -2536,5 +2566,609 @@ mod tests {
             );
         }
         assert_eq!(state.file(file).unwrap().versions.len(), 2);
+    }
+
+    // --- post-processing: verify, extract (P5.5) ---
+
+    use crate::model::{ArchiveScheme, ArchiveSet, PackageError, PostOptions};
+    use crate::verify::{VerifyFailure, VerifyReport};
+
+    fn rar_set(base: &str) -> ArchiveSet {
+        ArchiveSet {
+            scheme: ArchiveScheme::Rar,
+            base_name: base.to_string(),
+        }
+    }
+
+    fn extract_post(base: &str, delete: bool) -> PostOptions {
+        PostOptions {
+            archive: Some(rar_set(base)),
+            extract: true,
+            delete_archives: delete,
+        }
+    }
+
+    /// Adds a package of empty files named `names` and drives every file
+    /// to `Verified` (an empty file completes on activation). Returns the
+    /// package and every effect produced on the way.
+    fn finished_package(
+        state: &mut EngineState,
+        now: Instant,
+        names: &[&str],
+        post: PostOptions,
+    ) -> (crate::model::PackageId, Vec<Effect>) {
+        let mut all = state.handle(
+            Input::Command(Command::AddPackage {
+                name: "pkg".to_string(),
+                dest_dir: std::path::PathBuf::from("/tmp/nuxd-sim"),
+                sources: names
+                    .iter()
+                    .map(|n| format!("http://example.com/{n}"))
+                    .collect(),
+                priority: Priority::Normal,
+                post,
+            }),
+            now,
+        );
+        let package = package_added(&all).unwrap_or_else(|| panic!("no PackageAdded"));
+        let files: Vec<_> = state
+            .package(package)
+            .unwrap()
+            .files
+            .iter()
+            .map(|f| f.id)
+            .collect();
+        for (file, name) in files.iter().zip(names) {
+            all.extend(state.handle(
+                Input::ProbeDone {
+                    file: *file,
+                    result: ok_probe(&format!("http://example.com/{name}"), 0),
+                },
+                now,
+            ));
+        }
+        let mut prepared = std::collections::HashSet::new();
+        loop {
+            let ready: Vec<_> = all
+                .iter()
+                .filter_map(|e| match e {
+                    Effect::PrepareFile { file, .. } if !prepared.contains(file) => Some(*file),
+                    _ => None,
+                })
+                .collect();
+            if ready.is_empty() {
+                break;
+            }
+            for file in ready {
+                prepared.insert(file);
+                let index = files.iter().position(|f| *f == file).unwrap();
+                all.extend(state.handle(
+                    Input::FilePrepared {
+                        file,
+                        result: Ok(PreparedFile {
+                            final_name: names[index].to_string(),
+                            frontiers_valid: true,
+                        }),
+                    },
+                    now,
+                ));
+                check_invariants(state);
+            }
+        }
+        (package, all)
+    }
+
+    fn verified_ok(
+        state: &mut EngineState,
+        now: Instant,
+        package: crate::model::PackageId,
+    ) -> Vec<Effect> {
+        let effects = state.handle(
+            Input::VerifyDone {
+                package,
+                result: Ok(VerifyReport::default()),
+            },
+            now,
+        );
+        check_invariants(state);
+        effects
+    }
+
+    fn extract_effect(
+        effects: &[Effect],
+        package: crate::model::PackageId,
+    ) -> Option<&crate::extract::ExtractSpec> {
+        effects.iter().find_map(|e| match e {
+            Effect::Extract { package: p, spec } if *p == package => Some(spec),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn a_plain_package_is_verified_then_done() {
+        let mut state = EngineState::new(EngineConfig::default());
+        let now = Instant::now();
+        state.handle(Input::LinksChanged(vec![one_link()]), now);
+        let (package, effects) =
+            finished_package(&mut state, now, &["a.bin", "b.bin"], PostOptions::default());
+        assert_eq!(
+            state.package(package).unwrap().status,
+            PackageStatus::Verifying
+        );
+        let verify = effects
+            .iter()
+            .find_map(|e| match e {
+                Effect::VerifyPackage { files, .. } => Some(files.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            verify.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
+            vec!["a.bin", "b.bin"]
+        );
+        let effects = verified_ok(&mut state, now, package);
+        assert_eq!(state.package(package).unwrap().status, PackageStatus::Done);
+        assert!(effects.contains(&Effect::Emit(EngineEvent::PackageDone { package })));
+        assert!(!effects.iter().any(|e| matches!(e, Effect::Extract { .. })));
+    }
+
+    #[test]
+    fn extract_runs_after_verification_with_volumes_in_reading_order() {
+        let mut state = EngineState::new(EngineConfig::default());
+        let now = Instant::now();
+        state.handle(Input::LinksChanged(vec![one_link()]), now);
+        // Files arrive in a shuffled order, with a checksum sidecar.
+        let (package, _) = finished_package(
+            &mut state,
+            now,
+            &["x.part2.rar", "x.sfv", "x.part1.rar"],
+            extract_post("x", false),
+        );
+        assert_eq!(
+            state.package(package).unwrap().status,
+            PackageStatus::Verifying
+        );
+        let effects = verified_ok(&mut state, now, package);
+        assert_eq!(
+            state.package(package).unwrap().status,
+            PackageStatus::Extracting
+        );
+        assert!(effects.contains(&Effect::Emit(EngineEvent::PackageExtracting { package })));
+        let spec = extract_effect(&effects, package).expect("Extract effect");
+        let names: Vec<_> = spec
+            .volumes
+            .iter()
+            .map(|v| v.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        // Volume order, and the sidecar is not a volume.
+        assert_eq!(names, vec!["x.part1.rar", "x.part2.rar"]);
+        assert_eq!(spec.scheme, ArchiveScheme::Rar);
+
+        let effects = state.handle(
+            Input::ExtractDone {
+                package,
+                result: Ok(Default::default()),
+            },
+            now,
+        );
+        check_invariants(&state);
+        assert_eq!(state.package(package).unwrap().status, PackageStatus::Done);
+        assert!(effects.contains(&Effect::Emit(EngineEvent::PackageDone { package })));
+        // "Delete archives" was off: nothing is deleted.
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::DeleteFiles { .. }))
+        );
+    }
+
+    #[test]
+    fn archives_are_deleted_only_when_asked_and_only_after_success() {
+        let mut state = EngineState::new(EngineConfig::default());
+        let now = Instant::now();
+        state.handle(Input::LinksChanged(vec![one_link()]), now);
+        let (package, _) = finished_package(
+            &mut state,
+            now,
+            &["x.part1.rar", "x.part2.rar", "x.sfv"],
+            extract_post("x", true),
+        );
+        let effects = verified_ok(&mut state, now, package);
+        // Nothing is deleted just for being verified.
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::DeleteFiles { .. }))
+        );
+
+        let effects = state.handle(
+            Input::ExtractDone {
+                package,
+                result: Ok(Default::default()),
+            },
+            now,
+        );
+        let deleted = effects
+            .iter()
+            .find_map(|e| match e {
+                Effect::DeleteFiles { names, .. } => Some(names.clone()),
+                _ => None,
+            })
+            .expect("DeleteFiles");
+        // The volumes, but not the checksum sidecar.
+        assert_eq!(deleted, vec!["x.part1.rar", "x.part2.rar"]);
+
+        // A failed extraction deletes nothing.
+        let (second, _) = finished_package(
+            &mut state,
+            now,
+            &["y.part1.rar", "y.part2.rar"],
+            extract_post("y", true),
+        );
+        verified_ok(&mut state, now, second);
+        let effects = state.handle(
+            Input::ExtractDone {
+                package: second,
+                result: Err("boom".to_string()),
+            },
+            now,
+        );
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::DeleteFiles { .. }))
+        );
+    }
+
+    #[test]
+    fn the_extract_option_is_ignored_for_a_non_archive() {
+        let mut state = EngineState::new(EngineConfig::default());
+        let now = Instant::now();
+        state.handle(Input::LinksChanged(vec![one_link()]), now);
+        let post = PostOptions {
+            archive: None,
+            extract: true,
+            delete_archives: false,
+        };
+        let (package, _) = finished_package(&mut state, now, &["a.bin"], post);
+        assert!(!state.package(package).unwrap().extract);
+        let effects = verified_ok(&mut state, now, package);
+        assert_eq!(state.package(package).unwrap().status, PackageStatus::Done);
+        assert!(!effects.iter().any(|e| matches!(e, Effect::Extract { .. })));
+    }
+
+    #[test]
+    fn extraction_is_one_at_a_time_and_overlaps_the_next_download() {
+        let mut state = EngineState::new(EngineConfig::default());
+        let now = Instant::now();
+        state.handle(Input::LinksChanged(vec![one_link()]), now);
+        let (first, _) =
+            finished_package(&mut state, now, &["a.part1.rar"], extract_post("a", false));
+        let (second, _) =
+            finished_package(&mut state, now, &["b.part1.rar"], extract_post("b", false));
+        let effects = verified_ok(&mut state, now, first);
+        assert!(extract_effect(&effects, first).is_some());
+
+        // A third package is still downloading while the first extracts.
+        let effects = state.handle(
+            Input::Command(Command::AddPackage {
+                name: "next".to_string(),
+                dest_dir: std::path::PathBuf::from("/tmp/nuxd-sim"),
+                sources: vec!["http://example.com/next.bin".to_string()],
+                priority: Priority::Normal,
+                post: Default::default(),
+            }),
+            now,
+        );
+        let third = package_added(&effects).unwrap();
+        assert_eq!(
+            state.package(first).unwrap().status,
+            PackageStatus::Extracting
+        );
+        assert_eq!(
+            state.package(third).unwrap().status,
+            PackageStatus::Downloading
+        );
+
+        // The second is verified while the first extracts: it waits.
+        let effects = verified_ok(&mut state, now, second);
+        assert!(extract_effect(&effects, second).is_none());
+        assert_eq!(
+            state.package(second).unwrap().status,
+            PackageStatus::Verifying
+        );
+
+        // The first finishing starts the second.
+        let effects = state.handle(
+            Input::ExtractDone {
+                package: first,
+                result: Ok(Default::default()),
+            },
+            now,
+        );
+        assert!(extract_effect(&effects, second).is_some());
+        assert_eq!(
+            state.package(second).unwrap().status,
+            PackageStatus::Extracting
+        );
+        assert_eq!(state.package(first).unwrap().status, PackageStatus::Done);
+    }
+
+    #[test]
+    fn a_failed_extraction_can_be_retried_with_resume() {
+        let mut state = EngineState::new(EngineConfig::default());
+        let now = Instant::now();
+        state.handle(Input::LinksChanged(vec![one_link()]), now);
+        let (package, _) =
+            finished_package(&mut state, now, &["a.part1.rar"], extract_post("a", false));
+        verified_ok(&mut state, now, package);
+        let effects = state.handle(
+            Input::ExtractDone {
+                package,
+                result: Err("disk full".to_string()),
+            },
+            now,
+        );
+        check_invariants(&state);
+        assert_eq!(
+            state.package(package).unwrap().status,
+            PackageStatus::Failed(PackageError::ExtractFailed {
+                detail: "disk full".to_string()
+            })
+        );
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::Emit(EngineEvent::PackageFailed { .. })))
+        );
+
+        let effects = state.handle(Input::Command(Command::Resume(package)), now);
+        assert_eq!(
+            state.package(package).unwrap().status,
+            PackageStatus::Verifying
+        );
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::VerifyPackage { .. }))
+        );
+    }
+
+    #[test]
+    fn a_corrupt_file_is_deleted_and_can_be_restarted() {
+        let mut state = EngineState::new(EngineConfig::default());
+        let now = Instant::now();
+        state.handle(Input::LinksChanged(vec![one_link()]), now);
+        let (package, _) =
+            finished_package(&mut state, now, &["a.bin", "b.bin"], PostOptions::default());
+        let bad = state.package(package).unwrap().files[1].id;
+        let effects = state.handle(
+            Input::VerifyDone {
+                package,
+                result: Err(VerifyFailure {
+                    file: Some("b.bin".to_string()),
+                    corrupt: true,
+                    detail: "b.bin: CRC32 mismatch".to_string(),
+                }),
+            },
+            now,
+        );
+        let pkg = state.package(package).unwrap();
+        assert!(matches!(
+            pkg.status,
+            PackageStatus::Failed(PackageError::VerifyFailed { .. })
+        ));
+        assert!(matches!(
+            pkg.files[1].status,
+            FileStatus::Failed(crate::model::FileError::VerifyFailed { .. })
+        ));
+        assert_eq!(pkg.files[0].status, FileStatus::Verified);
+        assert!(effects.iter().any(
+            |e| matches!(e, Effect::DeleteFiles { names, .. } if names == &vec!["b.bin".to_string()])
+        ));
+
+        // Restarting the file revives the package.
+        state.handle(Input::Command(Command::RestartFile(bad)), now);
+        check_invariants(&state);
+        assert_eq!(
+            state.package(package).unwrap().status,
+            PackageStatus::Downloading
+        );
+    }
+
+    #[test]
+    fn a_failure_with_no_corrupt_file_just_fails_the_package() {
+        let mut state = EngineState::new(EngineConfig::default());
+        let now = Instant::now();
+        state.handle(Input::LinksChanged(vec![one_link()]), now);
+        let (package, _) = finished_package(&mut state, now, &["a.bin"], PostOptions::default());
+        let effects = state.handle(
+            Input::VerifyDone {
+                package,
+                result: Err(VerifyFailure {
+                    file: None,
+                    corrupt: false,
+                    detail: "unreadable".to_string(),
+                }),
+            },
+            now,
+        );
+        assert!(matches!(
+            state.package(package).unwrap().status,
+            PackageStatus::Failed(PackageError::VerifyFailed { .. })
+        ));
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::DeleteFiles { .. }))
+        );
+        assert_eq!(
+            state.package(package).unwrap().files[0].status,
+            FileStatus::Verified
+        );
+    }
+
+    #[test]
+    fn cancelling_an_extracting_package_stops_it_and_starts_the_next() {
+        let mut state = EngineState::new(EngineConfig::default());
+        let now = Instant::now();
+        state.handle(Input::LinksChanged(vec![one_link()]), now);
+        let (first, _) =
+            finished_package(&mut state, now, &["a.part1.rar"], extract_post("a", false));
+        let (second, _) =
+            finished_package(&mut state, now, &["b.part1.rar"], extract_post("b", false));
+        verified_ok(&mut state, now, first);
+        verified_ok(&mut state, now, second);
+
+        let effects = state.handle(Input::Command(Command::Cancel(first)), now);
+        assert!(effects.contains(&Effect::CancelPost { package: first }));
+        assert!(extract_effect(&effects, second).is_some());
+        // The cancelled run's late result changes nothing.
+        let status_before = state.package(first).unwrap().status.clone();
+        state.handle(
+            Input::ExtractDone {
+                package: first,
+                result: Ok(Default::default()),
+            },
+            now,
+        );
+        assert_eq!(state.package(first).unwrap().status, status_before);
+        assert!(matches!(status_before, PackageStatus::Failed(_)));
+        assert_eq!(
+            state.package(second).unwrap().status,
+            PackageStatus::Extracting
+        );
+    }
+
+    #[test]
+    fn removing_a_package_waiting_for_extraction_drops_it_from_the_queue() {
+        let mut state = EngineState::new(EngineConfig::default());
+        let now = Instant::now();
+        state.handle(Input::LinksChanged(vec![one_link()]), now);
+        let (first, _) =
+            finished_package(&mut state, now, &["a.part1.rar"], extract_post("a", false));
+        let (second, _) =
+            finished_package(&mut state, now, &["b.part1.rar"], extract_post("b", false));
+        verified_ok(&mut state, now, first);
+        verified_ok(&mut state, now, second);
+        let effects = state.handle(Input::Command(Command::Remove(second)), now);
+        assert!(effects.contains(&Effect::CancelPost { package: second }));
+        let effects = state.handle(
+            Input::ExtractDone {
+                package: first,
+                result: Ok(Default::default()),
+            },
+            now,
+        );
+        assert!(!effects.iter().any(|e| matches!(e, Effect::Extract { .. })));
+    }
+
+    #[test]
+    fn the_options_can_be_changed_before_the_package_finishes() {
+        let mut state = EngineState::new(EngineConfig::default());
+        let now = Instant::now();
+        state.handle(Input::LinksChanged(vec![one_link()]), now);
+        let post = PostOptions {
+            archive: Some(rar_set("a")),
+            extract: false,
+            delete_archives: false,
+        };
+        let effects = state.handle(
+            Input::Command(Command::AddPackage {
+                name: "a".to_string(),
+                dest_dir: std::path::PathBuf::from("/tmp/nuxd-sim"),
+                sources: vec!["http://example.com/a.part1.rar".to_string()],
+                priority: Priority::Normal,
+                post,
+            }),
+            now,
+        );
+        let package = package_added(&effects).unwrap();
+        let effects = state.handle(
+            Input::Command(Command::SetPostOptions {
+                package,
+                extract: true,
+                delete_archives: true,
+            }),
+            now,
+        );
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::Checkpoint { .. }))
+        );
+        let pkg = state.package(package).unwrap();
+        assert!(pkg.extract && pkg.delete_archives);
+    }
+
+    #[test]
+    fn restoring_a_package_that_was_mid_post_processing_verifies_it_again() {
+        use crate::storage::manifest::QueueManifest;
+        let mut state = EngineState::new(EngineConfig::default());
+        let now = Instant::now();
+        state.handle(Input::LinksChanged(vec![one_link()]), now);
+        let (package, _) =
+            finished_package(&mut state, now, &["a.part1.rar"], extract_post("a", false));
+        verified_ok(&mut state, now, package);
+        assert_eq!(
+            state.package(package).unwrap().status,
+            PackageStatus::Extracting
+        );
+
+        let snapshot = state.snapshot();
+        let queue = QueueManifest {
+            schema_version: 1,
+            next_package_id: snapshot.next_package_id,
+            next_file_id: snapshot.next_file_id,
+            package_order: snapshot.packages.iter().map(|p| p.id).collect(),
+            settings: Default::default(),
+        };
+        let (restored, effects) =
+            EngineState::restore(EngineConfig::default(), &queue, snapshot.packages);
+        assert_eq!(
+            restored.package(package).unwrap().status,
+            PackageStatus::Verifying
+        );
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::VerifyPackage { .. }))
+        );
+    }
+
+    #[test]
+    fn late_post_results_for_unknown_or_wrong_state_packages_are_ignored() {
+        let mut state = EngineState::new(EngineConfig::default());
+        let now = Instant::now();
+        state.handle(Input::LinksChanged(vec![one_link()]), now);
+        // Unknown package.
+        let ghost = crate::model::PackageId::new(99);
+        state.handle(
+            Input::VerifyDone {
+                package: ghost,
+                result: Ok(VerifyReport::default()),
+            },
+            now,
+        );
+        state.handle(
+            Input::ExtractDone {
+                package: ghost,
+                result: Ok(Default::default()),
+            },
+            now,
+        );
+        // A package that is still downloading never becomes Done from a stray result.
+        let (package, _) = add_single_file(&mut state, now, "http://example.com/f.bin");
+        state.handle(
+            Input::VerifyDone {
+                package,
+                result: Ok(VerifyReport::default()),
+            },
+            now,
+        );
+        assert_eq!(
+            state.package(package).unwrap().status,
+            PackageStatus::Downloading
+        );
     }
 }

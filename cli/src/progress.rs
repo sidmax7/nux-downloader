@@ -96,6 +96,11 @@ impl Bars {
         });
     }
 
+    /// Prints a line above the bars.
+    pub fn say(&self, message: &str) {
+        let _ = self.multi.println(message);
+    }
+
     pub fn finish(&self) {
         for bar in self.by_link.values() {
             bar.finish();

@@ -14,6 +14,8 @@ fn opts(name: &str, dest_dir: std::path::PathBuf) -> AddOptions {
         name: name.to_string(),
         dest_dir,
         priority: Priority::Normal,
+        extract: false,
+        delete_archives: false,
     }
 }
 

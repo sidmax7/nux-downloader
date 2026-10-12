@@ -66,6 +66,7 @@ async fn add(driver: &Driver, dest: &std::path::Path, url: String) {
             dest_dir: dest.to_path_buf(),
             sources: vec![url],
             priority: Priority::Normal,
+            post: Default::default(),
         })
         .await
         .unwrap_or_else(|error| panic!("couldn't send AddPackage: {error}"));

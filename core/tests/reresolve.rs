@@ -40,6 +40,8 @@ fn opts(dest: &std::path::Path) -> AddOptions {
         name: "pkg".to_string(),
         dest_dir: dest.to_path_buf(),
         priority: Priority::Normal,
+        extract: false,
+        delete_archives: false,
     }
 }
 

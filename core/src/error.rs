@@ -169,7 +169,31 @@ pub enum StorageError {
 
 /// Extraction, if it ships (Phase 5).
 #[derive(Debug, Error)]
-pub enum ExtractError {}
+pub enum ExtractError {
+    /// An entry would be written outside the output directory (`..`,
+    /// an absolute path, a drive or UNC prefix).
+    #[error("unsafe path in archive: {entry}")]
+    UnsafePath { entry: String },
+    /// Over a configured limit: probably an archive bomb.
+    #[error("archive refused: {detail}")]
+    TooLarge { detail: String },
+    /// A format or feature nuxd doesn't handle (encryption, RAR without
+    /// the `rar` feature, split ZIP).
+    #[error("{detail}")]
+    Unsupported { detail: String },
+    /// The archive is damaged: a CRC mismatch, a truncated volume.
+    #[error("archive is corrupt: {detail}")]
+    Corrupt { detail: String },
+    #[error("{operation} {path}: {source}")]
+    Io {
+        operation: &'static str,
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("extraction cancelled")]
+    Cancelled,
+}
 
 /// The `LinkResolver` registry and `DirectUrl` (`resolve`, Phase 4).
 #[derive(Debug, Error)]

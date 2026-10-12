@@ -29,6 +29,7 @@ async fn add_and_wait(
             dest_dir,
             sources: vec![url],
             priority: Priority::Normal,
+            post: Default::default(),
         })
         .await
         .unwrap_or_else(|error| panic!("driver: couldn't send AddPackage: {error}"));

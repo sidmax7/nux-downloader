@@ -3,7 +3,7 @@
 //! `Command` are `EngineState::handle`'s only way in.
 
 use crate::error::{ProbeError, StorageError, TransferError};
-use crate::model::{AttemptId, FileId, FileVersion, Link, PackageId, Priority};
+use crate::model::{AttemptId, FileId, FileVersion, Link, PackageId, PostOptions, Priority};
 use crate::probe::ProbeResult;
 use std::path::PathBuf;
 
@@ -23,6 +23,7 @@ pub enum Command {
         dest_dir: PathBuf,
         sources: Vec<String>,
         priority: Priority,
+        post: PostOptions,
     },
     /// Adds a package whose files were already probed (the collect stage,
     /// §5) — no probing happens again. A file whose probe failed becomes
@@ -32,6 +33,15 @@ pub enum Command {
         dest_dir: PathBuf,
         files: Vec<ProbedInput>,
         priority: Priority,
+        post: PostOptions,
+    },
+    /// Changes what happens after the package downloads (§12.4): the
+    /// "extract after download" and "delete archives after extraction"
+    /// checkboxes. Takes effect for the next step the package reaches.
+    SetPostOptions {
+        package: PackageId,
+        extract: bool,
+        delete_archives: bool,
     },
     /// Starts a failed file over from scratch (§10): its partial data is
     /// discarded and it is probed again.
@@ -143,6 +153,18 @@ pub enum Input {
     Reresolved {
         file: FileId,
         result: Result<ProbeResult, String>,
+    },
+    /// Verification of a package that reached `Verifying` finished
+    /// (`Effect::VerifyPackage`).
+    VerifyDone {
+        package: PackageId,
+        result: Result<crate::verify::VerifyReport, crate::verify::VerifyFailure>,
+    },
+    /// Extraction of a package finished (`Effect::Extract`); the error
+    /// is a human-readable reason.
+    ExtractDone {
+        package: PackageId,
+        result: Result<crate::extract::ExtractSummary, String>,
     },
     /// A fresh interface scan (P3.4): the complete set of usable links
     /// now. The driver sends it once at startup and again whenever the

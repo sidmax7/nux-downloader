@@ -80,6 +80,20 @@ pub enum EngineEvent {
     PackageDone {
         package: PackageId,
     },
+    /// Every file arrived; the package is being verified (§12.3).
+    PackageVerifying {
+        package: PackageId,
+    },
+    /// Extraction started (§12.4).
+    PackageExtracting {
+        package: PackageId,
+    },
+    /// Extraction progress, announced by the driver as bytes are written.
+    ExtractProgress {
+        package: PackageId,
+        bytes_done: u64,
+        bytes_total: u64,
+    },
     PackageRemoved {
         package: PackageId,
     },
@@ -152,6 +166,32 @@ pub enum Effect {
     /// already made those bytes crash-safe.
     Finalize {
         file: FileId,
+    },
+    /// Verify a package whose files are all on disk (§12.3); reported
+    /// back as `Input::VerifyDone`. The driver first waits for every
+    /// earlier rename to land.
+    VerifyPackage {
+        package: PackageId,
+        dest_dir: PathBuf,
+        files: Vec<crate::verify::VerifyFile>,
+    },
+    /// Extract a verified package's archive (§12.4); progress is
+    /// announced as events and the end is reported as `Input::ExtractDone`.
+    Extract {
+        package: PackageId,
+        spec: crate::extract::ExtractSpec,
+    },
+    /// Stop verification or extraction of a package that was cancelled
+    /// or removed.
+    CancelPost {
+        package: PackageId,
+    },
+    /// Deletes files from a directory: archives after a successful
+    /// extraction, or a file that failed verification (so a restart
+    /// fetches it afresh). Fire-and-forget.
+    DeleteFiles {
+        dest_dir: PathBuf,
+        names: Vec<String>,
     },
     Emit(EngineEvent),
     /// A hint that a timer should fire no later than this instant (retry

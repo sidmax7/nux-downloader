@@ -272,6 +272,9 @@ struct Worker {
     open_files: HashMap<FileId, OpenFile>,
     running: HashMap<AttemptId, RunningAttempt>,
     input_tx: mpsc::Sender<Input>,
+    events_tx: broadcast::Sender<EngineEvent>,
+    /// Cancel flags of the verification / extraction running per package.
+    post_cancel: HashMap<crate::model::PackageId, Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl Worker {
@@ -303,6 +306,8 @@ impl Worker {
             open_files: HashMap::new(),
             running: HashMap::new(),
             input_tx,
+            events_tx,
+            post_cancel: HashMap::new(),
         }
     }
 
@@ -565,12 +570,114 @@ impl Worker {
             Effect::Emit(event) => {
                 let _ = self.lane.send(LaneJob::Emit(event));
             }
+            Effect::VerifyPackage {
+                package,
+                dest_dir,
+                files,
+            } => self.spawn_verify(package, dest_dir, files),
+            Effect::Extract { package, spec } => self.spawn_extract(package, spec),
+            Effect::CancelPost { package } => {
+                if let Some(flag) = self.post_cancel.remove(&package) {
+                    flag.store(true, Ordering::Relaxed);
+                }
+            }
+            Effect::DeleteFiles { dest_dir, names } => {
+                // Awaited, so the deletion has happened by the time the
+                // `PackageDone` that follows it is announced.
+                let _ = tokio::task::spawn_blocking(move || {
+                    for name in names {
+                        // Only plain names in the package's directory.
+                        if name.contains(['/', '\\']) || name == ".." {
+                            continue;
+                        }
+                        let _ = std::fs::remove_file(dest_dir.join(&name));
+                    }
+                })
+                .await;
+            }
             Effect::WakeAt(_) => {
                 // The tick cadence already re-checks every block's backoff
                 // against `now` (see `Effect::WakeAt`'s doc comment) — no
                 // action needed for correctness.
             }
         }
+    }
+
+    /// A fresh cancel flag for `package`'s post-processing.
+    fn post_flag(
+        &mut self,
+        package: crate::model::PackageId,
+    ) -> Arc<std::sync::atomic::AtomicBool> {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        if let Some(old) = self.post_cancel.insert(package, flag.clone()) {
+            old.store(true, Ordering::Relaxed);
+        }
+        flag
+    }
+
+    /// Verifies a package on the blocking pool, once every rename issued
+    /// before it has landed on the lane.
+    fn spawn_verify(
+        &mut self,
+        package: crate::model::PackageId,
+        dest_dir: PathBuf,
+        files: Vec<crate::verify::VerifyFile>,
+    ) {
+        let cancel = self.post_flag(package);
+        let (reached, wait) = oneshot::channel();
+        let _ = self.lane.send(LaneJob::Barrier(reached));
+        let input_tx = self.input_tx.clone();
+        tokio::spawn(async move {
+            let _ = wait.await;
+            let result = tokio::task::spawn_blocking(move || {
+                crate::verify::verify_package(&dest_dir, &files, &cancel)
+            })
+            .await
+            .unwrap_or_else(|error| {
+                Err(crate::verify::VerifyFailure {
+                    file: None,
+                    corrupt: false,
+                    detail: format!("verification task failed: {error}"),
+                })
+            });
+            let _ = input_tx.send(Input::VerifyDone { package, result }).await;
+        });
+    }
+
+    /// Extracts a package's archive on the blocking pool, announcing
+    /// progress (at most ~10 times a second) as it goes.
+    fn spawn_extract(
+        &mut self,
+        package: crate::model::PackageId,
+        spec: crate::extract::ExtractSpec,
+    ) {
+        let cancel = self.post_flag(package);
+        let input_tx = self.input_tx.clone();
+        let events_tx = self.events_tx.clone();
+        tokio::spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                let mut last = Instant::now();
+                let mut progress = |p: crate::extract::ExtractProgress| {
+                    if last.elapsed() >= std::time::Duration::from_millis(100) {
+                        last = Instant::now();
+                        let _ = events_tx.send(EngineEvent::ExtractProgress {
+                            package,
+                            bytes_done: p.bytes_done,
+                            bytes_total: p.bytes_total,
+                        });
+                    }
+                };
+                crate::extract::extract(&spec, &cancel, &mut progress)
+            })
+            .await
+            .unwrap_or_else(|error| {
+                Err(crate::error::ExtractError::Unsupported {
+                    detail: format!("extraction task failed: {error}"),
+                })
+            });
+            let result = result.map_err(|error| error.to_string());
+            let _ = input_tx.send(Input::ExtractDone { package, result }).await;
+        });
     }
 
     /// Resolves `source` again and probes what it yields, so a signed URL

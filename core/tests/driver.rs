@@ -26,6 +26,7 @@ async fn run_to_completion(driver: &Driver, dest_dir: std::path::PathBuf, url: S
             dest_dir,
             sources: vec![url],
             priority: Priority::Normal,
+            post: Default::default(),
         })
         .await
         .unwrap_or_else(|error| panic!("driver: couldn't send AddPackage: {error}"));
@@ -254,6 +255,7 @@ async fn resumes_from_a_checkpoint_after_a_simulated_crash() {
                 dest_dir: dest.path().to_path_buf(),
                 sources: vec![origin.url()],
                 priority: Priority::Normal,
+                post: Default::default(),
             })
             .await
             .unwrap_or_else(|error| panic!("command: {error}"));

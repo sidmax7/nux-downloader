@@ -8,7 +8,7 @@ use crate::config::EngineConfig;
 use crate::driver::Driver;
 use crate::engine::{Command, EngineEvent, EngineSnapshot, EngineState, ProbedInput};
 use crate::error::{EngineError, StorageError};
-use crate::model::{FileId, Link, LinkId, LinkKind, PackageId, Priority};
+use crate::model::{FileId, Link, LinkId, LinkKind, PackageId, PostOptions, Priority};
 use crate::net::bind::BindPolicy;
 use crate::net::monitor::LinkSetup;
 use crate::resolve::Registry;
@@ -27,6 +27,29 @@ pub struct AddOptions {
     pub name: String,
     pub dest_dir: PathBuf,
     pub priority: Priority,
+    /// Extract the archive once it has downloaded (§12.4). Only
+    /// meaningful for a package that is an archive; a shell offers it
+    /// whenever `PackageDraft::offers_extract`.
+    pub extract: bool,
+    /// Delete the archive files after a successful extraction. Separate
+    /// from `extract`, and off unless asked for.
+    pub delete_archives: bool,
+}
+
+impl AddOptions {
+    /// The options a shell pre-fills for a reviewed draft: its own name,
+    /// normal priority, and "extract after download" ticked when it looks
+    /// like an archive. Archives are never deleted unless asked.
+    #[must_use]
+    pub fn for_draft(draft: &PackageDraft, dest_dir: PathBuf) -> Self {
+        Self {
+            name: draft.name.clone(),
+            dest_dir,
+            priority: Priority::Normal,
+            extract: draft.offers_extract(),
+            delete_archives: false,
+        }
+    }
 }
 
 /// Which package(s) a `pause`/`resume`/`cancel`/`remove` call applies to.
@@ -236,6 +259,11 @@ impl Engine {
                     })
                     .collect(),
                 priority: opts.priority,
+                post: PostOptions {
+                    archive: draft.archive,
+                    extract: opts.extract,
+                    delete_archives: opts.delete_archives,
+                },
             })
             .await
             .map_err(|_| shutdown_error())?;
@@ -249,36 +277,77 @@ impl Engine {
         Ok(package)
     }
 
-    /// Adds one package containing one file per source URL, and returns
-    /// its id. §15's signature returns `Vec<PackageId>` for when a batch
-    /// of inputs splits into several packages (grouping, §12.1) — that
-    /// split doesn't exist before Phase 5, so this always returns exactly
-    /// one id for now.
+    /// Adds the sources as packages: each multi-part archive set found
+    /// among their file names (§12.1) becomes its own package, and every
+    /// other source shares one package named `opts.name`. Names come from
+    /// the URLs, since nothing is probed yet. Returns the ids in that
+    /// order.
     pub async fn add(
         &self,
         sources: Vec<String>,
         opts: AddOptions,
     ) -> Result<Vec<PackageId>, EngineError> {
+        let names: Vec<String> = sources
+            .iter()
+            .map(|source| {
+                url::Url::parse(source)
+                    .map(|url| crate::probe::filename_from_url(&url))
+                    .unwrap_or_else(|_| "download".to_string())
+            })
+            .collect();
+        let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let groups = crate::group::group_names(&name_refs);
+
         let mut events = self.driver.subscribe();
-        self.driver
-            .command(Command::AddPackage {
-                name: opts.name,
-                dest_dir: opts.dest_dir,
-                sources,
-                priority: opts.priority,
+        let mut ids = Vec::new();
+        for group in groups {
+            let name = match &group.archive {
+                Some(archive) => archive.base_name.clone(),
+                None => opts.name.clone(),
+            };
+            let post = PostOptions {
+                extract: opts.extract && group.archive.is_some(),
+                delete_archives: opts.delete_archives,
+                archive: group.archive,
+            };
+            self.driver
+                .command(Command::AddPackage {
+                    name,
+                    dest_dir: opts.dest_dir.clone(),
+                    sources: group.members.iter().map(|&i| sources[i].clone()).collect(),
+                    priority: opts.priority,
+                    post,
+                })
+                .await
+                .map_err(|_| shutdown_error())?;
+            let package = wait_for(&mut events, |event| match event {
+                EngineEvent::PackageAdded { package } => Some(*package),
+                _ => None,
             })
             .await
-            .map_err(|_| shutdown_error())?;
-
-        let package = wait_for(&mut events, |event| match event {
-            EngineEvent::PackageAdded { package } => Some(*package),
-            _ => None,
-        })
-        .await
-        .ok_or_else(shutdown_error)?;
-
+            .ok_or_else(shutdown_error)?;
+            ids.push(package);
+        }
         self.save_queue().await?;
-        Ok(vec![package])
+        Ok(ids)
+    }
+
+    /// Changes a package's "extract after download" and "delete archives
+    /// after extraction" options.
+    pub async fn set_post_options(
+        &self,
+        package: PackageId,
+        extract: bool,
+        delete_archives: bool,
+    ) -> Result<(), EngineError> {
+        self.driver
+            .command(Command::SetPostOptions {
+                package,
+                extract,
+                delete_archives,
+            })
+            .await
+            .map_err(|_| shutdown_error())
     }
 
     pub async fn pause(&self, target: Target) -> Result<(), EngineError> {

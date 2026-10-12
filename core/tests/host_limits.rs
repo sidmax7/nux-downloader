@@ -30,6 +30,7 @@ async fn run(driver: &Driver, dest: &std::path::Path, sources: Vec<String>) {
             dest_dir: dest.to_path_buf(),
             sources,
             priority: Priority::Normal,
+            post: Default::default(),
         })
         .await
         .unwrap_or_else(|e| panic!("AddPackage: {e}"));

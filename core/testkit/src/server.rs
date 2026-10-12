@@ -43,6 +43,10 @@ pub struct OriginOptions {
     /// multi-link tests get one "network" per origin-side source
     /// address without needing a real second interface.
     pub bind_addr: SocketAddr,
+    /// Serve exactly these bytes (and report `size = body.len()`)
+    /// instead of generated content — for archives and other fixtures
+    /// whose contents matter.
+    pub body: Option<std::sync::Arc<Vec<u8>>>,
 }
 
 impl Default for OriginOptions {
@@ -57,7 +61,30 @@ impl Default for OriginOptions {
             content_disposition: None,
             extra_headers: Vec::new(),
             bind_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0),
+            body: None,
         }
+    }
+}
+
+/// `len` bytes at `start` of the served content: the fixed body if there
+/// is one, otherwise the seeded generator.
+fn served_bytes(
+    body: &Option<std::sync::Arc<Vec<u8>>>,
+    seed: u64,
+    start: u64,
+    len: u64,
+) -> Vec<u8> {
+    match body {
+        Some(bytes) => {
+            let from = usize::try_from(start)
+                .unwrap_or(usize::MAX)
+                .min(bytes.len());
+            let to = usize::try_from(start.saturating_add(len))
+                .unwrap_or(usize::MAX)
+                .min(bytes.len());
+            bytes[from..to].to_vec()
+        }
+        None => content_range(seed, start, len),
     }
 }
 
@@ -173,7 +200,10 @@ pub struct Origin {
 impl Origin {
     /// Starts listening immediately; the returned `Origin` is ready to
     /// take requests.
-    pub async fn start(options: OriginOptions) -> Self {
+    pub async fn start(mut options: OriginOptions) -> Self {
+        if let Some(body) = &options.body {
+            options.size = body.len() as u64;
+        }
         let listener = tokio::net::TcpListener::bind(options.bind_addr)
             .await
             .unwrap_or_else(|error| {
@@ -650,6 +680,7 @@ fn build_content_response(
     }
 
     let seed = options.seed;
+    let body = options.body.clone();
     let fault = fault.clone();
     let stream = async_stream::stream! {
         let _guard = guard;
@@ -681,7 +712,7 @@ fn build_content_response(
                 let cap = (*n).min(full_len);
                 while sent < cap {
                     let chunk_len = clip_to_hold!((cap - sent).min(4096));
-                    let bytes = Bytes::from(content_range(seed, serve_start + sent, chunk_len));
+                    let bytes = Bytes::from(served_bytes(&body, seed, serve_start + sent, chunk_len));
                     sent += chunk_len;
                     bytes_sent.store(sent, std::sync::atomic::Ordering::Relaxed);
                     yield Ok(bytes);
@@ -693,7 +724,7 @@ fn build_content_response(
                 let cap = (*n).min(full_len);
                 while sent < cap {
                     let chunk_len = clip_to_hold!((cap - sent).min(4096));
-                    let bytes = Bytes::from(content_range(seed, serve_start + sent, chunk_len));
+                    let bytes = Bytes::from(served_bytes(&body, seed, serve_start + sent, chunk_len));
                     sent += chunk_len;
                     bytes_sent.store(sent, std::sync::atomic::Ordering::Relaxed);
                     yield Ok(bytes);
@@ -711,7 +742,7 @@ fn build_content_response(
                 let delay = Duration::from_millis(100);
                 while sent < full_len {
                     let chunk_len = clip_to_hold!(chunk.min(full_len - sent));
-                    let bytes = Bytes::from(content_range(seed, serve_start + sent, chunk_len));
+                    let bytes = Bytes::from(served_bytes(&body, seed, serve_start + sent, chunk_len));
                     sent += chunk_len;
                     bytes_sent.store(sent, std::sync::atomic::Ordering::Relaxed);
                     yield Ok(bytes);
@@ -726,7 +757,7 @@ fn build_content_response(
                 let delay = Duration::from_secs_f64(piece as f64 / rate as f64);
                 while sent < full_len {
                     let chunk_len = clip_to_hold!(piece.min(full_len - sent));
-                    let bytes = Bytes::from(content_range(seed, serve_start + sent, chunk_len));
+                    let bytes = Bytes::from(served_bytes(&body, seed, serve_start + sent, chunk_len));
                     sent += chunk_len;
                     bytes_sent.store(sent, std::sync::atomic::Ordering::Relaxed);
                     yield Ok(bytes);
@@ -737,7 +768,7 @@ fn build_content_response(
             _ => {
                 while sent < full_len {
                     let chunk_len = clip_to_hold!((full_len - sent).min(64 * 1024));
-                    let bytes = Bytes::from(content_range(seed, serve_start + sent, chunk_len));
+                    let bytes = Bytes::from(served_bytes(&body, seed, serve_start + sent, chunk_len));
                     sent += chunk_len;
                     bytes_sent.store(sent, std::sync::atomic::Ordering::Relaxed);
                     yield Ok(bytes);

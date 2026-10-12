@@ -10,13 +10,13 @@ use crate::config::EngineConfig;
 use crate::error::{Blame, blame};
 use crate::model::{
     AttemptId, FileEntry, FileError, FileId, FileStatus, Link, LinkId, Package, PackageError,
-    PackageId, PackageStatus, PartStatus,
+    PackageId, PackageStatus, PartStatus, PostOptions,
 };
 use crate::net::health::{LinkHealth, LinkState};
 use crate::plan;
 use crate::sched;
 use crate::storage::manifest::{PackageManifest, QueueManifest};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 use url::Url;
 
@@ -117,6 +117,11 @@ pub struct EngineState {
     /// Files whose source is being re-resolved after a `403`/`410`;
     /// nothing new starts for them until it reports back.
     refreshing: HashSet<FileId>,
+    /// Verified packages waiting for the extraction pool (concurrency 1,
+    /// §12.4), in the order they became ready.
+    extract_queue: VecDeque<PackageId>,
+    /// The package being extracted now.
+    extracting: Option<PackageId>,
     /// Files that already used their one re-resolve (§13: "once").
     reresolved: HashSet<FileId>,
     attempts: HashMap<AttemptId, AttemptState>,
@@ -145,6 +150,8 @@ impl EngineState {
             written: HashMap::new(),
             idle: false,
             refreshing: HashSet::new(),
+            extract_queue: VecDeque::new(),
+            extracting: None,
             reresolved: HashSet::new(),
             attempts: HashMap::new(),
             blocks: HashMap::new(),
@@ -308,6 +315,13 @@ impl EngineState {
             {
                 package.status = PackageStatus::Paused;
             }
+            // Interrupted post-processing starts over from verification.
+            if matches!(
+                package.status,
+                PackageStatus::Verifying | PackageStatus::Extracting
+            ) {
+                package.status = PackageStatus::Downloading;
+            }
             for file in &mut package.files {
                 match file.status {
                     FileStatus::Active => {
@@ -348,6 +362,18 @@ impl EngineState {
             }
             state.packages.push(package);
         }
+        if !offline {
+            let ids: Vec<PackageId> = state.packages.iter().map(|p| p.id).collect();
+            for id in ids {
+                if state
+                    .package_ref(id)
+                    .is_some_and(|p| p.status == PackageStatus::Downloading)
+                {
+                    state.update_package_status(id, &mut effects);
+                }
+            }
+            state.pump_extract(&mut effects);
+        }
 
         (state, effects)
     }
@@ -384,6 +410,12 @@ impl EngineState {
             }
             Input::CheckpointDone { package, result } => {
                 self.handle_checkpoint_done(package, result, &mut effects);
+            }
+            Input::VerifyDone { package, result } => {
+                self.handle_verify_done(package, result, &mut effects);
+            }
+            Input::ExtractDone { package, result } => {
+                self.handle_extract_done(package, result, &mut effects);
             }
             Input::LinksChanged(links) => self.handle_links_changed(links, &mut effects),
         }
@@ -477,14 +509,41 @@ impl EngineState {
                 dest_dir,
                 sources,
                 priority,
-            } => self.add_package(name, dest_dir, sources, priority, now, effects),
+                post,
+            } => self.add_package(
+                NewPackage {
+                    name,
+                    dest_dir,
+                    priority,
+                    post,
+                },
+                sources,
+                now,
+                effects,
+            ),
             Command::Pause(package) => self.pause_package(package, now, effects),
             Command::AddProbed {
                 name,
                 dest_dir,
                 files,
                 priority,
-            } => self.add_probed(name, dest_dir, files, priority, now, effects),
+                post,
+            } => self.add_probed(
+                NewPackage {
+                    name,
+                    dest_dir,
+                    priority,
+                    post,
+                },
+                files,
+                now,
+                effects,
+            ),
+            Command::SetPostOptions {
+                package,
+                extract,
+                delete_archives,
+            } => self.set_post_options(package, extract, delete_archives, now, effects),
             Command::RestartFile(file) => self.restart_file(file, now, effects),
             Command::SetPriority { package, priority } => {
                 self.set_priority(package, priority, now, effects);
@@ -505,13 +564,17 @@ impl EngineState {
 
     fn add_package(
         &mut self,
-        name: String,
-        dest_dir: std::path::PathBuf,
+        new: NewPackage,
         sources: Vec<String>,
-        priority: crate::model::Priority,
         now: Instant,
         effects: &mut Vec<Effect>,
     ) {
+        let NewPackage {
+            name,
+            dest_dir,
+            priority,
+            post,
+        } = new;
         let package_id = self.alloc_package_id();
         let mut files = Vec::new();
         for source in sources {
@@ -546,9 +609,10 @@ impl EngineState {
                 }
             }
         }
-        let Some(package) = Package::new(package_id, name, dest_dir, files) else {
+        let Some(mut package) = Package::new(package_id, name, dest_dir, files) else {
             return;
         };
+        apply_post(&mut package, post);
         self.install_package(package, priority, now, effects);
     }
 
@@ -664,13 +728,17 @@ impl EngineState {
     /// probed, so it goes straight to `Queued` (§7.3).
     fn add_probed(
         &mut self,
-        name: String,
-        dest_dir: std::path::PathBuf,
+        new: NewPackage,
         inputs: Vec<super::input::ProbedInput>,
-        priority: crate::model::Priority,
         now: Instant,
         effects: &mut Vec<Effect>,
     ) {
+        let NewPackage {
+            name,
+            dest_dir,
+            priority,
+            post,
+        } = new;
         let package_id = self.alloc_package_id();
         let mut files = Vec::new();
         for input in inputs {
@@ -689,9 +757,10 @@ impl EngineState {
             }
             files.push(file);
         }
-        let Some(package) = Package::new(package_id, name, dest_dir, files) else {
+        let Some(mut package) = Package::new(package_id, name, dest_dir, files) else {
             return;
         };
+        apply_post(&mut package, post);
         self.install_package(package, priority, now, effects);
     }
 
@@ -733,6 +802,20 @@ impl EngineState {
         let Some(package) = self.package_mut(package_id) else {
             return;
         };
+        // A package whose verification or extraction failed retries that
+        // step; its files are all there.
+        if matches!(
+            package.status,
+            PackageStatus::Failed(
+                PackageError::VerifyFailed { .. } | PackageError::ExtractFailed { .. }
+            )
+        ) && package.all_files_verified()
+        {
+            package.status = PackageStatus::Downloading;
+            self.update_package_status(package_id, effects);
+            self.pump_extract(effects);
+            return;
+        }
         if package.status != PackageStatus::Paused {
             return;
         }
@@ -747,6 +830,7 @@ impl EngineState {
 
     fn cancel_package(&mut self, package_id: PackageId, now: Instant, effects: &mut Vec<Effect>) {
         self.abort_package_attempts(package_id, AbortReason::Cancel, effects);
+        self.stop_post(package_id, effects);
         let Some(package) = self.package_mut(package_id) else {
             return;
         };
@@ -802,6 +886,7 @@ impl EngineState {
 
     fn remove_package(&mut self, package_id: PackageId, effects: &mut Vec<Effect>) {
         self.abort_package_attempts(package_id, AbortReason::Cancel, effects);
+        self.stop_post(package_id, effects);
         let Some(&index) = self.package_index.get(&package_id) else {
             return;
         };
@@ -1262,7 +1347,10 @@ impl EngineState {
         file.parts.clear();
         // A package that failed only because of its failed files is
         // live again; one the user cancelled stays cancelled.
-        if package.status == PackageStatus::Failed(PackageError::FilesFailed) {
+        if matches!(
+            package.status,
+            PackageStatus::Failed(PackageError::FilesFailed | PackageError::VerifyFailed { .. })
+        ) {
             package.status = PackageStatus::Downloading;
         }
         self.blocks.retain(|(f, _), _| *f != file_id);
@@ -1648,15 +1736,15 @@ impl EngineState {
         };
         if matches!(
             package.status,
-            PackageStatus::Done | PackageStatus::Failed(_)
+            PackageStatus::Done
+                | PackageStatus::Failed(_)
+                | PackageStatus::Verifying
+                | PackageStatus::Extracting
         ) {
             return;
         }
         if package.all_files_verified() {
-            package.status = PackageStatus::Done;
-            effects.push(Effect::Emit(EngineEvent::PackageDone {
-                package: package_id,
-            }));
+            self.begin_post(package_id, effects);
             return;
         }
         let all_settled = package
@@ -1670,6 +1758,253 @@ impl EngineState {
                 error: PackageError::FilesFailed,
             }));
         }
+    }
+
+    // --- post-processing: verify, extract (§12.3, §12.4) ---
+
+    /// Every file is on disk: verify the package.
+    fn begin_post(&mut self, package_id: PackageId, effects: &mut Vec<Effect>) {
+        let Some(package) = self.package_mut(package_id) else {
+            return;
+        };
+        package.status = PackageStatus::Verifying;
+        let dest_dir = package.dest_dir.clone();
+        let files = package
+            .files
+            .iter()
+            .map(|file| crate::verify::VerifyFile {
+                name: file.name.clone(),
+                expected_size: file.expected_size,
+            })
+            .collect();
+        self.write_checkpoint(package_id, true, effects);
+        effects.push(Effect::Emit(EngineEvent::PackageVerifying {
+            package: package_id,
+        }));
+        effects.push(Effect::VerifyPackage {
+            package: package_id,
+            dest_dir,
+            files,
+        });
+    }
+
+    fn handle_verify_done(
+        &mut self,
+        package_id: PackageId,
+        result: Result<crate::verify::VerifyReport, crate::verify::VerifyFailure>,
+        effects: &mut Vec<Effect>,
+    ) {
+        let Some(package) = self.package_ref(package_id) else {
+            return;
+        };
+        if package.status != PackageStatus::Verifying {
+            return;
+        }
+        match result {
+            Ok(_) => {
+                let wants_extract = package.extract && package.archive.is_some();
+                if wants_extract {
+                    self.extract_queue.push_back(package_id);
+                    self.pump_extract(effects);
+                } else {
+                    self.finish_package(package_id, effects);
+                }
+            }
+            Err(failure) => {
+                let dest_dir = package.dest_dir.clone();
+                let bad_file = failure
+                    .file
+                    .as_ref()
+                    .and_then(|name| package.files.iter().position(|file| &file.name == name));
+                let detail = failure.detail.clone();
+                // A corrupt file is deleted and marked failed, so the
+                // user's "restart file" fetches it afresh.
+                if failure.corrupt
+                    && let Some(index) = bad_file
+                {
+                    let name = package.files[index].name.clone();
+                    self.fail_file(
+                        package_id,
+                        index,
+                        FileError::VerifyFailed {
+                            detail: detail.clone(),
+                        },
+                        effects,
+                    );
+                    effects.push(Effect::DeleteFiles {
+                        dest_dir,
+                        names: vec![name],
+                    });
+                }
+                self.fail_package(package_id, PackageError::VerifyFailed { detail }, effects);
+            }
+        }
+    }
+
+    /// Starts the next waiting extraction if the pool (one) is free.
+    fn pump_extract(&mut self, effects: &mut Vec<Effect>) {
+        while self.extracting.is_none() {
+            let Some(package_id) = self.extract_queue.pop_front() else {
+                return;
+            };
+            let Some(package) = self.package_ref(package_id) else {
+                continue;
+            };
+            if package.status != PackageStatus::Verifying {
+                continue;
+            }
+            let Some(spec) = self.extract_spec(package) else {
+                self.fail_package(
+                    package_id,
+                    PackageError::ExtractFailed {
+                        detail: "couldn't tell which files make up the archive".to_string(),
+                    },
+                    effects,
+                );
+                continue;
+            };
+            if let Some(package) = self.package_mut(package_id) {
+                package.status = PackageStatus::Extracting;
+            }
+            self.extracting = Some(package_id);
+            self.write_checkpoint(package_id, true, effects);
+            effects.push(Effect::Emit(EngineEvent::PackageExtracting {
+                package: package_id,
+            }));
+            effects.push(Effect::Extract {
+                package: package_id,
+                spec,
+            });
+        }
+    }
+
+    /// The archive's volumes, in reading order, among the package's
+    /// files (a checksum sidecar in the same package is not one).
+    fn extract_spec(&self, package: &Package) -> Option<crate::extract::ExtractSpec> {
+        let archive = package.archive.as_ref()?;
+        let names: Vec<&str> = package.files.iter().map(|f| f.name.as_str()).collect();
+        let group = crate::group::group_names(&names)
+            .into_iter()
+            .find(|g| g.archive.as_ref() == Some(archive))?;
+        Some(crate::extract::ExtractSpec {
+            scheme: archive.scheme,
+            base_name: archive.base_name.clone(),
+            volumes: group
+                .members
+                .iter()
+                .map(|&i| package.dest_dir.join(&package.files[i].name))
+                .collect(),
+            dest_dir: package.dest_dir.clone(),
+            limits: crate::extract::ExtractLimits::from_config(&self.config),
+        })
+    }
+
+    fn handle_extract_done(
+        &mut self,
+        package_id: PackageId,
+        result: Result<crate::extract::ExtractSummary, String>,
+        effects: &mut Vec<Effect>,
+    ) {
+        if self.extracting == Some(package_id) {
+            self.extracting = None;
+        }
+        let still_extracting = self
+            .package_ref(package_id)
+            .is_some_and(|p| p.status == PackageStatus::Extracting);
+        if still_extracting {
+            match result {
+                Ok(_) => {
+                    // Archives are deleted only after extraction
+                    // succeeded, and only the ones that were extracted.
+                    if let Some(package) = self.package_ref(package_id)
+                        && package.delete_archives
+                        && let Some(spec) = self.extract_spec(package)
+                    {
+                        let names = spec
+                            .volumes
+                            .iter()
+                            .filter_map(|v| v.file_name())
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .collect();
+                        effects.push(Effect::DeleteFiles {
+                            dest_dir: spec.dest_dir,
+                            names,
+                        });
+                    }
+                    self.finish_package(package_id, effects);
+                }
+                Err(detail) => {
+                    self.fail_package(package_id, PackageError::ExtractFailed { detail }, effects)
+                }
+            }
+        }
+        self.pump_extract(effects);
+    }
+
+    fn finish_package(&mut self, package_id: PackageId, effects: &mut Vec<Effect>) {
+        if let Some(package) = self.package_mut(package_id) {
+            package.status = PackageStatus::Done;
+        }
+        self.write_checkpoint(package_id, true, effects);
+        effects.push(Effect::Emit(EngineEvent::PackageDone {
+            package: package_id,
+        }));
+    }
+
+    fn fail_package(
+        &mut self,
+        package_id: PackageId,
+        error: PackageError,
+        effects: &mut Vec<Effect>,
+    ) {
+        if let Some(package) = self.package_mut(package_id) {
+            package.status = PackageStatus::Failed(error.clone());
+        }
+        self.write_checkpoint(package_id, true, effects);
+        effects.push(Effect::Emit(EngineEvent::PackageFailed {
+            package: package_id,
+            error,
+        }));
+    }
+
+    /// A cancelled or removed package leaves the post-processing queue,
+    /// and anything it has running is stopped.
+    fn stop_post(&mut self, package_id: PackageId, effects: &mut Vec<Effect>) {
+        self.extract_queue.retain(|id| *id != package_id);
+        let running = self.package_ref(package_id).is_some_and(|p| {
+            matches!(
+                p.status,
+                PackageStatus::Verifying | PackageStatus::Extracting
+            )
+        });
+        if running {
+            effects.push(Effect::CancelPost {
+                package: package_id,
+            });
+        }
+        if self.extracting == Some(package_id) {
+            self.extracting = None;
+            self.pump_extract(effects);
+        }
+    }
+
+    fn set_post_options(
+        &mut self,
+        package_id: PackageId,
+        extract: bool,
+        delete_archives: bool,
+        now: Instant,
+        effects: &mut Vec<Effect>,
+    ) {
+        let Some(package) = self.package_mut(package_id) else {
+            return;
+        };
+        if package.extract == extract && package.delete_archives == delete_archives {
+            return;
+        }
+        package.extract = extract;
+        package.delete_archives = delete_archives;
+        self.checkpoint_now(package_id, now, effects);
     }
 
     // --- scheduling (§7.2) ---
@@ -2029,4 +2364,19 @@ fn retry_backoff(config: &EngineConfig, attempt_n: u32) -> Duration {
     let exponent = attempt_n.saturating_sub(1).min(16);
     let scaled = config.retry_base_backoff.saturating_mul(1u32 << exponent);
     scaled.min(config.retry_max_backoff)
+}
+
+/// Applies a command's post-processing options to a new package.
+fn apply_post(package: &mut Package, post: PostOptions) {
+    package.archive = post.archive;
+    package.extract = post.extract && package.archive.is_some();
+    package.delete_archives = post.delete_archives;
+}
+
+/// What `AddPackage` / `AddProbed` share about the package they create.
+struct NewPackage {
+    name: String,
+    dest_dir: std::path::PathBuf,
+    priority: crate::model::Priority,
+    post: PostOptions,
 }

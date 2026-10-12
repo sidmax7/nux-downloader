@@ -75,6 +75,7 @@ pub async fn add(
     output: Option<PathBuf>,
     name: Option<String>,
     priority: Priority,
+    post: crate::PostFlags,
     data_dir: Option<PathBuf>,
 ) -> ExitCode {
     let inputs = match gather_inputs(urls, input) {
@@ -108,6 +109,8 @@ pub async fn add(
                 name,
                 dest_dir,
                 priority,
+                extract: post.extract,
+                delete_archives: post.delete_archives,
             },
         )
         .await;
@@ -120,6 +123,44 @@ pub async fn add(
         }
         Err(error) => {
             eprintln!("nuxd add: {error}");
+            ExitCode::from(2)
+        }
+    };
+    engine.shutdown().await;
+    code
+}
+
+/// Changes a package's extraction options.
+pub async fn options(
+    id: PackageId,
+    extract: Option<bool>,
+    delete_archives: Option<bool>,
+    data_dir: Option<PathBuf>,
+) -> ExitCode {
+    let Some(engine) = open(data_dir).await else {
+        return ExitCode::from(2);
+    };
+    let snapshot = engine.snapshot().await;
+    let Some(package) = snapshot.packages.iter().find(|p| p.id == id) else {
+        eprintln!("nuxd options: no package {id}");
+        engine.shutdown().await;
+        return ExitCode::from(2);
+    };
+    if package.archive.is_none() {
+        eprintln!("nuxd options: package {id} doesn't look like an archive; nothing to extract");
+        engine.shutdown().await;
+        return ExitCode::from(2);
+    }
+    let extract = extract.unwrap_or(package.extract);
+    let delete_archives = delete_archives.unwrap_or(package.delete_archives);
+    let result = engine.set_post_options(id, extract, delete_archives).await;
+    let code = match result {
+        Ok(()) => {
+            println!("package {id}: extract {extract}, delete archives {delete_archives}");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("nuxd options: {error}");
             ExitCode::from(2)
         }
     };
@@ -161,7 +202,7 @@ pub async fn queue(verbose: bool, data_dir: Option<PathBuf>) -> ExitCode {
             status_text(&package.status),
             package.files.len(),
             progress,
-            package.name,
+            name_with_options(package),
         );
         if verbose {
             for file in &package.files {
@@ -182,6 +223,20 @@ pub async fn queue(verbose: bool, data_dir: Option<PathBuf>) -> ExitCode {
     }
     engine.shutdown().await;
     ExitCode::SUCCESS
+}
+
+/// The package name, tagged with what happens to its archive.
+fn name_with_options(package: &nuxd_core::model::Package) -> String {
+    match (
+        package.archive.is_some(),
+        package.extract,
+        package.delete_archives,
+    ) {
+        (false, ..) => package.name.clone(),
+        (true, false, _) => format!("{} [archive]", package.name),
+        (true, true, false) => format!("{} [extract]", package.name),
+        (true, true, true) => format!("{} [extract, delete archives]", package.name),
+    }
 }
 
 fn status_text(status: &PackageStatus) -> String {

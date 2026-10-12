@@ -79,6 +79,20 @@ struct StartOpts {
     only_links: Option<Vec<String>>,
 }
 
+/// What to do with archives once they have downloaded (they are
+/// recognised by name: `.rar`/`.partN.rar`, `.zip`, `.7z`/`.7z.NNN`,
+/// `.NNN`). The two options are independent.
+#[derive(clap::Args, Clone, Copy, Default)]
+pub struct PostFlags {
+    /// Extract archives after they download and verify.
+    #[arg(long)]
+    extract: bool,
+    /// Delete the archive files after a successful extraction (needs
+    /// `--extract`; never happens when extraction fails).
+    #[arg(long)]
+    delete_archives: bool,
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Downloads one or more URLs as a single package and waits for it
@@ -94,6 +108,8 @@ enum Command {
         /// `nuxd links` shows them). Default: every usable link.
         #[arg(long, value_delimiter = ',', value_name = "NAMES")]
         links: Option<Vec<String>>,
+        #[command(flatten)]
+        post: PostFlags,
     },
     /// Lists the network links (interfaces) downloads can use.
     Links,
@@ -114,6 +130,17 @@ enum Command {
         name: Option<String>,
         #[arg(long, value_enum, default_value = "normal")]
         priority: PriorityArg,
+        #[command(flatten)]
+        post: PostFlags,
+    },
+    /// Changes what happens to a package's archive after it downloads:
+    /// `nuxd options 3 --extract true --delete-archives false`.
+    Options {
+        id: u64,
+        #[arg(long, value_name = "BOOL")]
+        extract: Option<bool>,
+        #[arg(long, value_name = "BOOL")]
+        delete_archives: Option<bool>,
     },
     /// Lists the queue: every package with its priority, status and
     /// progress (`-v` adds each file).
@@ -169,9 +196,10 @@ async fn main() -> ExitCode {
             urls,
             output,
             links,
+            post,
         } => {
             opts.only_links = links;
-            run_get(urls, output, opts).await
+            run_get(urls, output, post, opts).await
         }
         Command::Links => run_links().await,
         Command::Add {
@@ -180,7 +208,24 @@ async fn main() -> ExitCode {
             output,
             name,
             priority,
-        } => manage::add(urls, input, output, name, priority.into(), opts.data_dir).await,
+            post,
+        } => {
+            manage::add(
+                urls,
+                input,
+                output,
+                name,
+                priority.into(),
+                post,
+                opts.data_dir,
+            )
+            .await
+        }
+        Command::Options {
+            id,
+            extract,
+            delete_archives,
+        } => manage::options(PackageId::new(id), extract, delete_archives, opts.data_dir).await,
         Command::Queue { verbose } => manage::queue(verbose, opts.data_dir).await,
         Command::Pause { target } => match manage::parse_target(&target) {
             Ok(target) => manage::pause(target, opts.data_dir).await,
@@ -300,7 +345,12 @@ async fn check_requested_links(names: &[String]) -> bool {
     true
 }
 
-async fn run_get(urls: Vec<String>, output: Option<PathBuf>, opts: StartOpts) -> ExitCode {
+async fn run_get(
+    urls: Vec<String>,
+    output: Option<PathBuf>,
+    post: PostFlags,
+    opts: StartOpts,
+) -> ExitCode {
     if urls.is_empty() {
         eprintln!("nuxd get: at least one URL is required");
         return ExitCode::from(2);
@@ -332,6 +382,8 @@ async fn run_get(urls: Vec<String>, output: Option<PathBuf>, opts: StartOpts) ->
                 name,
                 dest_dir,
                 priority: nuxd_core::model::Priority::Normal,
+                extract: post.extract,
+                delete_archives: post.delete_archives,
             },
         )
         .await
@@ -400,6 +452,8 @@ async fn run_resume(targets: Vec<String>, opts: StartOpts) -> ExitCode {
 async fn wait_for_packages(engine: Engine, ids: Vec<PackageId>) -> ExitCode {
     let mut bars = progress::Bars::new();
     let mut all_ok = true;
+    let mut announced: std::collections::HashMap<PackageId, &'static str> =
+        std::collections::HashMap::new();
 
     loop {
         let tick = tokio::time::sleep(Duration::from_millis(250));
@@ -421,6 +475,16 @@ async fn wait_for_packages(engine: Engine, ids: Vec<PackageId>) -> ExitCode {
                 continue;
             };
             bars.update(package);
+            let phase = match package.status {
+                PackageStatus::Verifying => Some("verifying"),
+                PackageStatus::Extracting => Some("extracting"),
+                _ => None,
+            };
+            if let Some(phase) = phase
+                && announced.insert(id, phase) != Some(phase)
+            {
+                bars.say(&format!("nuxd: {phase} {}", package.name));
+            }
             match package.status {
                 PackageStatus::Done => {}
                 PackageStatus::Failed(_) => all_ok = false,

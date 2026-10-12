@@ -13,5 +13,5 @@ pub use byte::{ByteRange, ByteRate};
 pub use file::{BlockLayout, FileEntry, FileError, FileStatus, FileVersion, PartStatus};
 pub use ids::{AttemptId, FileId, LinkId, PackageId};
 pub use link::{Link, LinkKind};
-pub use package::{ArchiveScheme, ArchiveSet, Package, PackageError, PackageStatus};
+pub use package::{ArchiveScheme, ArchiveSet, Package, PackageError, PackageStatus, PostOptions};
 pub use priority::Priority;

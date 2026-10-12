@@ -27,6 +27,7 @@ async fn download(origin: &Origin, dest: &std::path::Path) -> Duration {
             dest_dir: dest.to_path_buf(),
             sources: vec![origin.url()],
             priority: Priority::Normal,
+            post: Default::default(),
         })
         .await
         .unwrap_or_else(|e| panic!("AddPackage: {e}"));

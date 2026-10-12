@@ -8,6 +8,8 @@
 //! pasting hundreds of links never opens hundreds of connections.
 
 use crate::config::EngineConfig;
+use crate::group::group_names;
+use crate::model::ArchiveSet;
 use crate::probe::{self, ProbeResult};
 use crate::resolve::{Registry, ResolveContext};
 use std::collections::HashMap;
@@ -24,16 +26,27 @@ pub struct DraftFile {
     pub probe: Result<ProbeResult, String>,
 }
 
-/// A package waiting for the user's go-ahead. Grouping into several
-/// drafts (multi-part archives, §12) arrives in Phase 5; until then one
-/// `collect` call yields one draft.
+/// A package waiting for the user's go-ahead. Archive sets (§12.1) each
+/// get their own draft, files in volume order; every other file in the
+/// batch shares one draft.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PackageDraft {
     pub name: String,
     pub files: Vec<DraftFile>,
+    /// Set when the files form (or are) an archive.
+    pub archive: Option<ArchiveSet>,
+    /// 1-based volumes the set is missing ("volume 7 missing").
+    pub missing_volumes: Vec<u32>,
 }
 
 impl PackageDraft {
+    /// Whether a shell should offer "extract after download" for this
+    /// draft: it appears to be an archive.
+    #[must_use]
+    pub fn offers_extract(&self) -> bool {
+        self.archive.is_some()
+    }
+
     /// Files that probed successfully.
     #[must_use]
     pub fn ok_count(&self) -> usize {
@@ -114,9 +127,41 @@ pub async fn collect(
         return Vec::new();
     }
 
-    let name = files
-        .iter()
-        .find_map(|f| f.probe.as_ref().ok().map(|p| p.suggested_name.clone()))
-        .unwrap_or_else(|| "download".to_string());
-    vec![PackageDraft { name, files }]
+    let names: Vec<String> = files.iter().map(file_name).collect();
+    let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let mut slots: Vec<Option<DraftFile>> = files.into_iter().map(Some).collect();
+    let mut drafts = Vec::new();
+    for group in group_names(&name_refs) {
+        let members: Vec<DraftFile> = group
+            .members
+            .iter()
+            .filter_map(|&i| slots[i].take())
+            .collect();
+        let name = match &group.archive {
+            Some(archive) => archive.base_name.clone(),
+            None => members
+                .iter()
+                .find_map(|f| f.probe.as_ref().ok().map(|p| p.suggested_name.clone()))
+                .unwrap_or_else(|| "download".to_string()),
+        };
+        drafts.push(PackageDraft {
+            name,
+            files: members,
+            archive: group.archive,
+            missing_volumes: group.missing,
+        });
+    }
+    drafts
+}
+
+/// The name grouping sees: the probed name, or for a failed probe the
+/// last path segment of the source.
+fn file_name(file: &DraftFile) -> String {
+    match &file.probe {
+        Ok(probe) => probe.suggested_name.clone(),
+        Err(_) => url::Url::parse(&file.source)
+            .ok()
+            .and_then(|u| u.path_segments()?.next_back().map(str::to_string))
+            .unwrap_or_else(|| file.source.clone()),
+    }
 }

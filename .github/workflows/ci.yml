@@ -49,6 +49,11 @@ jobs:
         run: |
           for n in 2 3 4; do sudo ifconfig lo0 alias 127.0.0.$n up; done
       - run: cargo test --workspace --all-targets
+      # RAR extraction builds the UnRAR C++ sources, so it is its own
+      # (opt-in) feature; exercise it where a C++ toolchain is certain.
+      - name: Test with RAR support
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo test -p nuxd-core --features rar --test extract
 
   deny:
     name: cargo-deny

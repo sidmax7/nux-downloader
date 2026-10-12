@@ -7,6 +7,8 @@ pub mod config;
 pub mod driver;
 pub mod engine;
 pub mod error;
+pub mod extract;
+pub mod group;
 pub mod model;
 pub mod net;
 pub mod plan;
@@ -14,6 +16,7 @@ pub mod probe;
 pub mod resolve;
 pub mod sched;
 pub mod storage;
+pub mod verify;
 pub mod version;
 
 pub use api::{AddOptions, Engine, Target};

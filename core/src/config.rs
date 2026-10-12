@@ -168,6 +168,13 @@ pub struct EngineConfig {
     pub max_concurrent_probes: u32,
     /// Probes in flight at once to one host.
     pub max_probes_per_host: u32,
+    /// Extraction safety limits (§12.4). An archive that would write more
+    /// than `max_extract_bytes` in total, more than `max_extract_ratio`
+    /// times its own size (once past 1 GiB), or more than
+    /// `max_extract_entries` entries is refused as a likely bomb.
+    pub max_extract_bytes: u64,
+    pub max_extract_ratio: u64,
+    pub max_extract_entries: u64,
     pub soft_max_connections_per_file: u32,
 
     // --- Block planning (§7.4) ---
@@ -226,6 +233,9 @@ impl Default for EngineConfig {
             max_connections_total: 32,
             max_concurrent_probes: 8,
             max_probes_per_host: 2,
+            max_extract_bytes: 512 * 1024 * 1024 * 1024,
+            max_extract_ratio: 1000,
+            max_extract_entries: 1_000_000,
             soft_max_connections_per_file: 8,
 
             single_block_threshold_bytes: 4 * 1024 * 1024,

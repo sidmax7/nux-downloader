@@ -5,9 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::PathBuf;
 
-/// Set by multi-part archive grouping (§12.1, Phase 5). Kept minimal for
-/// now — extraction detail is added once Phase 5 settles whether
-/// extraction ships at all (see `IMPLEMENTATION_PLAN.md`).
+/// Set by multi-part archive grouping (§12.1).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArchiveSet {
     pub scheme: ArchiveScheme,
@@ -15,13 +13,23 @@ pub struct ArchiveSet {
     pub base_name: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ArchiveScheme {
     Rar,
     RarLegacy,
     SevenZip,
     SplitZip,
     GenericSplit,
+}
+
+/// What to do with a package once it has downloaded and verified
+/// (§12.4). `extract` and `delete_archives` are independent options:
+/// the second applies only after a successful extraction.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PostOptions {
+    pub archive: Option<ArchiveSet>,
+    pub extract: bool,
+    pub delete_archives: bool,
 }
 
 /// Why a package failed — a serializable summary, same rationale as
@@ -78,6 +86,12 @@ pub struct Package {
     /// Never empty — see `Package::new`.
     pub files: Vec<FileEntry>,
     pub archive: Option<ArchiveSet>,
+    /// Extract the archive once it has downloaded and verified.
+    #[serde(default)]
+    pub extract: bool,
+    /// Delete the archive files after a successful extraction.
+    #[serde(default)]
+    pub delete_archives: bool,
     pub limit: Option<ByteRate>,
     pub status: PackageStatus,
 }
@@ -104,6 +118,8 @@ impl Package {
             priority: Priority::default(),
             files,
             archive: None,
+            extract: false,
+            delete_archives: false,
             limit: None,
             status: PackageStatus::Queued,
         })

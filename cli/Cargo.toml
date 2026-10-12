@@ -24,3 +24,4 @@ indicatif = "0.18"
 [dev-dependencies]
 nuxd-testkit = { workspace = true }
 tempfile = "3"
+zip = { version = "9", default-features = false, features = ["deflate"] }

@@ -39,6 +39,7 @@ async fn twenty_files_through_three_slots_all_complete() {
             dest_dir: dest.path().to_path_buf(),
             sources: (0..20).map(|_| origin.url()).collect(),
             priority: Priority::Normal,
+            post: Default::default(),
         })
         .await
         .unwrap_or_else(|e| panic!("AddPackage: {e}"));
