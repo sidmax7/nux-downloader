@@ -87,10 +87,15 @@ async fn run_lane(
                 }
             }
             LaneJob::Finalize { file, open } => {
+                // `open` moves into the task and is dropped there, so the
+                // file is closed by the time `FinalizeDone` is sent.
                 match tokio::task::spawn_blocking(move || prepare::finish(&open)).await {
                     Ok(Ok(())) => {}
                     Ok(Err(error)) => warn!("driver: finalize failed for {file:?}: {error}"),
                     Err(error) => warn!("driver: finalize task panicked for {file:?}: {error}"),
+                }
+                if let Some(tx) = input_tx.upgrade() {
+                    let _ = tx.send(Input::FinalizeDone { file }).await;
                 }
             }
             LaneJob::Emit(event) => {
@@ -585,6 +590,10 @@ impl Worker {
             Effect::Finalize { file } => {
                 if let Some(open) = self.open_files.remove(&file) {
                     let _ = self.lane.send(LaneJob::Finalize { file, open });
+                } else {
+                    // Nothing open to finish; the engine still counts it.
+                    let more = self.state.handle(Input::FinalizeDone { file }, now);
+                    queue.extend(more);
                 }
             }
             Effect::Emit(event) => {

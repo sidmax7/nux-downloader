@@ -146,6 +146,13 @@ pub enum Input {
         package: PackageId,
         result: Result<(), StorageError>,
     },
+    /// A file's `Effect::Finalize` has run on the durability lane, and its
+    /// open handle is closed. Sent whether the rename worked or not (a
+    /// failure is logged by the driver); the engine only counts what is
+    /// still waiting (§7.3, Decision 30).
+    FinalizeDone {
+        file: FileId,
+    },
     /// A response's validators differed from every accepted version, but
     /// sampling durable bytes showed the file is identical (§10): the
     /// new version is recorded and later attempts accept it.

@@ -165,6 +165,10 @@ pub struct EngineState {
     extracting: Option<PackageId>,
     /// Files that already used their one re-resolve (§13: "once").
     reresolved: HashSet<FileId>,
+    /// Files whose `Finalize` hasn't been reported done yet: each still
+    /// holds an open file in the driver. Activation waits while there are
+    /// `max_pending_finalizes` of them (§7.3, Decision 30).
+    finalizing: HashSet<FileId>,
     attempts: HashMap<AttemptId, AttemptState>,
     blocks: HashMap<(FileId, u32), BlockRuntime>,
     checkpoints: HashMap<PackageId, CheckpointState>,
@@ -194,6 +198,7 @@ impl EngineState {
             extract_queue: VecDeque::new(),
             extracting: None,
             reresolved: HashSet::new(),
+            finalizing: HashSet::new(),
             attempts: HashMap::new(),
             blocks: HashMap::new(),
             checkpoints: HashMap::new(),
@@ -451,6 +456,9 @@ impl EngineState {
             }
             Input::CheckpointDone { package, result } => {
                 self.handle_checkpoint_done(package, result, &mut effects);
+            }
+            Input::FinalizeDone { file } => {
+                self.finalizing.remove(&file);
             }
             Input::VerifyDone { package, result } => {
                 self.handle_verify_done(package, result, &mut effects);
@@ -1951,6 +1959,7 @@ impl EngineState {
         let file_id = file.id;
         effects.push(Effect::Emit(EngineEvent::FileVerified { file: file_id }));
         effects.push(Effect::Finalize { file: file_id });
+        self.finalizing.insert(file_id);
         true
     }
 
@@ -2558,9 +2567,16 @@ impl EngineState {
     /// won't fill and the file's host allows another active file. The
     /// `PrepareFile` effect creates and preallocates its placeholder;
     /// the file turns `Active` — and gets attempts — when the driver
-    /// reports it prepared. Returns whether one was activated.
+    /// reports it prepared. Waits while too many finished files are still
+    /// queued for their rename, each holding an open file (Decision 30).
+    /// Returns whether one was activated.
     fn try_activate_one(&mut self, now: Instant, effects: &mut Vec<Effect>) -> bool {
         if self.preparing_count() >= self.free_slot_count(now) {
+            return false;
+        }
+        if u32::try_from(self.finalizing.len()).unwrap_or(u32::MAX)
+            >= self.config.max_pending_finalizes
+        {
             return false;
         }
 

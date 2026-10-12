@@ -520,6 +520,68 @@ mod tests {
     }
 
     #[test]
+    fn activation_waits_while_finished_files_wait_for_their_rename() {
+        let config = EngineConfig {
+            max_pending_finalizes: 1,
+            ..EngineConfig::default()
+        };
+        let mut state = EngineState::new(config);
+        let now = Instant::now();
+        state.handle(Input::LinksChanged(vec![link(1, "eth0", 1)]), now);
+
+        let urls = ["http://a.example.com/f.bin", "http://b.example.com/f.bin"];
+        let effects = state.handle(
+            Input::Command(Command::AddPackage {
+                name: "pkg".to_string(),
+                dest_dir: std::path::PathBuf::from("/tmp/nuxd-sim"),
+                sources: urls.iter().map(ToString::to_string).collect(),
+                priority: Priority::Normal,
+                post: Default::default(),
+            }),
+            now,
+        );
+        let package = package_added(&effects).unwrap();
+        let files: Vec<_> = state
+            .package(package)
+            .unwrap()
+            .files
+            .iter()
+            .map(|f| f.id)
+            .collect();
+        let (attempt, _) = activate_and_start(&mut state, now, files[0], urls[0], 500);
+        // Probed while the only slot is busy, so it waits as `Queued`.
+        let effects = state.handle(
+            Input::ProbeDone {
+                file: files[1],
+                result: ok_probe(urls[1], 500),
+            },
+            now,
+        );
+        assert!(!find_prepare(&effects, files[1]));
+
+        // The first file finishes and frees the only slot, but its rename
+        // is still queued: the second file must not be activated yet.
+        let effects = state.handle(
+            Input::AttemptEnded {
+                id: attempt,
+                outcome: AttemptOutcome::Success,
+                position: 500,
+            },
+            now,
+        );
+        check_invariants(&state);
+        assert!(effects.contains(&Effect::Finalize { file: files[0] }));
+        assert!(!find_prepare(&effects, files[1]), "{effects:?}");
+        let effects = state.handle(Input::Tick { progress: vec![] }, now);
+        assert!(!find_prepare(&effects, files[1]));
+
+        // Once it's renamed, the next file goes.
+        let effects = state.handle(Input::FinalizeDone { file: files[0] }, now);
+        check_invariants(&state);
+        assert!(find_prepare(&effects, files[1]), "{effects:?}");
+    }
+
+    #[test]
     fn an_invalid_url_fails_its_file_without_blocking_the_package() {
         let mut state = EngineState::new(EngineConfig::default());
         let now = Instant::now();

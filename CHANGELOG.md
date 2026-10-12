@@ -6,6 +6,15 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.1]
+
+### Fixed
+
+- A queue of many small files on a slow disk no longer piles up open
+  files. A finished file stays open until it has been safely written and
+  renamed; new files now wait while 16 finished ones are still queued for
+  that, instead of the number growing without limit.
+
 ## [0.1.0]
 
 The first release, for Linux (x86-64): AppImage, `.deb`, `.rpm` and the
@@ -58,5 +67,6 @@ tested.
   `move`, `limit`, `options`, `restart-file`, `links` and `diagnostics`,
   sharing the app's queue.
 
-[Unreleased]: https://github.com/sidmax7/nux-downloader/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/sidmax7/nux-downloader/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/sidmax7/nux-downloader/releases/tag/v0.1.1
 [0.1.0]: https://github.com/sidmax7/nux-downloader/releases/tag/v0.1.0

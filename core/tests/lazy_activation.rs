@@ -120,6 +120,90 @@ async fn twenty_files_through_three_slots_all_complete() {
     origin.shutdown().await;
 }
 
+/// Decision 30: a finished file keeps its `.nuxdpart` (and an open handle)
+/// until its rename has run on the durability lane, so activation waits
+/// while `max_pending_finalizes` of them are queued. With a limit of 1 the
+/// run only finishes if the driver reports every rename back, and a
+/// placeholder on disk is either an active file (at most one per slot) or
+/// the one waiting rename: never more than 3 + 1, however fast or slow
+/// the disk is.
+#[tokio::test]
+async fn files_waiting_for_their_rename_hold_back_activation() {
+    let size = 20_000;
+    let origin = Origin::start(OriginOptions {
+        size,
+        seed: 42,
+        ..Default::default()
+    })
+    .await;
+    let dest = tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
+    let manifests = tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
+    let mut link = one_link();
+    link.max_slots = 3;
+    let config = EngineConfig {
+        max_pending_finalizes: 1,
+        ..EngineConfig::default()
+    };
+    let driver = Driver::spawn_fresh(config, vec![link], manifests.path().to_path_buf());
+    let mut events = driver.subscribe();
+    driver
+        .command(Command::AddPackage {
+            name: "many".to_string(),
+            dest_dir: dest.path().to_path_buf(),
+            sources: (0..20).map(|_| origin.url()).collect(),
+            priority: Priority::Normal,
+            post: Default::default(),
+        })
+        .await
+        .unwrap_or_else(|e| panic!("AddPackage: {e}"));
+
+    let mut most = 0;
+    let watch = async {
+        loop {
+            most = most.max(placeholders(dest.path()));
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    };
+    let done = async {
+        loop {
+            match events.recv().await {
+                Ok(EngineEvent::PackageDone { .. }) => return,
+                Ok(
+                    event @ (EngineEvent::PackageFailed { .. } | EngineEvent::FileFailed { .. }),
+                ) => panic!("failed: {event:?}"),
+                Ok(_) => {}
+                Err(e) => panic!("events: {e}"),
+            }
+        }
+    };
+    tokio::select! {
+        () = watch => {}
+        result = tokio::time::timeout(Duration::from_secs(30), done) => {
+            assert!(result.is_ok(), "stalled: a rename was never reported back");
+        }
+    }
+    assert!(
+        most <= 4,
+        "{most} placeholders at once, at most 3 + 1 expected"
+    );
+
+    let expected = content_range(42, 0, size);
+    let files: Vec<_> = std::fs::read_dir(dest.path())
+        .unwrap_or_else(|e| panic!("read_dir: {e}"))
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .collect();
+    assert_eq!(files.len(), 20, "{files:?}");
+    for file in files {
+        assert_eq!(
+            std::fs::read(&file).unwrap_or_else(|e| panic!("read: {e}")),
+            expected
+        );
+    }
+    driver.shutdown().await;
+    origin.shutdown().await;
+}
+
 /// How many `.nuxdpart` files are in `dir`.
 fn placeholders(dir: &Path) -> usize {
     std::fs::read_dir(dir)

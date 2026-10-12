@@ -217,6 +217,10 @@ pub struct EngineConfig {
     pub checkpoint_interval: Duration,
     pub checkpoint_bytes_threshold: u64,
     pub auto_resume_on_startup: bool,
+    /// Finished files still waiting for their sync + rename on the
+    /// durability lane before activation pauses (§7.3, Decision 30). Each
+    /// one holds an open file until then.
+    pub max_pending_finalizes: u32,
 
     // --- Transfer (§8) ---
     pub write_buffer_bytes: usize,
@@ -271,6 +275,7 @@ impl Default for EngineConfig {
             checkpoint_interval: Duration::from_secs(5),
             checkpoint_bytes_threshold: 64 * 1024 * 1024,
             auto_resume_on_startup: true,
+            max_pending_finalizes: 16,
 
             write_buffer_bytes: 256 * 1024,
 
@@ -342,6 +347,7 @@ mod tests {
         assert_eq!(config.checkpoint_interval, Duration::from_secs(5));
         assert_eq!(config.checkpoint_bytes_threshold, 64 * 1024 * 1024);
         assert!(config.auto_resume_on_startup);
+        assert_eq!(config.max_pending_finalizes, 16);
         assert_eq!(config.write_buffer_bytes, 256 * 1024);
         assert_eq!(config.progress_event_hz, 4);
         assert_eq!(config.interface_rescan_interval, Duration::from_secs(5));
