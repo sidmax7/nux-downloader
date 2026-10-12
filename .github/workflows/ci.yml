@@ -1,9 +1,13 @@
 name: CI
 
+# Pushes and pull requests check Linux only: that is the platform being
+# released. "Run workflow" on the Actions tab (workflow_dispatch) adds the
+# macOS and Windows legs, for when they can be debugged on real machines.
 on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -24,7 +28,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: ${{ fromJSON(github.event_name == 'workflow_dispatch' && '["ubuntu-latest","macos-latest","windows-latest"]' || '["ubuntu-latest"]') }}
     steps:
       - uses: actions/checkout@v4
       - name: Install toolchain
@@ -56,7 +60,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: ${{ fromJSON(github.event_name == 'workflow_dispatch' && '["ubuntu-latest","macos-latest","windows-latest"]' || '["ubuntu-latest"]') }}
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
@@ -122,7 +126,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: ${{ fromJSON(github.event_name == 'workflow_dispatch' && '["ubuntu-latest","macos-latest","windows-latest"]' || '["ubuntu-latest"]') }}
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
@@ -176,7 +180,7 @@ jobs:
           WEBKIT_DISABLE_DMABUF_RENDERER: "1"
         # tauri-driver starts the app, so it must run inside the virtual
         # display too, not only the test runner.
-        run: xvfb-run -a bash -c 'tauri-driver & sleep 2; pnpm e2e' 
+        run: xvfb-run -a bash -c 'tauri-driver & sleep 2; pnpm e2e'
 
   deny:
     name: cargo-deny

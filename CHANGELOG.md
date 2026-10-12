@@ -8,8 +8,9 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [0.1.0]
 
-The first release. Linux is the tested platform; the Windows and macOS
-builds are new and have had less testing.
+The first release, for Linux (x86-64): AppImage, `.deb`, `.rpm` and the
+`nuxd` command. Windows and macOS builds will follow once they have been
+tested.
 
 ### Downloading
 
@@ -48,8 +49,8 @@ builds are new and have had less testing.
   off or limit each connection.
 - Tray icon (pause all, resume all, quit), notifications, light and dark
   themes, one window per user (a second launch focuses the first).
-- Updates itself from GitHub Releases (Windows, macOS, Linux AppImage);
-  `.deb`, `.rpm` and AUR installs are updated by the package manager.
+- The AppImage updates itself from GitHub Releases; `.deb`, `.rpm` and
+  Arch installs are updated by the package manager.
 
 ### Command line
 

@@ -4,9 +4,10 @@
 
 # Nux Downloader
 
-> **Status: alpha.** It works end to end on Linux and is being prepared
-> for its first release. The Windows and macOS builds are new and have had
-> less testing.
+> **Status: alpha, Linux only.** It works end to end on Linux and is
+> being prepared for its first release. Windows and macOS are planned:
+> the code is written for them, but they haven't been tested yet, so there
+> are no installers for them.
 
 Nux Downloader is a download manager that uses **every network connection
 you have at once**. Plug in a phone over USB while you're on Wi-Fi, or
@@ -101,35 +102,12 @@ the Arch one, are updated by your package manager rather than by the app.
 After installing, start **Nux Downloader** from your applications menu,
 or run `nux-downloader`.
 
-### Windows
+### Windows and macOS
 
-1. Download `nux-downloader_<version>_x64-setup.exe` and run it.
-2. The installers are not code-signed yet, so Windows SmartScreen may
-   say "Windows protected your PC". Click **More info**, then **Run
-   anyway**.
-3. The app needs Microsoft Edge WebView2, which Windows 10 and 11
-   already have. If it's missing, the installer downloads it.
-
-Windows 10 or newer, 64-bit. The app updates itself when a new version
-is out (Settings → About).
-
-### macOS
-
-1. Download `nux-downloader_<version>_universal.dmg` (Apple Silicon and
-   Intel). Open it and drag **Nux Downloader** to **Applications**.
-2. The app is not notarised by Apple yet, so the first launch is
-   blocked with "Apple could not verify…". Open **System Settings →
-   Privacy & Security**, scroll down and click **Open Anyway** next to
-   Nux Downloader, then confirm.
-
-   From a terminal, this does the same:
-
-   ```sh
-   xattr -dr com.apple.quarantine "/Applications/Nux Downloader.app"
-   ```
-
-macOS 11 (Big Sur) or newer. The app updates itself when a new version
-is out (Settings → About).
+Not released yet. The code is written for both and is meant to build
+there, but neither has been tried on a real machine, so there are no
+installers. If you'd like to try anyway, [build from source](#build-from-source)
+and please report what you find.
 
 ### Where your data lives
 
@@ -182,9 +160,9 @@ nuxd links                                      # network links found
 nuxd --help                                     # everything else
 ```
 
-Each release has prebuilt `nuxd` archives for Linux, macOS and Windows
-(`nuxd-<version>-<target>.tar.gz` or `.zip`); unpack and put `nuxd` on
-your `PATH`. The Arch package includes it. From source:
+Each release has a prebuilt `nuxd` for Linux
+(`nuxd-<version>-x86_64-unknown-linux-gnu.tar.gz`); unpack it and put
+`nuxd` on your `PATH`. The Arch package includes it. From source:
 `cargo install --path cli` (see below).
 
 ## Build from source
@@ -195,7 +173,7 @@ You need:
   version (`rust-toolchain.toml`) and rustup installs it automatically.
 - **Node.js 22 or newer** and **pnpm** (`npm install -g pnpm`, or
   `corepack enable`).
-- The system pieces for your platform:
+- The system pieces for your platform (macOS and Windows are untested):
 
   | System | Install |
   |---|---|

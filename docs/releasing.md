@@ -44,10 +44,10 @@ The release workflow refuses to run while the public key is empty.
    git push origin vX.Y.Z
    ```
 
-6. The **Release** workflow builds the Linux AppImage, `.deb` and `.rpm`,
-   the macOS universal `.dmg`, the Windows installer and the `nuxd`
-   archives, and attaches them, `SHA256SUMS` and `latest.json` to a
-   **draft** release. Tags with a `-` become pre-releases.
+6. The **Release** workflow builds the Linux AppImage, `.deb` and `.rpm`
+   and the Linux `nuxd` archive, and attaches them, `SHA256SUMS` and
+   `latest.json` to a **draft** release. Tags with a `-` become
+   pre-releases.
 7. Download and try at least the Linux AppImage and `.deb` from the
    draft. Then publish it. Only a published, non-pre-release is "latest",
    so only then do installed apps see the update.
@@ -75,6 +75,25 @@ git commit -am "Update to X.Y.Z" && git push
 Check the sums against the release's `SHA256SUMS`. Copy the final
 `PKGBUILD` back into `packaging/aur/nuxd-bin/` so the repository keeps
 the current one.
+
+## Adding macOS and Windows
+
+Releases are Linux-only until those builds have been tried on real
+machines. The pieces are in place, switched off:
+
+1. On the Actions tab, run the **CI** workflow by hand ("Run workflow").
+   A manual run adds the macOS and Windows legs (clippy, tests, app
+   build) that pushes skip. Get them green.
+2. Build and try the app on each system: install, add a download, quit
+   and resume, the tray, an update.
+3. In `.github/workflows/release.yml`, uncomment the `macos` and
+   `windows` entries of the `app` matrix and the three non-Linux `cli`
+   targets. `scripts/update-manifest.py` adds each platform to
+   `latest.json` as soon as its files are in the release.
+4. Bring back the Windows and macOS install sections in the README (they
+   are in the git history of `README.md`, just before they were replaced
+   by "Windows and macOS: not released yet"), and say so in the
+   changelog.
 
 ## What the workflow does not do
 

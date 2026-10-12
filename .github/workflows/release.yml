@@ -1,7 +1,7 @@
 name: Release
 
 # Pushing a `v*` tag (e.g. `v0.1.0`, or `v0.2.0-beta.1` for a pre-release)
-# builds every installer and the CLI, signs the update artefacts, and puts
+# builds the Linux packages and the CLI, signs the update artefacts, and puts
 # them on a *draft* GitHub release. Publishing the draft is a manual step
 # (docs/releasing.md), and only then do installed apps see the update.
 
@@ -58,20 +58,23 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Linux only for now. The macOS and Windows legs below are ready
+        # but untested; uncomment them once those builds have been tried
+        # on real machines (docs/releasing.md).
         include:
           # 22.04's older glibc lets the AppImage and .deb run on more systems.
           - name: linux
             os: ubuntu-22.04
             args: --bundles appimage,deb,rpm
             out: target/release/bundle
-          - name: macos
-            os: macos-latest
-            args: --target universal-apple-darwin --bundles app,dmg
-            out: target/universal-apple-darwin/release/bundle
-          - name: windows
-            os: windows-latest
-            args: --bundles nsis
-            out: target/release/bundle
+          # - name: macos
+          #   os: macos-latest
+          #   args: --target universal-apple-darwin --bundles app,dmg
+          #   out: target/universal-apple-darwin/release/bundle
+          # - name: windows
+          #   os: windows-latest
+          #   args: --bundles nsis
+          #   out: target/release/bundle
     defaults:
       run:
         shell: bash
@@ -115,11 +118,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Linux only for now, like the app above.
         include:
           - { os: ubuntu-22.04, target: x86_64-unknown-linux-gnu }
-          - { os: macos-latest, target: aarch64-apple-darwin }
-          - { os: macos-latest, target: x86_64-apple-darwin }
-          - { os: windows-latest, target: x86_64-pc-windows-msvc }
+          # - { os: macos-latest, target: aarch64-apple-darwin }
+          # - { os: macos-latest, target: x86_64-apple-darwin }
+          # - { os: windows-latest, target: x86_64-pc-windows-msvc }
     defaults:
       run:
         shell: bash

@@ -4,7 +4,8 @@
 Run inside a folder holding the release assets (with their `.sig` files).
 Only the formats that update themselves are listed: the AppImage, the
 macOS app archive (one universal build serves both architectures) and the
-Windows installer.
+Windows installer, each only if the release has it. The AppImage is
+required: Linux is always released.
 
   update-manifest.py <version> <tag>
 """
@@ -28,6 +29,10 @@ def main() -> None:
     }
     platforms = {}
     for platform, name in entries.items():
+        if not Path(name).is_file():
+            if platform.startswith("linux"):
+                sys.exit(f"missing {name}")
+            continue
         sig = Path(f"{name}.sig")
         if not sig.is_file():
             sys.exit(f"missing {sig}: was TAURI_SIGNING_PRIVATE_KEY set for the build?")

@@ -28,7 +28,7 @@ body:
     id: install
     attributes:
       label: How did you install it?
-      options: [AppImage, .deb, .rpm, AUR, Windows installer, macOS .dmg, Built from source]
+      options: [AppImage, .deb, .rpm, Arch (PKGBUILD), Built from source]
   - type: textarea
     id: diagnostics
     attributes:
