@@ -634,7 +634,8 @@ impl EngineState {
                     files.push(file);
                 }
                 Ok(url) => {
-                    let placeholder_name = crate::probe::filename_from_url(&url);
+                    let placeholder_name =
+                        crate::probe::sanitize_filename(&crate::probe::filename_from_url(&url));
                     let Some(file) = FileEntry::new(file_id, source.clone(), placeholder_name)
                     else {
                         continue;
@@ -788,7 +789,7 @@ impl EngineState {
         for input in inputs {
             let file_id = self.alloc_file_id();
             let placeholder = Url::parse(&input.source)
-                .map(|url| crate::probe::filename_from_url(&url))
+                .map(|url| crate::probe::sanitize_filename(&crate::probe::filename_from_url(&url)))
                 .unwrap_or_else(|_| "download".to_string());
             let Some(mut file) = FileEntry::new(file_id, input.source, placeholder) else {
                 continue;
@@ -864,6 +865,34 @@ impl EngineState {
             return;
         }
         package.status = PackageStatus::Downloading;
+        let had_error = package.last_error.take().is_some();
+        // Files that stopped on the I/O error pick up where they left off:
+        // reopen the partial data (or start over if it is gone).
+        let mut reopen = Vec::new();
+        if had_error {
+            for file in &mut package.files {
+                if !matches!(file.status, FileStatus::Failed(FileError::Io { .. })) {
+                    continue;
+                }
+                if file.layout.is_some() {
+                    file.status = FileStatus::Preparing;
+                    reopen.push(Effect::PrepareFile {
+                        file: file.id,
+                        plan: FilePrep {
+                            package: package_id,
+                            dest_dir: package.dest_dir.clone(),
+                            suggested_name: file.name.clone(),
+                            expected_size: file.expected_size,
+                            resume_final_name: Some(file.name.clone()),
+                        },
+                    });
+                } else {
+                    file.status = FileStatus::Unprobed;
+                    file.url = None;
+                }
+            }
+        }
+        effects.extend(reopen);
         // Persist the status change now: a management session may exit
         // before any tick.
         self.checkpoint_now(package_id, now, effects);
@@ -1279,10 +1308,16 @@ impl EngineState {
                 // can trust the checkpoint has already landed (§9.3) — the
                 // driver executes effects strictly in order.
                 let mut post_effects = Vec::new();
-                let completed = self.try_complete_file(package_id, index, false, &mut post_effects);
+                self.try_complete_file(package_id, index, false, &mut post_effects);
                 self.update_package_status(package_id, &mut post_effects);
-                if completed {
-                    self.checkpoint_now(package_id, now, effects);
+                // Always: the name the driver just reserved on disk must
+                // be in a manifest at once, or a crash right now would
+                // leave an empty placeholder nothing refers to.
+                self.checkpoint_now(package_id, now, effects);
+                // ...but progress is still checkpointed on its own cadence
+                // from the first tick, not a full interval later.
+                if let Some(checkpoint) = self.checkpoints.get_mut(&package_id) {
+                    checkpoint.last = None;
                 }
                 effects.extend(post_effects);
             }
@@ -1317,17 +1352,21 @@ impl EngineState {
         detail: String,
         effects: &mut Vec<Effect>,
     ) {
+        // A full disk or a vanished directory is not the download's
+        // fault, and nothing is lost: pause with the reason, and let
+        // `Resume` try again once the user has fixed it.
+        let error = PackageError::Io { detail };
         if let Some(package) = self.package_mut(package_id) {
-            package.status = PackageStatus::Failed(PackageError::Io {
-                detail: detail.clone(),
-            });
+            package.status = PackageStatus::Paused;
+            package.last_error = Some(error.clone());
         } else {
             return;
         }
         self.abort_package_attempts(package_id, AbortReason::Fatal, effects);
-        effects.push(Effect::Emit(EngineEvent::PackageFailed {
+        self.write_checkpoint(package_id, true, effects);
+        effects.push(Effect::Emit(EngineEvent::PackagePausedOnError {
             package: package_id,
-            error: PackageError::Io { detail },
+            error,
         }));
     }
 
@@ -1926,6 +1965,11 @@ impl EngineState {
                 | PackageStatus::Verifying
                 | PackageStatus::Extracting
         ) {
+            return;
+        }
+        // A package paused (by the user or by a disk error) waits for
+        // `Resume`; its files failing or finishing changes nothing yet.
+        if package.status == PackageStatus::Paused {
             return;
         }
         if package.all_files_verified() {

@@ -28,18 +28,23 @@ protection measures, or automate premium-account credential sharing.
 
 ## Building
 
-Nothing to build yet. The workspace is Rust only:
+The workspace:
 
 - `core/` — the download engine, a library with no UI or Tauri
   dependency.
 - `cli/` — a thin `nuxd` binary over `core`, for exercising the engine
   without the UI.
-- `src-tauri/` / `ui/` — the desktop app (Tauri + Vue), not yet
-  scaffolded.
+- `src-tauri/` / `ui/` — the desktop app: a Tauri shell with the Vue UI
+  bundled into it, so it installs as one package.
 
 ```sh
-cargo build --workspace
+cargo build -p nuxd-core -p nuxd      # engine and CLI
+pnpm --dir ui install                  # once
+cd src-tauri && ../ui/node_modules/.bin/tauri dev    # the app, live reload
 ```
+
+The app needs Node 22+, pnpm, and on Linux the `webkit2gtk-4.1` and
+`gtk3` development packages.
 
 ## Licence
 

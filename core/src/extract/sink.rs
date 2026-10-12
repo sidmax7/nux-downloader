@@ -139,7 +139,17 @@ impl<'a> Sink<'a> {
         cancel: &'a AtomicBool,
         progress: &'a mut dyn FnMut(Progress),
     ) -> Result<Self, ExtractError> {
-        fs::create_dir_all(root).map_err(|e| io("create", root, e))?;
+        // The root is created here, exclusively: an existing path must be a
+        // real directory, never a symlink somebody planted.
+        match fs::symlink_metadata(root) {
+            Ok(meta) if meta.file_type().is_dir() => {}
+            Ok(_) => {
+                return Err(ExtractError::UnsafePath {
+                    entry: root.display().to_string(),
+                });
+            }
+            Err(_) => fs::create_dir(root).map_err(|e| io("create", root, e))?,
+        }
         let canonical_root = root.canonicalize().map_err(|e| io("resolve", root, e))?;
         Ok(Self {
             root: root.to_path_buf(),

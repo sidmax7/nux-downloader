@@ -221,3 +221,71 @@ async fn limit_command_sets_and_clears_a_package_limit_and_flags_are_validated()
     assert!(!ok);
     assert!(err.contains("--limit"), "{err}");
 }
+
+#[tokio::test]
+async fn a_second_nuxd_on_the_same_data_directory_is_refused() {
+    let origin = Origin::start(OriginOptions {
+        size: 100_000,
+        ..Default::default()
+    })
+    .await;
+    // Keep the first process busy for a while.
+    origin.set_fault(2, nuxd_testkit::Fault::StallBody);
+    let data_dir = tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
+    let dest = tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
+    let mut first = nuxd(data_dir.path());
+    first
+        .arg("get")
+        .arg(origin.url())
+        .arg("-o")
+        .arg(dest.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let mut first = first.spawn().unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+
+    for args in [vec!["queue"], vec!["get", "http://127.0.0.1:9/x"]] {
+        let mut second = nuxd(data_dir.path());
+        second.args(&args);
+        let (ok, _, err) = run(second).await;
+        assert!(!ok, "{args:?} should have been refused");
+        assert!(err.contains("another nuxd"), "{err}");
+    }
+
+    first.kill().await.unwrap();
+    let _ = first.wait().await;
+    // The OS released the dead process's lock.
+    let mut after = nuxd(data_dir.path());
+    after.arg("queue");
+    let (ok, _, err) = run(after).await;
+    assert!(ok, "{err}");
+}
+
+#[tokio::test]
+async fn diagnostics_reports_the_queue_without_secrets_and_logs_are_written() {
+    let origin = Origin::start(OriginOptions::default()).await;
+    let data_dir = tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
+    let mut add = nuxd(data_dir.path());
+    add.arg("add")
+        .arg(format!("{}?token=TOPSECRET", origin.url()));
+    assert!(run(add).await.0);
+
+    let mut diag = nuxd(data_dir.path());
+    diag.arg("diagnostics");
+    let (ok, out, err) = run(diag).await;
+    assert!(ok, "{err}");
+    assert!(out.contains("nuxd diagnostics"), "{out}");
+    assert!(out.contains("version:"), "{out}");
+    assert!(
+        out.contains("pending") || out.contains("Downloading") || out.contains("Paused"),
+        "{out}"
+    );
+    assert!(!out.contains("TOPSECRET"), "{out}");
+    // Diagnostics works while another nuxd holds the data directory, too:
+    // it only reads.
+    assert!(
+        data_dir.path().join("logs").exists(),
+        "no log directory was created"
+    );
+}

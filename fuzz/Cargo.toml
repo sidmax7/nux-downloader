@@ -1,0 +1,52 @@
+[package]
+name = "nuxd-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+nuxd-core = { path = "../core" }
+serde_json = "1"
+url = "2"
+
+# Not part of the main workspace: fuzzing needs sanitizer flags.
+[workspace]
+
+[[bin]]
+name = "headers"
+path = "fuzz_targets/headers.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "grouping"
+path = "fuzz_targets/grouping.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "entry_paths"
+path = "fuzz_targets/entry_paths.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "manifests"
+path = "fuzz_targets/manifests.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "text_parsers"
+path = "fuzz_targets/text_parsers.rs"
+test = false
+doc = false
+bench = false

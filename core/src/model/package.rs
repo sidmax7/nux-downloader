@@ -59,6 +59,7 @@ impl fmt::Display for PackageError {
             Self::FilesFailed => write!(f, "one or more files failed"),
             Self::VerifyFailed { detail } => write!(f, "verification failed: {detail}"),
             Self::ExtractFailed { detail } => write!(f, "extraction failed: {detail}"),
+            Self::Io { detail } if detail.starts_with("disk error") => write!(f, "{detail}"),
             Self::Io { detail } => write!(f, "disk error: {detail}"),
             Self::Other { detail } => write!(f, "{detail}"),
         }
@@ -80,6 +81,7 @@ pub enum PackageStatus {
 pub struct Package {
     pub id: PackageId,
     pub name: String,
+    #[serde(with = "super::path_serde")]
     pub dest_dir: PathBuf,
     pub priority: Priority,
     /// `len() == 1` is a simple download; `len() > 1` is a grouped set.
@@ -94,6 +96,11 @@ pub struct Package {
     pub delete_archives: bool,
     pub limit: Option<ByteRate>,
     pub status: PackageStatus,
+    /// Why the package is `Paused` against the user's wishes: a disk or
+    /// I/O error (disk full, destination gone, permission denied). The
+    /// partial data is intact; `Resume` clears this and tries again.
+    #[serde(default)]
+    pub last_error: Option<PackageError>,
 }
 
 impl Package {
@@ -122,6 +129,7 @@ impl Package {
             delete_archives: false,
             limit: None,
             status: PackageStatus::Queued,
+            last_error: None,
         })
     }
 

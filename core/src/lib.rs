@@ -4,6 +4,7 @@
 mod api;
 pub mod collect;
 pub mod config;
+pub mod diagnostics;
 pub mod driver;
 pub mod engine;
 pub mod error;

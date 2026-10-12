@@ -94,13 +94,7 @@ pub async fn add(
     };
     let dest_dir =
         output.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-    let name = name.unwrap_or_else(|| {
-        inputs[0]
-            .rsplit('/')
-            .find(|segment| !segment.is_empty())
-            .unwrap_or("download")
-            .to_string()
-    });
+    let name = name.unwrap_or_else(|| crate::default_package_name(&inputs[0]));
     let count = inputs.len();
     let result = engine
         .add(
@@ -230,7 +224,7 @@ pub async fn queue(verbose: bool, data_dir: Option<PathBuf>) -> ExitCode {
             package.id,
             position + 1,
             format!("{:?}", package.priority),
-            status_text(&package.status),
+            status_text(package),
             package.files.len(),
             progress,
             name_with_options(package),
@@ -270,10 +264,11 @@ fn name_with_options(package: &nuxd_core::model::Package) -> String {
     }
 }
 
-fn status_text(status: &PackageStatus) -> String {
-    match status {
-        PackageStatus::Failed(error) => format!("failed: {error}"),
-        other => format!("{other:?}").to_lowercase(),
+fn status_text(package: &nuxd_core::model::Package) -> String {
+    match (&package.status, &package.last_error) {
+        (PackageStatus::Failed(error), _) => format!("failed: {error}"),
+        (PackageStatus::Paused, Some(error)) => format!("paused: {error}"),
+        (other, _) => format!("{other:?}").to_lowercase(),
     }
 }
 

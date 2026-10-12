@@ -46,6 +46,7 @@ pub struct QueueManifest {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct QueueSettings {
     pub auto_resume_on_startup: bool,
+    #[serde(with = "crate::model::path_serde::option", default)]
     pub destination_dir: Option<PathBuf>,
 }
 
@@ -252,8 +253,19 @@ pub fn load_all_package_manifests(dir: &Path) -> Vec<PackageManifest> {
             continue;
         }
         let _ = fs::remove_file(tmp_path_for(&path));
-        if let Ok(manifest) = load_package_manifest(&path) {
-            manifests.push(manifest);
+        match load_package_manifest(&path) {
+            Ok(manifest) => manifests.push(manifest),
+            Err(error) => {
+                // Never lose it silently, and never overwrite it: move it
+                // aside where the user can find it.
+                tracing::warn!(
+                    "package manifest {} is unreadable ({error}); setting it aside",
+                    path.display()
+                );
+                let mut aside = path.clone().into_os_string();
+                aside.push(".corrupt");
+                let _ = fs::rename(&path, aside);
+            }
         }
     }
     manifests
@@ -405,5 +417,22 @@ mod tests {
         let dir = tempdir().unwrap();
         let missing = dir.path().join("does-not-exist");
         assert!(load_all_package_manifests(&missing).is_empty());
+    }
+
+    #[test]
+    fn an_unreadable_manifest_is_set_aside_not_lost_or_overwritten() {
+        let dir = tempdir().unwrap();
+        let good = dir.path().join("pkg-1.json");
+        save_package_manifest(&good, &PackageManifest::new(sample_package(1))).unwrap();
+        let bad = dir.path().join("pkg-2.json");
+        fs::write(&bad, b"{ this is not json").unwrap();
+
+        let loaded = load_all_package_manifests(dir.path());
+        assert_eq!(loaded.len(), 1);
+        assert!(!bad.exists());
+        assert_eq!(
+            fs::read(dir.path().join("pkg-2.json.corrupt")).unwrap(),
+            b"{ this is not json"
+        );
     }
 }

@@ -49,6 +49,7 @@ fn monitored(interfaces: &Arc<FakeInterfaces>) -> LinkSetup {
         enrich_timeout: Duration::from_secs(1),
         bind: BindPolicy::Off,
         only: None,
+        switch: Default::default(),
     })
 }
 

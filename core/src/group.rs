@@ -154,9 +154,24 @@ fn missing_volumes(scheme: ArchiveScheme, present: &BTreeSet<u32>, has_last: boo
     let Some(&max) = present.last() else {
         return Vec::new();
     };
-    let mut missing: Vec<u32> = (1..=max).filter(|n| !present.contains(n)).collect();
-    if scheme == ArchiveScheme::SplitZip && !has_last {
-        missing.push(max + 1);
+    // Gaps between the volumes that are there. A name like
+    // `x.part4294967295.rar` must not allocate four billion entries, so
+    // the list is capped — enough to tell the user what is missing.
+    const MAX_REPORTED: usize = 1000;
+    let mut missing: Vec<u32> = Vec::new();
+    let mut expected = 1u32;
+    'gaps: for &have in present {
+        while expected < have {
+            if missing.len() >= MAX_REPORTED {
+                break 'gaps;
+            }
+            missing.push(expected);
+            expected += 1;
+        }
+        expected = have.saturating_add(1);
+    }
+    if scheme == ArchiveScheme::SplitZip && !has_last && missing.len() < MAX_REPORTED {
+        missing.push(max.saturating_add(1));
     }
     missing
 }
@@ -381,5 +396,17 @@ mod tests {
         assert!(run(&[]).is_empty());
         let g = run(&["Ünï.part1.rar", "Ünï.part2.rar"]);
         assert_eq!(archive(&g[0]).1, "Ünï");
+    }
+
+    #[test]
+    fn an_absurd_volume_number_cannot_exhaust_memory() {
+        // Found by fuzzing: this once tried to list four billion gaps.
+        let g = run(&["x.part4294967295.rar", "x.part1.rar"]);
+        assert_eq!(g.len(), 1);
+        assert_eq!(g[0].members.len(), 2);
+        assert_eq!(g[0].missing.len(), 1000);
+        assert_eq!(g[0].missing[0], 2);
+        let g = run(&["a.7z.4294967295"]);
+        assert!(g[0].missing.len() <= 1000);
     }
 }

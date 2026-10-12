@@ -530,3 +530,30 @@ mod rar {
         assert!(result.is_err());
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn a_symlink_planted_as_the_staging_directory_is_not_followed() {
+    let src = tempfile::tempdir().unwrap();
+    let archive = src.path().join("a.zip");
+    std::fs::write(&archive, make_zip(&files())).unwrap();
+    let out = tempfile::tempdir().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    // The staging name is predictable; an attacker with write access to
+    // the destination could aim it somewhere else.
+    std::os::unix::fs::symlink(elsewhere.path(), out.path().join(".a.nuxdextract")).unwrap();
+
+    let cancel = AtomicBool::new(false);
+    extract(
+        &spec(ArchiveScheme::SplitZip, "a", vec![archive], out.path()),
+        &cancel,
+        &mut |_| {},
+    )
+    .unwrap();
+    assert_eq!(
+        std::fs::read_dir(elsewhere.path()).unwrap().count(),
+        0,
+        "extraction wrote through the planted link"
+    );
+    assert_files(out.path());
+}

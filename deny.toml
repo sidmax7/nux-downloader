@@ -11,7 +11,15 @@ targets = [
 
 [advisories]
 version = 2
-ignore = []
+ignore = [
+    # proc-macro-error is unmaintained; it is pulled in only by the
+    # gtk3-rs bindings that Tauri uses for its Linux window (a proc
+    # macro, compile time only). Goes away with Tauri's move off gtk3.
+    "RUSTSEC-2024-0370",
+    # paste is archived; it is a compile-time proc macro pulled in by
+    # tauri-specta/specta (no runtime code, no known vulnerability).
+    "RUSTSEC-2024-0436",
+]
 
 [licenses]
 version = 2

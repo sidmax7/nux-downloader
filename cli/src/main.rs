@@ -183,6 +183,10 @@ enum Command {
     /// Moves a package in the queue to `top`, `bottom`, or a 1-based
     /// position.
     Move { id: u64, position: String },
+    /// Prints a report for bug reports: version, platform, the queue and
+    /// recent log lines, with URL queries and credentials removed. Reads
+    /// the data directory directly, so it works while a download runs.
+    Diagnostics,
     /// Starts a failed file over from scratch (its id from
     /// `nuxd queue -v`); `nuxd resume` then downloads it again.
     RestartFile { file: u64 },
@@ -190,12 +194,17 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    // `RUST_LOG=nuxd_core=debug nuxd get … 2>log.txt` shows every failed
-    // attempt and host backoff; the default shows warnings only.
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
-    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
     let cli = Cli::parse();
+    // Logs go to rotating files in `<data dir>/logs` (`NUXD_LOG=debug`
+    // for detail) and warnings to stderr (`RUST_LOG=nuxd_core=debug nuxd
+    // get … 2>log.txt` shows every failed attempt and host backoff).
+    let data_dir_for_logs = cli
+        .data_dir
+        .clone()
+        .or_else(nuxd_core::diagnostics::default_data_dir);
+    let _logging = data_dir_for_logs.map(|dir| {
+        nuxd_core::diagnostics::init_logging(&nuxd_core::diagnostics::log_dir(&dir), true)
+    });
     let opts = StartOpts {
         data_dir: cli.data_dir,
         write_buffer_bytes: cli.write_buffer_bytes,
@@ -240,6 +249,19 @@ async fn main() -> ExitCode {
             Ok(rate) => manage::limit(PackageId::new(id), rate, opts.data_dir).await,
             Err(error) => usage(&error),
         },
+        Command::Diagnostics => {
+            let dir = opts
+                .data_dir
+                .clone()
+                .or_else(nuxd_core::diagnostics::default_data_dir);
+            match dir {
+                Some(dir) => {
+                    println!("{}", nuxd_core::diagnostics::from_disk(&dir));
+                    ExitCode::SUCCESS
+                }
+                None => usage("no data directory (give --data-dir)"),
+            }
+        }
         Command::Options {
             id,
             extract,
@@ -422,6 +444,16 @@ async fn check_requested_links(names: &[String]) -> bool {
     true
 }
 
+/// A package name from its first link: the last path segment, without
+/// the query or fragment (those can carry secrets and are never a name).
+fn default_package_name(first_link: &str) -> String {
+    let path = first_link.split(['?', '#']).next().unwrap_or(first_link);
+    path.rsplit('/')
+        .find(|segment| !segment.is_empty() && !segment.ends_with(':'))
+        .unwrap_or("download")
+        .to_string()
+}
+
 async fn run_get(
     urls: Vec<String>,
     output: Option<PathBuf>,
@@ -446,11 +478,7 @@ async fn run_get(
         Some(dir) => dir,
         None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
     };
-    let name = urls[0]
-        .rsplit('/')
-        .find(|segment| !segment.is_empty())
-        .unwrap_or("download")
-        .to_string();
+    let name = default_package_name(&urls[0]);
 
     let ids = match engine
         .add(
@@ -565,6 +593,9 @@ async fn wait_for_packages(engine: Engine, ids: Vec<PackageId>) -> ExitCode {
             match package.status {
                 PackageStatus::Done => {}
                 PackageStatus::Failed(_) => all_ok = false,
+                // Stopped by a disk error: nothing more will happen until
+                // the user fixes it and resumes.
+                PackageStatus::Paused if package.last_error.is_some() => all_ok = false,
                 _ => all_settled = false,
             }
         }
@@ -585,11 +616,34 @@ async fn wait_for_packages(engine: Engine, ids: Vec<PackageId>) -> ExitCode {
         if let PackageStatus::Failed(error) = &package.status {
             eprintln!("nuxd: package {}: {error}", package.name);
         }
+        if let Some(error) = &package.last_error {
+            eprintln!(
+                "nuxd: package {} is paused: {error}\nnuxd: fix that, then run `nuxd resume`",
+                package.name
+            );
+        }
     }
     engine.shutdown().await;
     if all_ok {
         ExitCode::SUCCESS
     } else {
         ExitCode::from(1)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::default_package_name;
+
+    #[test]
+    fn names_come_from_the_path_never_the_query() {
+        assert_eq!(default_package_name("https://h.example/a/b.zip"), "b.zip");
+        assert_eq!(
+            default_package_name("https://h.example/a/b.zip?token=S#x"),
+            "b.zip"
+        );
+        assert_eq!(default_package_name("https://h.example/dir/"), "dir");
+        assert_eq!(default_package_name("https://h.example/?t=S"), "h.example");
+        assert_eq!(default_package_name(""), "download");
     }
 }

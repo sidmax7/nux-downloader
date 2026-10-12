@@ -34,6 +34,36 @@ const MAX_REDIRECTS: usize = 5;
 /// Binding to a specific network link is layered on top of this builder
 /// in Phase 3 (`net::bind`); this function has no link-specific
 /// behavior at all.
+/// Why a redirect must not be followed, if it mustn't: too many hops, or
+/// a step from `https` down to plain `http`, which would let anyone on the
+/// path swap the file.
+pub(crate) fn redirect_refusal(
+    hops_so_far: usize,
+    from_scheme: &str,
+    to_scheme: &str,
+) -> Option<&'static str> {
+    if hops_so_far >= MAX_REDIRECTS {
+        Some("too many redirects")
+    } else if from_scheme == "https" && to_scheme != "https" {
+        Some("refusing a redirect from https down to http")
+    } else {
+        None
+    }
+}
+
+fn redirect_policy() -> Policy {
+    Policy::custom(|attempt| {
+        let from = attempt
+            .previous()
+            .last()
+            .map_or("", |previous| previous.scheme());
+        match redirect_refusal(attempt.previous().len(), from, attempt.url().scheme()) {
+            Some(reason) => attempt.error(reason),
+            None => attempt.follow(),
+        }
+    })
+}
+
 pub(super) fn base_client_builder(config: &EngineConfig) -> ClientBuilder {
     let mut headers = HeaderMap::new();
     headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
@@ -41,7 +71,7 @@ pub(super) fn base_client_builder(config: &EngineConfig) -> ClientBuilder {
     Client::builder()
         .http1_only()
         .use_rustls_tls()
-        .redirect(Policy::limited(MAX_REDIRECTS))
+        .redirect(redirect_policy())
         .connect_timeout(config.connect_timeout)
         .tcp_nodelay(true)
         .default_headers(headers)
@@ -81,5 +111,14 @@ mod tests {
     #[test]
     fn link_client_builds_successfully() {
         assert!(build_link_client(&EngineConfig::default()).is_ok());
+    }
+
+    #[test]
+    fn redirects_may_not_downgrade_from_https_or_loop_forever() {
+        assert_eq!(redirect_refusal(0, "http", "http"), None);
+        assert_eq!(redirect_refusal(1, "http", "https"), None);
+        assert_eq!(redirect_refusal(2, "https", "https"), None);
+        assert!(redirect_refusal(1, "https", "http").is_some());
+        assert!(redirect_refusal(MAX_REDIRECTS, "http", "http").is_some());
     }
 }

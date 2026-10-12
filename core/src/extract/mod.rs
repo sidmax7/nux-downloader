@@ -63,15 +63,30 @@ pub fn extract(
         });
     }
     let staging = staging_dir(&spec.dest_dir, &spec.base_name);
-    let _ = std::fs::remove_dir_all(&staging);
+    remove_stale(&staging);
 
     let outcome = extract_into(spec, &staging, cancel, progress);
     let result = match outcome {
         Ok(summary) => publish(&staging, &spec.dest_dir).map(|()| summary),
         Err(error) => Err(error),
     };
-    let _ = std::fs::remove_dir_all(&staging);
+    remove_stale(&staging);
     result
+}
+
+/// Clears a leftover staging path from an earlier run. A symlink planted
+/// there is removed as a link — never followed — so extraction can't be
+/// steered into some other directory.
+fn remove_stale(path: &Path) {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_dir() => {
+            let _ = std::fs::remove_dir_all(path);
+        }
+        Ok(_) => {
+            let _ = std::fs::remove_file(path);
+        }
+        Err(_) => {}
+    }
 }
 
 fn staging_dir(dest_dir: &Path, base_name: &str) -> PathBuf {

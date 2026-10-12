@@ -98,17 +98,34 @@ pub fn reserve_destination_path(dir: &Path, file_name: &str) -> Result<PathBuf, 
 /// sequentially instead.
 pub fn create_and_preallocate(path: &Path, size: Option<u64>) -> Result<File, StorageError> {
     // Read and write: byte sampling (§10) reads durable regions back.
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(path)
-        .map_err(|source| StorageError::Io {
-            operation: "create",
-            path: path.display().to_string(),
-            source,
-        })?;
+    // `create_new` (O_EXCL) never follows a symlink at `path`. A regular
+    // leftover from an earlier run is replaced; anything else is refused.
+    let open = || {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(path)
+    };
+    let io_error = |source| StorageError::Io {
+        operation: "create",
+        path: path.display().to_string(),
+        source,
+    };
+    let file = match open() {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let meta = fs::symlink_metadata(path).map_err(io_error)?;
+            if !meta.file_type().is_file() {
+                return Err(io_error(std::io::Error::other(
+                    "refusing to replace a link or directory",
+                )));
+            }
+            fs::remove_file(path).map_err(io_error)?;
+            open().map_err(io_error)?
+        }
+        Err(error) => return Err(io_error(error)),
+    };
 
     if let Some(size) = size
         && size > 0

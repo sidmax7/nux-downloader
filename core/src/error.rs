@@ -158,6 +158,12 @@ pub enum StorageError {
     /// limit and every one was already taken.
     #[error("couldn't find an unused file name for {name} in {dir}")]
     NameReservationExhausted { dir: String, name: String },
+    /// Another `nuxd` already holds this data directory.
+    #[error(
+        "another nuxd is using {dir}{}",
+        holder.map(|pid| format!(" (process {pid})")).unwrap_or_default()
+    )]
+    Locked { dir: String, holder: Option<u32> },
     /// The upfront free-space check before activation (§9.2) failed.
     #[error("not enough free space in {dir}: need {needed} bytes, {available} available")]
     InsufficientSpace {

@@ -30,6 +30,22 @@ jobs:
       - name: Install toolchain
         run: rustup component add clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Linux packages for the Tauri shell
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev libayatana-appindicator3-dev
+      # `tauri::generate_context!` embeds ui/dist, so it must exist.
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: ui/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: ui/pnpm-lock.yaml
+      - run: pnpm --dir ui install --frozen-lockfile
+      - run: pnpm --dir ui build
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
   test:
@@ -42,6 +58,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
+      - name: Linux packages for the Tauri shell
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev libayatana-appindicator3-dev
+      # `tauri::generate_context!` embeds ui/dist, so it must exist.
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: ui/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: ui/pnpm-lock.yaml
+      - run: pnpm --dir ui install --frozen-lockfile
+      - run: pnpm --dir ui build
       # The multi-link tests bind to 127.0.0.2/.3/.4. Linux and Windows
       # treat all of 127/8 as loopback; macOS needs explicit aliases.
       - name: Add loopback aliases (macOS)
@@ -54,6 +86,88 @@ jobs:
       - name: Test with RAR support
         if: matrix.os == 'ubuntu-latest'
         run: cargo test -p nuxd-core --features rar --test extract
+
+  ui:
+    name: ui (typecheck, lint, build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: ui/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: ui/pnpm-lock.yaml
+      - run: pnpm --dir ui install --frozen-lockfile
+      - run: pnpm --dir ui typecheck
+      - run: pnpm --dir ui lint
+      - run: pnpm --dir ui test
+      - run: pnpm --dir ui build
+
+  app:
+    name: app build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Linux packages for the Tauri shell
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev libayatana-appindicator3-dev
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: ui/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: ui/pnpm-lock.yaml
+      - run: pnpm --dir ui install --frozen-lockfile
+      # Builds the UI, then the app (no installers yet: that is Phase 9).
+      - run: ../ui/node_modules/.bin/tauri build --no-bundle
+        working-directory: src-tauri
+        shell: bash
+
+  # Drives the built app through tauri-driver (WebDriver). Linux only for
+  # now; the Windows leg needs msedgedriver and has not been tried.
+  e2e:
+    name: end-to-end (ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev libayatana-appindicator3-dev webkit2gtk-driver xvfb
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: ui/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: ui/pnpm-lock.yaml
+      - run: pnpm --dir ui install --frozen-lockfile
+      - run: cargo install tauri-driver --locked
+      - run: ../ui/node_modules/.bin/tauri build --no-bundle
+        working-directory: src-tauri
+      - name: Run
+        working-directory: ui
+        env:
+          NUXD_APP: ../target/release/nuxd-app
+          WEBKIT_DISABLE_DMABUF_RENDERER: "1"
+        run: |
+          tauri-driver &
+          sleep 2
+          xvfb-run -a pnpm e2e
 
   deny:
     name: cargo-deny

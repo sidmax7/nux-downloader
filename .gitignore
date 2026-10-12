@@ -39,3 +39,8 @@ coverage/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# cargo-fuzz
+fuzz/target/
+fuzz/artifacts/
+fuzz/corpus/

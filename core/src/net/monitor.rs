@@ -30,6 +30,36 @@ pub enum LinkSetup {
     Monitored(MonitorSetup),
 }
 
+/// Links the user switched off, by interface name. Shared between the
+/// monitor (which leaves them out of every scan) and the `Engine` handle
+/// (which edits it); a change takes effect at the next rescan.
+#[derive(Debug, Clone, Default)]
+pub struct LinkSwitch(Arc<std::sync::Mutex<std::collections::BTreeSet<String>>>);
+
+impl LinkSwitch {
+    /// Switches the link called `name` on or off.
+    pub fn set_enabled(&self, name: &str, enabled: bool) {
+        let mut off = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if enabled {
+            off.remove(name);
+        } else {
+            off.insert(name.to_string());
+        }
+    }
+
+    #[must_use]
+    pub fn is_enabled(&self, name: &str) -> bool {
+        !self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(name)
+    }
+}
+
 #[derive(Clone)]
 pub struct MonitorSetup {
     pub source: Arc<dyn LinkSource>,
@@ -42,6 +72,8 @@ pub struct MonitorSetup {
     /// Use only the links with these interface names (`--links`).
     /// `None` uses every link found.
     pub only: Option<Vec<String>>,
+    /// Links switched off at run time (the app's enable/disable toggle).
+    pub switch: LinkSwitch,
 }
 
 impl MonitorSetup {
@@ -56,6 +88,7 @@ impl MonitorSetup {
             enrich_timeout: DEFAULT_ENRICH_TIMEOUT,
             bind: BindPolicy::Auto,
             only: None,
+            switch: LinkSwitch::default(),
         }
     }
 }
@@ -82,6 +115,10 @@ pub async fn scan(
             .collect(),
         None => discovered,
     };
+    let discovered: Vec<Link> = discovered
+        .into_iter()
+        .filter(|link| setup.switch.is_enabled(&link.name))
+        .collect();
     let (mut known, fresh): (Vec<Link>, Vec<Link>) = discovered
         .into_iter()
         .partition(|link| previous.iter().any(|p| p.id == link.id));
@@ -190,6 +227,7 @@ mod tests {
             enrich_timeout: Duration::from_secs(1),
             bind: BindPolicy::Off,
             only: None,
+            switch: LinkSwitch::default(),
         }
     }
 
@@ -226,6 +264,22 @@ mod tests {
         let links = scan(&setup, &EngineConfig::default(), &[]).await.unwrap();
         let names: Vec<_> = links.iter().map(|l| l.name.as_str()).collect();
         assert_eq!(names, ["usb0", "wlan0"]);
+    }
+
+    #[tokio::test]
+    async fn a_switched_off_link_is_left_out() {
+        let shared = Arc::new(Shared::default());
+        shared.set(&[("eth0", "10.0.0.2"), ("usb0", "10.0.1.2")]);
+        let setup = setup(shared, Vec::new());
+        setup.switch.set_enabled("usb0", false);
+        let links = scan(&setup, &EngineConfig::default(), &[]).await.unwrap();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].name, "eth0");
+        setup.switch.set_enabled("usb0", true);
+        let links = scan(&setup, &EngineConfig::default(), &links)
+            .await
+            .unwrap();
+        assert_eq!(links.len(), 2);
     }
 
     #[tokio::test]

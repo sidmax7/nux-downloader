@@ -117,6 +117,7 @@ impl fmt::Display for FileError {
             Self::VerifyFailed { detail } => {
                 write!(f, "the downloaded file didn't verify: {detail}")
             }
+            Self::Io { detail } if detail.starts_with("disk error") => write!(f, "{detail}"),
             Self::Io { detail } => write!(f, "disk error: {detail}"),
             Self::Other { detail } => write!(f, "{detail}"),
         }

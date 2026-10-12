@@ -58,6 +58,15 @@ pub fn reopen(plan: &FilePrep, final_name: &str) -> Result<(OpenFile, bool), Sto
     let final_path = plan.dest_dir.join(final_name);
     let part_path = part_path_for(&final_path);
 
+    // Never write through a symlink standing where our partial file
+    // should be.
+    if std::fs::symlink_metadata(&part_path).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(StorageError::Io {
+            operation: "open",
+            path: part_path.display().to_string(),
+            source: std::io::Error::other("refusing to follow a symlink"),
+        });
+    }
     let file = match std::fs::OpenOptions::new()
         .read(true)
         .write(true)

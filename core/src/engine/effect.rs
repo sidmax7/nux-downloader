@@ -80,6 +80,12 @@ pub enum EngineEvent {
     PackageDone {
         package: PackageId,
     },
+    /// A disk or I/O error paused the package (§16: "Fatal (package)").
+    /// Its partial data is intact; resuming retries.
+    PackagePausedOnError {
+        package: PackageId,
+        error: PackageError,
+    },
     /// A package's speed limit changed (`Command::SetPackageLimit`).
     PackageLimitChanged {
         package: PackageId,

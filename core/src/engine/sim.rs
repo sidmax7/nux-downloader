@@ -3752,4 +3752,121 @@ mod tests {
         }
         assert_eq!(refreshes, 2);
     }
+
+    // --- disk errors pause the package (P8.3) ---
+
+    #[test]
+    fn a_write_error_pauses_the_package_and_resume_reopens_the_file() {
+        let mut state = EngineState::new(EngineConfig::default());
+        let now = Instant::now();
+        state.handle(Input::LinksChanged(vec![one_link()]), now);
+        let (package, file) = add_single_file(&mut state, now, "http://example.com/f.bin");
+        let (attempt, _) =
+            activate_and_start(&mut state, now, file, "http://example.com/f.bin", 1000);
+        state.handle(
+            Input::Tick {
+                progress: vec![(attempt, 400)],
+            },
+            now,
+        );
+        let effects = state.handle(
+            Input::AttemptEnded {
+                id: attempt,
+                outcome: AttemptOutcome::Failed(TransferError::Io(
+                    "No space left on device".into(),
+                )),
+                position: 400,
+            },
+            now,
+        );
+        check_invariants(&state);
+        let pkg = state.package(package).unwrap();
+        assert_eq!(pkg.status, PackageStatus::Paused);
+        assert!(
+            matches!(pkg.last_error, Some(PackageError::Io { ref detail }) if detail.contains("space"))
+        );
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::Emit(EngineEvent::PackagePausedOnError { .. })))
+        );
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::Checkpoint { .. }))
+        );
+        // The progress made before the error is kept.
+        assert_eq!(pkg.files[0].parts[0].durable, 400);
+        // Nothing starts while it is paused.
+        let tick = state.handle(
+            Input::Tick { progress: vec![] },
+            now + Duration::from_secs(30),
+        );
+        assert!(find_start_attempt(&tick, file).is_none());
+
+        let effects = state.handle(Input::Command(Command::Resume(package)), now);
+        check_invariants(&state);
+        let pkg = state.package(package).unwrap();
+        assert_eq!(pkg.status, PackageStatus::Downloading);
+        assert_eq!(pkg.last_error, None);
+        let prep = effects.iter().find_map(|e| match e {
+            Effect::PrepareFile { file: f, plan } if *f == file => Some(plan.clone()),
+            _ => None,
+        });
+        // Reopened by its name, not recreated.
+        assert_eq!(
+            prep.unwrap().resume_final_name,
+            Some("file.bin".to_string())
+        );
+        // Back to work once prepared, from the saved byte.
+        let effects = state.handle(
+            Input::FilePrepared {
+                file,
+                result: Ok(PreparedFile {
+                    final_name: "file.bin".to_string(),
+                    frontiers_valid: true,
+                }),
+            },
+            now,
+        );
+        let (_, range) = find_start_attempt(&effects, file).expect("restarted");
+        assert_eq!(range.start, 400);
+    }
+
+    #[test]
+    fn a_prepare_error_pauses_too() {
+        let mut state = EngineState::new(EngineConfig::default());
+        let now = Instant::now();
+        state.handle(Input::LinksChanged(vec![one_link()]), now);
+        let (package, file) = add_single_file(&mut state, now, "http://example.com/f.bin");
+        state.handle(
+            Input::ProbeDone {
+                file,
+                result: ok_probe("http://example.com/f.bin", 1000),
+            },
+            now,
+        );
+        state.handle(
+            Input::FilePrepared {
+                file,
+                result: Err(crate::error::StorageError::InsufficientSpace {
+                    dir: "/data".to_string(),
+                    needed: 1000,
+                    available: 10,
+                }),
+            },
+            now,
+        );
+        check_invariants(&state);
+        let pkg = state.package(package).unwrap();
+        assert_eq!(pkg.status, PackageStatus::Paused);
+        assert!(pkg.last_error.is_some());
+        // It resumes by preparing the file afresh.
+        let effects = state.handle(Input::Command(Command::Resume(package)), now);
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::PrepareFile { file: f, .. } if *f == file))
+        );
+    }
 }

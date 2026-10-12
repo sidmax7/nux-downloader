@@ -75,6 +75,11 @@ pub struct Engine {
     config: EngineConfig,
     registry: Registry,
     client: reqwest::Client,
+    /// Which links are switched off (`set_link_enabled`); a fixed link
+    /// set has none to switch.
+    link_switch: crate::net::monitor::LinkSwitch,
+    /// Keeps the data directory to this engine (and its clones).
+    _lock: std::sync::Arc<crate::storage::lock::DataDirLock>,
 }
 
 /// The single synthetic link `Engine::start` uses (`ARCHITECTURE.md`
@@ -144,9 +149,8 @@ impl Engine {
     /// reordering, removing — without starting anything: no probes, no
     /// transfers, and nothing that wasn't touched is rewritten. Used by
     /// commands that must not begin downloading as a side effect
-    /// (`nuxd add`, `nuxd queue`, …). Two processes on one data
-    /// directory at once is not protected against yet (a lock file is
-    /// Phase 8).
+    /// (`nuxd add`, `nuxd queue`, …). Like `start`, it holds the data
+    /// directory's lock, so it fails while a download is running there.
     pub async fn open_offline(
         config: EngineConfig,
         data_dir: Option<PathBuf>,
@@ -166,22 +170,18 @@ impl Engine {
     ) -> Result<Self, EngineError> {
         let data_dir = match data_dir {
             Some(dir) => dir,
-            None => {
-                let dirs = directories::ProjectDirs::from("", "", "nuxd").ok_or_else(|| {
-                    StorageError::Io {
-                        operation: "locate the data directory",
-                        path: String::new(),
-                        source: std::io::Error::other("no home directory for this platform/user"),
-                    }
-                })?;
-                dirs.data_dir().to_path_buf()
-            }
+            None => crate::diagnostics::default_data_dir().ok_or_else(|| StorageError::Io {
+                operation: "locate the data directory",
+                path: String::new(),
+                source: std::io::Error::other("no home directory for this platform/user"),
+            })?,
         };
         let manifest_dir = data_dir.join("packages");
         let queue_path = data_dir.join("queue.json");
 
         std::fs::create_dir_all(&manifest_dir)
             .map_err(|source| io_error("create", &manifest_dir, source))?;
+        let lock = std::sync::Arc::new(crate::storage::lock::DataDirLock::acquire(&data_dir)?);
 
         let queue = if queue_path.exists() {
             load_queue_manifest(&queue_path)?
@@ -202,6 +202,10 @@ impl Engine {
             .map(|manifest| manifest.package)
             .collect();
 
+        let link_switch = match &links {
+            LinkSetup::Monitored(setup) => setup.switch.clone(),
+            LinkSetup::Fixed { .. } => crate::net::monitor::LinkSwitch::default(),
+        };
         let client = crate::net::client::build_default_client(&config)?;
         let engine_config = config.clone();
         let (state, initial_effects) = if offline {
@@ -221,6 +225,8 @@ impl Engine {
             config: engine_config,
             registry: Registry::default(),
             client,
+            link_switch,
+            _lock: lock,
         })
     }
 
@@ -334,6 +340,25 @@ impl Engine {
 
     /// Changes a package's "extract after download" and "delete archives
     /// after extraction" options.
+    /// A plain-text report for bug reports — version, platform, links,
+    /// queue state, recent log lines — with URLs cut down to host and
+    /// path. Nothing is sent anywhere; the caller shows or copies it.
+    pub async fn diagnostics(&self) -> String {
+        let snapshot = self.snapshot().await;
+        let data_dir = self
+            .manifest_dir
+            .parent()
+            .unwrap_or(&self.manifest_dir)
+            .to_path_buf();
+        crate::diagnostics::render(&crate::diagnostics::ReportInput {
+            data_dir: &data_dir,
+            config: Some(&self.config),
+            packages: &snapshot.packages,
+            links: &snapshot.links,
+            unreadable: Vec::new(),
+        })
+    }
+
     /// Sets or clears the overall speed limit; running transfers adapt
     /// at once.
     pub fn set_global_limit(&self, rate: Option<crate::model::ByteRate>) {
@@ -353,6 +378,18 @@ impl Engine {
     #[must_use]
     pub fn link_limit(&self, link: LinkId) -> Option<crate::model::ByteRate> {
         self.driver.limits().link(link)
+    }
+
+    /// Switches a link on or off by interface name. A switched-off link
+    /// leaves the link set at the next rescan (a few seconds); its
+    /// running transfers move to the other links.
+    pub fn set_link_enabled(&self, name: &str, enabled: bool) {
+        self.link_switch.set_enabled(name, enabled);
+    }
+
+    #[must_use]
+    pub fn link_enabled(&self, name: &str) -> bool {
+        self.link_switch.is_enabled(name)
     }
 
     /// Sets or clears one package's speed limit. Unlike the global and

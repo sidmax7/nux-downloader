@@ -119,12 +119,16 @@ pub fn parse_sidecar(kind: HashKind, text: &str) -> Vec<Expectation> {
                 None => continue,
             }
         };
-        if hash.len() != want_len || !hash.bytes().all(|b| b.is_ascii_hexdigit()) || name.is_empty()
+        // `dir/` and `..` name no file.
+        let base = base_name(name);
+        if hash.len() != want_len
+            || !hash.bytes().all(|b| b.is_ascii_hexdigit())
+            || matches!(base, "" | "." | "..")
         {
             continue;
         }
         out.push(Expectation {
-            name: base_name(name).to_string(),
+            name: base.to_string(),
             kind,
             hash: hash.to_ascii_lowercase(),
         });
@@ -205,7 +209,8 @@ pub fn verify_package(
         let length = std::fs::metadata(&path)
             .map_err(|error| VerifyFailure {
                 file: Some(file.name.clone()),
-                corrupt: false,
+                // A file that is gone has to be fetched again.
+                corrupt: error.kind() == std::io::ErrorKind::NotFound,
                 detail: format!("{} is missing or unreadable: {error}", file.name),
             })?
             .len();
@@ -399,11 +404,11 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_file_is_a_failure_but_not_corrupt() {
+    fn a_missing_file_has_to_be_fetched_again() {
         let dir = tempfile::tempdir().unwrap();
         let failure =
             verify_package(dir.path(), &[vf("gone.bin", None)], &no_cancel()).unwrap_err();
-        assert!(!failure.corrupt);
+        assert!(failure.corrupt, "a vanished file must be refetched");
     }
 
     #[test]
@@ -431,6 +436,16 @@ mod tests {
         let cancel = AtomicBool::new(true);
         let failure = hash_file(&dir.path().join("a.bin"), HashKind::Sha256, &cancel).unwrap_err();
         assert_eq!(failure.detail, "cancelled");
+    }
+
+    #[test]
+    fn sidecar_entries_that_name_no_file_are_skipped() {
+        // Found by fuzzing: `dir/` has an empty base name.
+        let h = "d41d8cd98f00b204e9800998ecf8427e";
+        let text = format!("{h}  dir/\n{h}  ..\n{h}  .\n{h}  real.bin\n");
+        let parsed = parse_sidecar(HashKind::Md5, &text);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].name, "real.bin");
     }
 
     #[test]

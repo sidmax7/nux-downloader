@@ -30,10 +30,11 @@ pub struct ContentRange {
 #[must_use]
 pub fn parse_content_range(value: &str) -> Option<ContentRange> {
     let s = value.trim();
-    if s.len() < 5 || !s[..5].eq_ignore_ascii_case("bytes") {
+    // `get`, not slicing: byte 5 may fall inside a multi-byte character.
+    if !s.get(..5)?.eq_ignore_ascii_case("bytes") {
         return None;
     }
-    let rest = s[5..].trim_start();
+    let rest = s.get(5..)?.trim_start();
     let (start_str, rest) = rest.split_once('-')?;
     let (end_str, total_str) = rest.split_once('/')?;
 
@@ -238,6 +239,9 @@ pub fn sanitize_filename(name: &str) -> String {
         .map(|c| if "<>:\"|?*".contains(c) { '_' } else { c })
         .collect();
 
+    // Truncate first, then trim: cutting a long name can itself leave a
+    // trailing space or dot, which Windows would silently strip.
+    let mut safe = truncate_to_byte_limit(safe, MAX_FILENAME_BYTES);
     let trimmed_len = safe.trim_end_matches([' ', '.']).len();
     safe.truncate(trimmed_len);
 
@@ -248,8 +252,7 @@ pub fn sanitize_filename(name: &str) -> String {
     if safe.is_empty() || safe.chars().all(|c| c == '.') {
         return "download".to_string();
     }
-
-    truncate_to_byte_limit(safe, MAX_FILENAME_BYTES)
+    safe
 }
 
 /// What a probe (`GET` with `Range: bytes=0-0`, §5) learned about a
@@ -603,6 +606,24 @@ mod tests {
     #[test]
     fn trims_trailing_dots_and_spaces() {
         assert_eq!(sanitize_filename("trailing.dots... "), "trailing.dots");
+    }
+
+    #[test]
+    fn content_range_survives_multibyte_text_where_it_slices() {
+        // Found by fuzzing: slicing at byte 5 panicked inside a character.
+        assert_eq!(parse_content_range("\u{FFFD}\u{FFFD}"), None);
+        assert_eq!(parse_content_range("byt\u{e9}s 0-1/2"), None);
+        assert_eq!(parse_content_range("é"), None);
+    }
+
+    #[test]
+    fn a_long_name_cut_to_the_limit_never_ends_in_a_space_or_dot() {
+        // Found by fuzzing: truncating left a trailing space.
+        let name = format!("{}{}", "a".repeat(253), " .x");
+        let clean = sanitize_filename(&name);
+        assert!(!clean.ends_with(' ') && !clean.ends_with('.'), "{clean:?}");
+        assert!(clean.len() <= 255);
+        assert_eq!(sanitize_filename(&clean), clean);
     }
 
     #[test]

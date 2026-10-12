@@ -3,4 +3,5 @@
 //! Phase 2 (`ARCHITECTURE.md` §9).
 
 pub mod file;
+pub mod lock;
 pub mod manifest;

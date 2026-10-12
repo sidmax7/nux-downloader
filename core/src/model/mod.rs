@@ -9,6 +9,7 @@ mod link;
 mod package;
 mod priority;
 
+pub mod path_serde;
 pub use byte::{ByteRange, ByteRate};
 pub use file::{BlockLayout, FileEntry, FileError, FileStatus, FileVersion, PartStatus};
 pub use ids::{AttemptId, FileId, LinkId, PackageId};
