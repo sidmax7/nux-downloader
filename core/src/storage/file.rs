@@ -159,17 +159,14 @@ mod windows_sparse {
     use std::io;
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Foundation::HANDLE;
-    use windows_sys::Win32::Storage::FileSystem::FSCTL_SET_SPARSE;
     use windows_sys::Win32::System::IO::DeviceIoControl;
+    use windows_sys::Win32::System::Ioctl::FSCTL_SET_SPARSE;
 
     /// Marks `file` sparse via `FSCTL_SET_SPARSE`, so a later `set_len`
     /// extends it without the OS eagerly zero-filling every byte up to
     /// the new length first.
     ///
-    /// Not independently verified on Windows — written and reviewed on
-    /// Linux with no Windows toolchain available to compile or run it;
-    /// confirm it on Windows CI (`IMPLEMENTATION_PLAN.md` P0.4) or a real
-    /// machine before relying on it.
+    /// Compiled on Windows CI; not yet exercised on a real Windows machine.
     pub fn set_sparse(file: &File) -> io::Result<()> {
         let handle = file.as_raw_handle() as HANDLE;
         let mut bytes_returned: u32 = 0;
