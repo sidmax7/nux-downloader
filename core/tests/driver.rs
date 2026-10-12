@@ -239,6 +239,7 @@ async fn resumes_from_a_checkpoint_after_a_simulated_crash() {
         ..EngineConfig::default()
     };
 
+    origin.hold_request_at(2, 3000);
     let package_id: PackageId;
     let durable_at_pause: u64;
     {
@@ -276,9 +277,8 @@ async fn resumes_from_a_checkpoint_after_a_simulated_crash() {
         .flatten()
         .unwrap_or_else(|| panic!("the probe never completed"));
 
-        // The probe (a 1-byte response) is out of the way now, so this
-        // catches the transfer's request instead.
-        origin.hold_next_request_at(3000);
+        // Held from request 2 (the transfer), armed before the engine
+        // sent anything, so a fast machine can't finish the 20 KB first.
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         driver

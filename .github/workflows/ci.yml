@@ -82,7 +82,15 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           for n in 2 3 4; do sudo ifconfig lo0 alias 127.0.0.$n up; done
+      # On Windows a Tauri crate's *test* binary can't start
+      # (STATUS_ENTRYPOINT_NOT_FOUND): Tauri links its Windows manifest
+      # into the app binary only. Those tests (settings, IPC bindings) are
+      # platform-independent and run on Linux and macOS; the app itself is
+      # built on Windows by the `app` job.
       - run: cargo test --workspace --all-targets
+        if: runner.os != 'Windows'
+      - run: cargo test --workspace --all-targets --exclude nuxd-app
+        if: runner.os == 'Windows'
       # RAR extraction builds the UnRAR C++ sources, so it is its own
       # (opt-in) feature; exercise it where a C++ toolchain is certain.
       - name: Test with RAR support
@@ -166,10 +174,9 @@ jobs:
         env:
           NUXD_APP: ../target/release/nux-downloader
           WEBKIT_DISABLE_DMABUF_RENDERER: "1"
-        run: |
-          tauri-driver &
-          sleep 2
-          xvfb-run -a pnpm e2e
+        # tauri-driver starts the app, so it must run inside the virtual
+        # display too, not only the test runner.
+        run: xvfb-run -a bash -c 'tauri-driver & sleep 2; pnpm e2e' 
 
   deny:
     name: cargo-deny

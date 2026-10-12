@@ -101,6 +101,9 @@ async fn pause_then_resume_still_completes() {
     .await;
     let data_dir = tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
     let dest = tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
+    // The first transfer (request 2; 1 is the probe) is slow, so a fast
+    // machine can't finish the file before the pause lands.
+    origin.set_fault(2, Fault::Throttle(10_000));
     let engine = Engine::start(EngineConfig::default(), Some(data_dir.path().to_path_buf()))
         .await
         .unwrap_or_else(|error| panic!("start: {error}"));

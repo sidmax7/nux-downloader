@@ -185,9 +185,12 @@ async fn a_fifty_volume_set_and_two_hundred_small_files_keep_every_slot_busy() {
         ..Default::default()
     })
     .await;
-    // Slow enough that a slot is genuinely busy for tens of milliseconds.
-    volumes.set_default_fault(Fault::Throttle(4_000_000));
-    smalls.set_default_fault(Fault::Throttle(4_000_000));
+    // Slow enough that a transfer (100 ms for a small file, 250 ms for a
+    // volume block) dwarfs the few milliseconds of hand-over between
+    // transfers, even on a busy shared CI runner. At 4 MB/s (25 ms) a CI
+    // runner measured 49%: the scheduling gaps, not idle slots.
+    volumes.set_default_fault(Fault::Throttle(1_000_000));
+    smalls.set_default_fault(Fault::Throttle(1_000_000));
 
     let data_dir = tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
     let dest_volumes = tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));

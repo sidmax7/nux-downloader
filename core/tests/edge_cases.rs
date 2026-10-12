@@ -173,7 +173,9 @@ async fn permission_denied_pauses_with_the_reason_and_resumes_after_it_is_fixed(
     engine.shutdown().await;
 }
 
-#[cfg(unix)]
+// macOS (APFS) refuses names that aren't valid UTF-8 ("Illegal byte
+// sequence"), so such a folder can't exist there; Linux allows any bytes.
+#[cfg(all(unix, not(target_os = "macos")))]
 #[tokio::test]
 async fn a_destination_that_is_not_utf8_works_and_survives_a_restart() {
     use std::ffi::OsStr;

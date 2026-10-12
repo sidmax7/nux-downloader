@@ -197,6 +197,9 @@ struct SharedState {
     /// pauses after this many bytes until `release()` is called, or
     /// forever if it never is (deterministic pause/kill tests).
     hold_next_at: Option<u64>,
+    /// Armed by `Origin::hold_request_at`: the `n`th request's body pauses
+    /// after this many bytes (1-based, like `set_fault`).
+    hold_for_request: HashMap<usize, u64>,
 }
 
 /// Decrements the source's concurrency counter when the response body is
@@ -257,6 +260,7 @@ impl Origin {
             concurrent_by_source: HashMap::new(),
             peak_concurrent_by_source: HashMap::new(),
             hold_next_at: None,
+            hold_for_request: HashMap::new(),
         }));
         let hold_notify = Arc::new(Notify::new());
 
@@ -404,6 +408,14 @@ impl Origin {
         lock_state(&self.state).hold_next_at = Some(offset);
     }
 
+    /// Like `hold_next_request_at`, for the `n`th request (1-based). Can be
+    /// armed before anything is sent, so it cannot lose a race with a fast
+    /// client the way "the next request" can: request 1 is the probe, 2 the
+    /// first transfer.
+    pub fn hold_request_at(&self, n: usize, offset: u64) {
+        lock_state(&self.state).hold_for_request.insert(n, offset);
+    }
+
     /// Releases every request currently paused by a hold.
     pub fn release(&self) {
         self.hold_notify.notify_waiters();
@@ -518,7 +530,10 @@ async fn handle_request(
         } else {
             fault
         };
-        let hold_at = state.hold_next_at.take();
+        let hold_at = match state.hold_for_request.remove(&n) {
+            Some(offset) => Some(offset),
+            None => state.hold_next_at.take(),
+        };
 
         let count = *state
             .concurrent_by_source
