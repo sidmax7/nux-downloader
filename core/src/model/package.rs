@@ -101,7 +101,7 @@ pub struct Package {
     /// its output here, and `dest_dir` is this folder or, for an archive
     /// being extracted, its `Archives` subfolder. `None` for a package
     /// added without its own folder (and every package saved before
-    /// 0.3): `dest_dir` is then the whole story.
+    /// 0.2.1): `dest_dir` is then the whole story.
     #[serde(
         default,
         with = "super::path_serde::option",

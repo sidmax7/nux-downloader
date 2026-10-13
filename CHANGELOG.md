@@ -6,8 +6,17 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.1]
+
+RAR archives are extracted, and downloads stay tidy: every package gets
+a folder of its own.
+
 ### Added
 
+- RAR archives are extracted, including multi-part sets (`.part1.rar`,
+  `.r00`…), with the same safety checks as ZIP and 7z. Extraction uses
+  the UnRAR library, which is freeware; its licence is under Settings →
+  About.
 - In the add dialog's review step, each package's file list folds away
   behind its row (it starts folded when there are more than a dozen
   files), with "Expand all" / "Collapse all" and a running total of
@@ -31,15 +40,6 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 - Removing a package together with its files no longer leaves files
   behind when one of them was just starting to download.
-
-## [0.2.1]
-
-### Added
-
-- RAR archives are extracted, including multi-part sets (`.part1.rar`,
-  `.r00`…), with the same safety checks as ZIP and 7z. Extraction uses
-  the UnRAR library, which is freeware; its licence is under Settings →
-  About.
 
 ## [0.2.0]
 
