@@ -19,6 +19,7 @@ const form = reactive({
   autoResume: true,
   extractByDefault: true,
   deleteByDefault: false,
+  packageFolders: true,
   hostRules: "",
   notifications: true,
   closeToTray: false,
@@ -38,6 +39,7 @@ function fill(settings: Settings) {
   form.autoResume = settings.auto_resume;
   form.extractByDefault = settings.extract_by_default;
   form.deleteByDefault = settings.delete_archives_by_default;
+  form.packageFolders = settings.package_folders;
   form.hostRules = settings.host_rules.join("\n");
   form.notifications = settings.notifications;
   form.closeToTray = settings.close_to_tray;
@@ -81,6 +83,7 @@ async function save() {
     auto_resume: form.autoResume,
     extract_by_default: form.extractByDefault,
     delete_archives_by_default: form.deleteByDefault,
+    package_folders: form.packageFolders,
     host_rules: form.hostRules
       .split("\n")
       .map((line) => line.trim())
@@ -127,6 +130,7 @@ async function copyReport() {
         Overall speed limit
         <input v-model="form.globalLimit" class="field short" placeholder="none" />
       </label>
+      <label class="check"><input v-model="form.packageFolders" type="checkbox" /> Put each package in its own folder <small class="muted">(an extracted archive's parts go in its “Archives” subfolder; a single file isn't put in a folder)</small></label>
       <label class="check"><input v-model="form.autoResume" type="checkbox" /> Resume unfinished downloads when the app starts <small class="muted">(applies after a restart)</small></label>
     </fieldset>
 

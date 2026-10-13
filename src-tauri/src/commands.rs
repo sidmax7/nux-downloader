@@ -93,6 +93,7 @@ pub async fn enqueue_draft(state: Shared<'_>, request: EnqueueRequest) -> AppRes
         priority: request.priority.into(),
         extract: request.extract && draft.offers_extract(),
         delete_archives: request.delete_archives,
+        own_folder: state.settings().package_folders,
     };
     engine
         .enqueue(draft, opts)

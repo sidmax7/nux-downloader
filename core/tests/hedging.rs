@@ -53,6 +53,7 @@ async fn a_crawling_transfer_is_rescued_by_a_hedge() {
                 priority: Priority::Normal,
                 extract: false,
                 delete_archives: false,
+                own_folder: false,
             },
         )
         .await
@@ -137,6 +138,7 @@ async fn a_crawling_connection_is_refreshed_on_a_fresh_one() {
                 priority: Priority::Normal,
                 extract: false,
                 delete_archives: false,
+                own_folder: false,
             },
         )
         .await

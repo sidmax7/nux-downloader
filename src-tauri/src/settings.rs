@@ -46,6 +46,10 @@ pub struct Settings {
     pub extract_by_default: bool,
     /// Tick "delete archive after extraction" in the add dialog.
     pub delete_archives_by_default: bool,
+    /// Give each package its own folder in the download folder, with an
+    /// extracted archive's parts in its `Archives` subfolder (Decision
+    /// 37). A lone file still goes straight into the download folder.
+    pub package_folders: bool,
     /// `PATTERN=CONNS[:FILES]` rules. Apply on the next start.
     pub host_rules: Vec<String>,
     pub link_prefs: BTreeMap<String, LinkPref>,
@@ -66,6 +70,7 @@ impl Default for Settings {
             auto_resume: true,
             extract_by_default: true,
             delete_archives_by_default: false,
+            package_folders: true,
             host_rules: Vec::new(),
             link_prefs: BTreeMap::new(),
             notifications: true,

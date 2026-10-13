@@ -236,6 +236,64 @@ describe("AddLinks", () => {
     expect(add?.attributes("disabled")).toBeDefined();
   });
 
+  it("folds each package's files away when there are many, and opens them on demand", async () => {
+    const many = (id: number, n: number) =>
+      draft({
+        id,
+        name: `album ${id}`,
+        ok_count: n,
+        files: Array.from({ length: n }, (_, i) => ({
+          source: `https://x/${id}/${i}.jpg`,
+          name: `${i}.jpg`,
+          size: 100,
+          error: null,
+          found_on: null,
+        })),
+      });
+    api.collect.mockResolvedValue([many(1, 10), many(2, 10)]);
+    const wrapper = setup();
+    await wrapper.find("button.primary").trigger("click");
+    await flushPromises();
+
+    const toggles = wrapper.findAll("button.disclose");
+    expect(toggles.map((t) => t.attributes("aria-expanded"))).toEqual(["false", "false"]);
+    expect(wrapper.find("#files-1").attributes("inert")).toBeDefined();
+    // Folded away, the package still says what it holds and where it goes.
+    expect(wrapper.text()).toContain("2 packages · 20 of 20 files");
+    expect(wrapper.text()).toContain("Saves to Downloads/album 1/");
+
+    await toggles[0].trigger("click");
+    expect(toggles[0].attributes("aria-expanded")).toBe("true");
+    expect(wrapper.find("#files-1").attributes("inert")).toBeUndefined();
+
+    const all = wrapper.find("button.textbtn");
+    expect(all.text()).toBe("Expand all");
+    await all.trigger("click");
+    expect(wrapper.findAll("button.disclose").map((t) => t.attributes("aria-expanded"))).toEqual([
+      "true",
+      "true",
+    ]);
+    expect(all.text()).toBe("Collapse all");
+  });
+
+  it("starts open when there are few files, and shows where an archive's parts go", async () => {
+    api.collect.mockResolvedValue([archive(), draft({ id: 9 })]);
+    const wrapper = setup();
+    await wrapper.find("button.primary").trigger("click");
+    await flushPromises();
+    expect(wrapper.findAll("button.disclose").map((t) => t.attributes("aria-expanded"))).toEqual([
+      "true",
+      "true",
+    ]);
+    const saves = wrapper.findAll(".saves").map((p) => p.text());
+    expect(saves[0]).toBe("Saves to Downloads/a/ · parts in Archives/");
+    // A single plain file isn't given a folder.
+    expect(saves[1]).toBe("Saves to Downloads/");
+    // Unticking extraction keeps the parts at the top of the folder.
+    await wrapper.findAll(".post input[type=checkbox]")[0].setValue(false);
+    expect(wrapper.find(".saves").text()).toBe("Saves to Downloads/a/");
+  });
+
   it("discards the drafts on cancel", async () => {
     const wrapper = setup();
     await wrapper.findAll("footer button")[0].trigger("click");

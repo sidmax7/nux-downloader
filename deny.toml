@@ -50,8 +50,12 @@ allow = [
     # own code.
     "MPL-2.0",
 ]
-# UnRAR (Phase 5, only if extraction ships) is proprietary and reviewed
-# separately (IMPLEMENTATION_PLAN.md P9.8) — not pre-approved here.
+# UnRAR (compiled in by `unrar_sys`, on by default in the app and `nuxd`)
+# is freeware, not open source. `unrar_sys` declares MIT OR Apache-2.0,
+# which covers only its Rust code, so cargo-deny never sees the UnRAR
+# licence. It was reviewed by hand (Decision 36): extraction is allowed in
+# any software, free of charge; its text is added to THIRD_PARTY_NOTICES.md
+# by scripts/third-party-notices.py.
 confidence-threshold = 0.8
 
 [bans]

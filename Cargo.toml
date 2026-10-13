@@ -3,7 +3,7 @@ resolver = "3"
 members = ["core", "core/testkit", "cli", "src-tauri"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 rust-version = "1.98"
 license = "Apache-2.0"
@@ -13,8 +13,8 @@ publish = false
 # Shared dependency versions — crates in this workspace pull from here
 # with `{ workspace = true }` so versions can't drift between them.
 [workspace.dependencies]
-nuxd-core = { path = "core", version = "0.2.0" }
-nuxd-testkit = { path = "core/testkit", version = "0.2.0" }
+nuxd-core = { path = "core", version = "0.2.1" }
+nuxd-testkit = { path = "core/testkit", version = "0.2.1" }
 
 tokio = { version = "1", features = ["full"] }
 axum = "0.8"

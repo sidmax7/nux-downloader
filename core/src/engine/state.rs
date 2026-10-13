@@ -2369,6 +2369,7 @@ impl EngineState {
                     effects.push(Effect::DeleteFiles {
                         dest_dir,
                         names: vec![name],
+                        remove_dir_if_empty: false,
                     });
                 }
                 self.fail_package(package_id, PackageError::VerifyFailed { detail }, effects);
@@ -2429,7 +2430,11 @@ impl EngineState {
                 .iter()
                 .map(|&i| package.dest_dir.join(&package.files[i].name))
                 .collect(),
-            dest_dir: package.dest_dir.clone(),
+            dest_dir: package
+                .folder
+                .clone()
+                .unwrap_or_else(|| package.dest_dir.clone()),
+            unwrap_single_dir: package.folder.is_some(),
             limits: crate::extract::ExtractLimits::from_config(&self.config),
         })
     }
@@ -2461,9 +2466,16 @@ impl EngineState {
                             .filter_map(|v| v.file_name())
                             .map(|n| n.to_string_lossy().into_owned())
                             .collect();
+                        // The parts live in `dest_dir`, which may be the
+                        // package folder's `Archives` (Decision 37): once
+                        // emptied, that goes too.
                         effects.push(Effect::DeleteFiles {
-                            dest_dir: spec.dest_dir,
+                            dest_dir: package.dest_dir.clone(),
                             names,
+                            remove_dir_if_empty: package
+                                .folder
+                                .as_ref()
+                                .is_some_and(|folder| *folder != package.dest_dir),
                         });
                     }
                     self.finish_package(package_id, effects);
@@ -3110,6 +3122,7 @@ fn apply_post(package: &mut Package, post: PostOptions) {
     package.archive = post.archive;
     package.extract = post.extract && package.archive.is_some();
     package.delete_archives = post.delete_archives;
+    package.folder = post.folder;
 }
 
 /// What `AddPackage` / `AddProbed` share about the package they create.

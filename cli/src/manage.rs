@@ -105,6 +105,7 @@ pub async fn add(
                 priority,
                 extract: post.extract,
                 delete_archives: post.delete_archives,
+                own_folder: !post.flat,
             },
         )
         .await;

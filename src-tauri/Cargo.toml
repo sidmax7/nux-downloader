@@ -20,10 +20,14 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 workspace = true
 
 [features]
-default = ["self-update"]
+default = ["self-update", "rar"]
 # In-app updates from GitHub Releases. Package-manager builds (AUR, distro
-# packages) turn it off: `--no-default-features`.
+# packages) turn it off: `--no-default-features --features rar`.
 self-update = ["dep:tauri-plugin-updater"]
+# RAR extraction (the UnRAR library: freeware, not open source; its
+# licence is in THIRD_PARTY_NOTICES.md). Builds for repositories that
+# exclude non-free code leave it out.
+rar = ["nuxd-core/rar"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

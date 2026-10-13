@@ -6,6 +6,41 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- In the add dialog's review step, each package's file list folds away
+  behind its row (it starts folded when there are more than a dozen
+  files), with "Expand all" / "Collapse all" and a running total of
+  packages, files and size. Folded rows still show the file count, size,
+  options and warnings, and every package now says where it will be
+  saved.
+
+### Changed
+
+- Each package now downloads into its own folder inside the download
+  folder, instead of everything landing in one place. When an archive is
+  extracted, the extracted files sit at the top of the package folder
+  and the downloaded parts go in its `Archives` subfolder, which "delete
+  archives" removes too. An archive that holds a single folder is
+  unpacked without an extra level of nesting. A single file still goes
+  straight into the download folder. Settings → "Put each package in its
+  own folder" (on by default) turns this off; for `nuxd`, `--flat`.
+  Downloads already in the queue keep their old layout.
+
+### Fixed
+
+- Removing a package together with its files no longer leaves files
+  behind when one of them was just starting to download.
+
+## [0.2.1]
+
+### Added
+
+- RAR archives are extracted, including multi-part sets (`.part1.rar`,
+  `.r00`…), with the same safety checks as ZIP and 7z. Extraction uses
+  the UnRAR library, which is freeware; its licence is under Settings →
+  About.
+
 ## [0.2.0]
 
 Paste a link to an album or gallery page and get the files in it; pick
@@ -104,7 +139,8 @@ tested.
   `move`, `limit`, `options`, `restart-file`, `links` and `diagnostics`,
   sharing the app's queue.
 
-[Unreleased]: https://github.com/sidmax7/nux-downloader/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/sidmax7/nux-downloader/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/sidmax7/nux-downloader/releases/tag/v0.2.1
 [0.2.0]: https://github.com/sidmax7/nux-downloader/releases/tag/v0.2.0
 [0.1.1]: https://github.com/sidmax7/nux-downloader/releases/tag/v0.1.1
 [0.1.0]: https://github.com/sidmax7/nux-downloader/releases/tag/v0.1.0

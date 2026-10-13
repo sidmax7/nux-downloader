@@ -37,6 +37,12 @@ pub struct ExtractSpec {
     /// Volume files in reading order (see `group`).
     pub volumes: Vec<PathBuf>,
     pub dest_dir: PathBuf,
+    /// An archive whose root is a single folder has that folder's
+    /// contents placed in `dest_dir`, so a package folder doesn't end up
+    /// holding `Name/Name/…` (Decision 37). Only for a package's own
+    /// folder: in a shared download folder the archive's folder is what
+    /// keeps its files together.
+    pub unwrap_single_dir: bool,
     pub limits: Limits,
 }
 
@@ -67,7 +73,11 @@ pub fn extract(
 
     let outcome = extract_into(spec, &staging, cancel, progress);
     let result = match outcome {
-        Ok(summary) => publish(&staging, &spec.dest_dir).map(|()| summary),
+        Ok(summary) => publish(
+            &publish_root(&staging, spec.unwrap_single_dir),
+            &spec.dest_dir,
+        )
+        .map(|()| summary),
         Err(error) => Err(error),
     };
     remove_stale(&staging);
@@ -126,7 +136,8 @@ fn extract_into(
             rar::extract(&spec.volumes[0], &mut sink)?;
             #[cfg(not(feature = "rar"))]
             return Err(ExtractError::Unsupported {
-                detail: "RAR extraction isn't built into this nuxd (rebuild with --features rar)"
+                detail: "this build was made without RAR support; extract the archive \
+                         with another tool, or install the release build"
                     .to_string(),
             });
         }
@@ -164,6 +175,20 @@ fn extract_into(
         bytes: sink.written,
         skipped_links: sink.skipped_links,
     })
+}
+
+/// Where the entries to publish are: the staging directory, or the one
+/// folder it holds when unwrapping is asked for and that is all it holds.
+fn publish_root(staging: &Path, unwrap_single_dir: bool) -> PathBuf {
+    if unwrap_single_dir && let Ok(entries) = std::fs::read_dir(staging) {
+        let entries: Vec<_> = entries.filter_map(Result::ok).take(2).collect();
+        if let [only] = entries.as_slice()
+            && only.file_type().is_ok_and(|t| t.is_dir())
+        {
+            return only.path();
+        }
+    }
+    staging.to_path_buf()
 }
 
 /// Moves the staged top-level entries into `dest_dir`, never replacing

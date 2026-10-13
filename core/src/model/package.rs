@@ -30,6 +30,9 @@ pub struct PostOptions {
     pub archive: Option<ArchiveSet>,
     pub extract: bool,
     pub delete_archives: bool,
+    /// The folder made for the package (Decision 37), if any; see
+    /// `Package::folder`.
+    pub folder: Option<PathBuf>,
 }
 
 /// Why a package failed — a serializable summary, same rationale as
@@ -94,6 +97,17 @@ pub struct Package {
     /// Delete the archive files after a successful extraction.
     #[serde(default)]
     pub delete_archives: bool,
+    /// The folder made for this package (Decision 37). Extraction puts
+    /// its output here, and `dest_dir` is this folder or, for an archive
+    /// being extracted, its `Archives` subfolder. `None` for a package
+    /// added without its own folder (and every package saved before
+    /// 0.3): `dest_dir` is then the whole story.
+    #[serde(
+        default,
+        with = "super::path_serde::option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub folder: Option<PathBuf>,
     pub limit: Option<ByteRate>,
     pub status: PackageStatus,
     /// Why the package is `Paused` against the user's wishes: a disk or
@@ -127,6 +141,7 @@ impl Package {
             archive: None,
             extract: false,
             delete_archives: false,
+            folder: None,
             limit: None,
             status: PackageStatus::Queued,
             last_error: None,

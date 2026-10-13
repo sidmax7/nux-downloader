@@ -16,7 +16,7 @@ use crate::storage::manifest::{
     QUEUE_SCHEMA_VERSION, QueueManifest, QueueSettings, load_all_package_manifests,
     load_queue_manifest, save_queue_manifest,
 };
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::sync::broadcast;
 
@@ -34,12 +34,17 @@ pub struct AddOptions {
     /// Delete the archive files after a successful extraction. Separate
     /// from `extract`, and off unless asked for.
     pub delete_archives: bool,
+    /// Give the package its own folder inside `dest_dir` (Decision 37;
+    /// see `package_dirs`). A lone file that isn't an archive still goes
+    /// straight into `dest_dir`.
+    pub own_folder: bool,
 }
 
 impl AddOptions {
     /// The options a shell pre-fills for a reviewed draft: its own name,
     /// normal priority, and "extract after download" ticked when it looks
-    /// like an archive. Archives are never deleted unless asked.
+    /// like an archive, in a folder of its own. Archives are never
+    /// deleted unless asked.
     #[must_use]
     pub fn for_draft(draft: &PackageDraft, dest_dir: PathBuf) -> Self {
         Self {
@@ -48,8 +53,78 @@ impl AddOptions {
             priority: Priority::Normal,
             extract: draft.offers_extract(),
             delete_archives: false,
+            own_folder: true,
         }
     }
+}
+
+/// The subfolder an extracted archive's parts are downloaded into.
+pub const ARCHIVES_FOLDER: &str = "Archives";
+
+/// Where a new package's files go (Decision 37): `(dest_dir, folder)`.
+///
+/// Without `own_folder`, or for a lone file that isn't an archive, that
+/// is `base` and no folder. Otherwise the package gets a folder in
+/// `base` named after it — `Name`, or `Name (1)`… when a folder of that
+/// name already holds something — claimed by creating it, so two
+/// packages never share one. An archive that will be extracted
+/// downloads into the folder's `Archives`, and extracts into the folder.
+///
+/// If the folder can't be made (the download folder is missing or read
+/// only), the package falls back to `base`, where preparing its first
+/// file reports the actual problem.
+#[must_use]
+pub fn package_dirs(
+    base: &Path,
+    name: &str,
+    files: usize,
+    archive: bool,
+    extract: bool,
+    own_folder: bool,
+) -> (PathBuf, Option<PathBuf>) {
+    if !own_folder || (files <= 1 && !archive) {
+        return (base.to_path_buf(), None);
+    }
+    let Some(folder) = claim_folder(base, &crate::probe::sanitize_filename(name)) else {
+        return (base.to_path_buf(), None);
+    };
+    let dest_dir = if archive && extract {
+        folder.join(ARCHIVES_FOLDER)
+    } else {
+        folder.clone()
+    };
+    (dest_dir, Some(folder))
+}
+
+/// Creates `base/name`, or the first free `base/name (n)`; an existing
+/// empty folder is reused.
+fn claim_folder(base: &Path, name: &str) -> Option<PathBuf> {
+    if let Err(error) = std::fs::create_dir_all(base) {
+        tracing::warn!(dir = %base.display(), %error, "can't create the download folder");
+        return None;
+    }
+    for n in 0..1000 {
+        let candidate = if n == 0 {
+            base.join(name)
+        } else {
+            base.join(format!("{name} ({n})"))
+        };
+        match std::fs::create_dir(&candidate) {
+            Ok(()) => return Some(candidate),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let empty_dir = std::fs::symlink_metadata(&candidate).is_ok_and(|m| m.is_dir())
+                    && std::fs::read_dir(&candidate).is_ok_and(|mut d| d.next().is_none());
+                if empty_dir {
+                    return Some(candidate);
+                }
+            }
+            Err(error) => {
+                tracing::warn!(dir = %candidate.display(), %error, "can't create a package folder");
+                return None;
+            }
+        }
+    }
+    None
 }
 
 /// Which package(s) a `pause`/`resume`/`cancel`/`remove` call applies to.
@@ -269,11 +344,19 @@ impl Engine {
         draft: PackageDraft,
         opts: AddOptions,
     ) -> Result<PackageId, EngineError> {
+        let (dest_dir, folder) = package_dirs(
+            &opts.dest_dir,
+            &opts.name,
+            draft.files.len(),
+            draft.archive.is_some(),
+            opts.extract,
+            opts.own_folder,
+        );
         let mut events = self.driver.subscribe();
         self.driver
             .command(Command::AddProbed {
                 name: opts.name,
-                dest_dir: opts.dest_dir,
+                dest_dir,
                 files: draft
                     .files
                     .into_iter()
@@ -287,6 +370,7 @@ impl Engine {
                     archive: draft.archive,
                     extract: opts.extract,
                     delete_archives: opts.delete_archives,
+                    folder,
                 },
             })
             .await
@@ -329,15 +413,25 @@ impl Engine {
                 Some(archive) => archive.base_name.clone(),
                 None => opts.name.clone(),
             };
+            let extract = opts.extract && group.archive.is_some();
+            let (dest_dir, folder) = package_dirs(
+                &opts.dest_dir,
+                &name,
+                group.members.len(),
+                group.archive.is_some(),
+                extract,
+                opts.own_folder,
+            );
             let post = PostOptions {
-                extract: opts.extract && group.archive.is_some(),
+                extract,
                 delete_archives: opts.delete_archives,
                 archive: group.archive,
+                folder,
             };
             self.driver
                 .command(Command::AddPackage {
                     name,
-                    dest_dir: opts.dest_dir.clone(),
+                    dest_dir,
                     sources: group.members.iter().map(|&i| sources[i].clone()).collect(),
                     priority: opts.priority,
                     post,
@@ -463,15 +557,10 @@ impl Engine {
         };
 
         for id in ids {
-            let package = snapshot.packages.iter().find(|package| package.id == id);
-            if delete_files && let Some(package) = package {
-                for file in &package.files {
-                    let final_path = package.dest_dir.join(&file.name);
-                    let _ = std::fs::remove_file(&final_path);
-                    let _ =
-                        std::fs::remove_file(crate::driver::prepare::part_path_for(&final_path));
-                }
-            }
+            // The names as they are now: a probe may have renamed a file
+            // since `snapshot`.
+            let current = self.snapshot().await;
+            let package = current.packages.iter().find(|package| package.id == id);
             let mut events = self.driver.subscribe();
             self.driver
                 .command(Command::Remove(id))
@@ -486,6 +575,24 @@ impl Engine {
                     _ => None,
                 })
                 .await;
+            }
+            // Only now that its transfers are stopped: deleting earlier
+            // let a file that was just starting create itself again.
+            if delete_files && let Some(package) = package {
+                for file in &package.files {
+                    let final_path = package.dest_dir.join(&file.name);
+                    let _ = std::fs::remove_file(&final_path);
+                    let _ =
+                        std::fs::remove_file(crate::driver::prepare::part_path_for(&final_path));
+                }
+            }
+            // A folder made for the package goes too, if that left it
+            // empty (Decision 37) — `Archives` first, then the folder.
+            if let Some(package) = package
+                && let Some(folder) = &package.folder
+            {
+                let _ = std::fs::remove_dir(&package.dest_dir);
+                let _ = std::fs::remove_dir(folder);
             }
             let _ = std::fs::remove_file(crate::driver::prepare::manifest_path(
                 &self.manifest_dir,

@@ -2693,7 +2693,7 @@ dependencies = [
 
 [[package]]
 name = "nuxd"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "clap",
  "indicatif",
@@ -2707,7 +2707,7 @@ dependencies = [
 
 [[package]]
 name = "nuxd-app"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "directories",
@@ -2728,7 +2728,7 @@ dependencies = [
 
 [[package]]
 name = "nuxd-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "crc32fast",
@@ -2759,7 +2759,7 @@ dependencies = [
 
 [[package]]
 name = "nuxd-testkit"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-stream",
  "axum",

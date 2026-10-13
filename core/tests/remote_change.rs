@@ -39,6 +39,7 @@ fn opts(dest: &std::path::Path) -> AddOptions {
         priority: Priority::Normal,
         extract: false,
         delete_archives: false,
+        own_folder: false,
     }
 }
 

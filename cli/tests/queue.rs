@@ -76,13 +76,21 @@ async fn managing_the_queue_never_touches_the_network_and_resume_downloads() {
     assert!(text.contains("Low"), "{text}");
     assert_eq!(text.matches("file ").count(), 4, "{text}");
 
-    // Nothing was probed or downloaded by adding and listing.
+    // Nothing was probed or downloaded by adding and listing; the
+    // three-file package only claimed its (empty) folder, Decision 37.
     assert!(
         origin.requests().is_empty(),
         "management touched the network"
     );
+    let batch = dest.path().join("batch");
     assert_eq!(
         std::fs::read_dir(dest.path())
+            .unwrap_or_else(|e| panic!("read_dir: {e}"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        std::fs::read_dir(&batch)
             .unwrap_or_else(|e| panic!("read_dir: {e}"))
             .count(),
         0
@@ -118,9 +126,12 @@ async fn managing_the_queue_never_touches_the_network_and_resume_downloads() {
     let (ok, out, err) = run(resume).await;
     assert!(ok, "resume failed: {out}\n{err}");
     let mut finished = 0;
-    for entry in std::fs::read_dir(dest.path()).unwrap_or_else(|e| panic!("read_dir: {e}")) {
+    let entries = std::fs::read_dir(dest.path())
+        .and_then(|top| Ok(top.chain(std::fs::read_dir(&batch)?)))
+        .unwrap_or_else(|e| panic!("read_dir: {e}"));
+    for entry in entries {
         let path = entry.unwrap_or_else(|e| panic!("entry: {e}")).path();
-        if path.extension().is_some_and(|x| x == "nuxdpart") {
+        if path.is_dir() || path.extension().is_some_and(|x| x == "nuxdpart") {
             continue;
         }
         assert_eq!(

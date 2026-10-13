@@ -89,6 +89,7 @@ fn spec(scheme: ArchiveScheme, base: &str, volumes: Vec<PathBuf>, dest: &Path) -
         base_name: base.to_string(),
         volumes,
         dest_dir: dest.to_path_buf(),
+        unwrap_single_dir: false,
         limits: limits(),
     }
 }
@@ -454,7 +455,7 @@ fn unsupported_cases_say_so() {
 }
 
 // --- RAR (needs the `rar` feature; fixtures are hand-assembled, see
-// tests/fixtures/rar/make_fixtures.py) ---
+// tests/fixtures/rar/make_fixtures.py, except rar5-solid.rar) ---
 
 #[cfg(feature = "rar")]
 mod rar {
@@ -495,6 +496,24 @@ mod rar {
         assert_eq!(
             std::fs::read(run.out.path().join("big.bin")).unwrap(),
             expected
+        );
+    }
+
+    /// A real WinRAR archive: RAR5, solid, compressed (`-m3`). Taken from
+    /// the `unrar` crate's test data (MIT OR Apache-2.0), since the
+    /// hand-made fixtures can only be stored RAR4.
+    #[test]
+    fn a_compressed_rar5_archive_extracts() {
+        let (run, result) = run(
+            ArchiveScheme::RarLegacy,
+            "rar5-solid",
+            vec![fixture("rar5-solid.rar")],
+            None,
+        );
+        result.unwrap();
+        assert_eq!(
+            std::fs::read(run.out.path().join(".gitignore")).unwrap(),
+            b"target\nCargo.lock\n"
         );
     }
 

@@ -19,9 +19,22 @@ README. Removing that folder resets the app.
 queue, so only one of them can run downloads at a time. The other says
 which one is busy.
 
-**Why is RAR not extracted?** RAR extraction needs the UnRAR library,
-whose licence is not open source, so release builds leave it out. ZIP
-and 7z are extracted. Source builds can turn RAR on (see the README).
+**Where do my files go?** Into the download folder (Settings), with a
+folder per package: `Downloads/<package>/`. When an archive is
+extracted, its files are at the top of that folder and the downloaded
+parts are in `Downloads/<package>/Archives/`; an archive holding a
+single folder is unpacked without nesting it again. A package that is a
+single file isn't put in a folder. If a folder with the package's name
+already has something in it, the package gets `<package> (1)`. Turn off
+"Put each package in its own folder" in Settings (or pass `--flat` to
+`nuxd`) for everything in one folder.
+
+**Which archives are extracted?** ZIP, 7z and RAR, including
+multi-part sets (`.part1.rar`, `.r00`, `.7z.001`, `.zip.001`).
+Encrypted archives and Info-ZIP splits (`.z01`) are not. RAR uses the
+UnRAR library, which is freeware rather than open source; builds made
+without it (see the README) download RAR archives but don't extract
+them.
 
 **Does it download from file-hosting sites, video sites or streams?** It
 downloads files from links you already have access to. It does not and

@@ -56,11 +56,13 @@ async fn extract_flag_extracts_and_keeps_the_archive() {
         .arg("--extract");
     let (ok, _, err) = run(get).await;
     assert!(ok, "{err}");
+    // A folder of its own (Decision 37): the archive's one root folder is
+    // unwrapped into it, and the archive sits in its `Archives`.
     assert_eq!(
-        std::fs::read(dest.path().join("inside/hello.txt")).unwrap(),
+        std::fs::read(dest.path().join("pack/hello.txt")).unwrap(),
         b"hello from the zip"
     );
-    assert!(dest.path().join("pack.zip").exists());
+    assert!(dest.path().join("pack/Archives/pack.zip").exists());
 }
 
 #[tokio::test]
@@ -74,11 +76,14 @@ async fn delete_archives_flag_removes_the_archive_after_extraction() {
         .arg("-o")
         .arg(dest.path())
         .arg("--extract")
-        .arg("--delete-archives");
+        .arg("--delete-archives")
+        .arg("--flat");
     let (ok, _, err) = run(get).await;
     assert!(ok, "{err}");
+    // `--flat`: straight into the destination, nothing unwrapped.
     assert!(dest.path().join("inside/hello.txt").exists());
     assert!(!dest.path().join("pack.zip").exists());
+    assert!(!dest.path().join("pack").exists());
 }
 
 #[tokio::test]
@@ -115,7 +120,10 @@ async fn without_flags_nothing_is_extracted_and_options_can_turn_it_on() {
     resume.arg("resume");
     let (ok, _, err) = run(resume).await;
     assert!(ok, "{err}");
-    assert!(dest.path().join("inside/hello.txt").exists());
+    // Extraction was off when it was added, so the archive is at the top
+    // of its folder, next to what it extracted to.
+    assert!(dest.path().join("pack/hello.txt").exists());
+    assert!(dest.path().join("pack/pack.zip").exists());
 }
 
 #[tokio::test]

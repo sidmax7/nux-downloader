@@ -101,6 +101,11 @@ pub struct PostFlags {
     /// `--extract`; never happens when extraction fails).
     #[arg(long)]
     delete_archives: bool,
+    /// Put the files straight into the destination. By default a package
+    /// of several files, or an archive, gets a folder of its own there
+    /// (an extracted archive's parts go in its `Archives` subfolder).
+    #[arg(long)]
+    flat: bool,
 }
 
 #[derive(Subcommand)]
@@ -489,6 +494,7 @@ async fn run_get(
                 priority: nuxd_core::model::Priority::Normal,
                 extract: post.extract,
                 delete_archives: post.delete_archives,
+                own_folder: !post.flat,
             },
         )
         .await

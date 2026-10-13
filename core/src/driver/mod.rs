@@ -613,7 +613,11 @@ impl Worker {
                     flag.store(true, Ordering::Relaxed);
                 }
             }
-            Effect::DeleteFiles { dest_dir, names } => {
+            Effect::DeleteFiles {
+                dest_dir,
+                names,
+                remove_dir_if_empty,
+            } => {
                 // Awaited, so the deletion has happened by the time the
                 // `PackageDone` that follows it is announced.
                 let _ = tokio::task::spawn_blocking(move || {
@@ -623,6 +627,10 @@ impl Worker {
                             continue;
                         }
                         let _ = std::fs::remove_file(dest_dir.join(&name));
+                    }
+                    if remove_dir_if_empty {
+                        // Fails, harmlessly, unless the directory is empty.
+                        let _ = std::fs::remove_dir(&dest_dir);
                     }
                 })
                 .await;

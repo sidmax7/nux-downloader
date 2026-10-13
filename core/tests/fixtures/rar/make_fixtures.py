@@ -5,6 +5,10 @@ are assembled by hand from the documented block layout (stored, no
 compression). Check them with `unrar t`. Re-run to regenerate:
 
     python3 make_fixtures.py
+
+rar5-solid.rar is not made here: it is a real WinRAR archive (RAR5,
+solid, -m3) copied from the `unrar` crate's test data (unrar 0.5.8,
+data/solid.rar; MIT OR Apache-2.0).
 """
 import struct, zlib
 

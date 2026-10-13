@@ -16,6 +16,7 @@ fn opts(name: &str, dest_dir: std::path::PathBuf) -> AddOptions {
         priority: Priority::Normal,
         extract: false,
         delete_archives: false,
+        own_folder: false,
     }
 }
 

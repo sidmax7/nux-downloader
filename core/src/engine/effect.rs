@@ -207,6 +207,9 @@ pub enum Effect {
     DeleteFiles {
         dest_dir: PathBuf,
         names: Vec<String>,
+        /// Also remove `dest_dir` itself if that leaves it empty (a
+        /// package folder's `Archives`, Decision 37).
+        remove_dir_if_empty: bool,
     },
     Emit(EngineEvent),
     /// A hint that a timer should fire no later than this instant (retry

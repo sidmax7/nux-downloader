@@ -101,6 +101,7 @@ async fn one_engine_under_churn_stays_flat() {
                     priority: Priority::Normal,
                     extract: false,
                     delete_archives: false,
+                    own_folder: false,
                 },
             )
             .await

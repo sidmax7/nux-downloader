@@ -226,6 +226,12 @@ export type Settings = {
 	extract_by_default: boolean,
 	/**  Tick "delete archive after extraction" in the add dialog. */
 	delete_archives_by_default: boolean,
+	/**
+	 *  Give each package its own folder in the download folder, with an
+	 *  extracted archive's parts in its `Archives` subfolder (Decision
+	 *  37). A lone file still goes straight into the download folder.
+	 */
+	package_folders: boolean,
 	/**  `PATTERN=CONNS[:FILES]` rules. Apply on the next start. */
 	host_rules: string[],
 	link_prefs: { [key in string]: LinkPref },

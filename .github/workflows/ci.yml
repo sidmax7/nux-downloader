@@ -95,11 +95,12 @@ jobs:
         if: runner.os != 'Windows'
       - run: cargo test --workspace --all-targets --exclude nuxd-app
         if: runner.os == 'Windows'
-      # RAR extraction builds the UnRAR C++ sources, so it is its own
-      # (opt-in) feature; exercise it where a C++ toolchain is certain.
-      - name: Test with RAR support
+      # The app and `nuxd` build RAR extraction in by default, so the
+      # workspace run above covers it. The library alone leaves it out;
+      # check that a build without it says so instead of failing oddly.
+      - name: Test without RAR support
         if: matrix.os == 'ubuntu-latest'
-        run: cargo test -p nuxd-core --features rar --test extract
+        run: cargo test -p nuxd-core --test extract
 
   ui:
     name: ui (typecheck, lint, build)

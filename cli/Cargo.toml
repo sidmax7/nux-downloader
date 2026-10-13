@@ -14,6 +14,12 @@ path = "src/main.rs"
 [lints]
 workspace = true
 
+[features]
+default = ["rar"]
+# RAR extraction (the UnRAR library: freeware, not open source). Builds
+# for repositories that exclude non-free code use `--no-default-features`.
+rar = ["nuxd-core/rar"]
+
 [dependencies]
 nuxd-core = { workspace = true }
 tokio = { workspace = true }

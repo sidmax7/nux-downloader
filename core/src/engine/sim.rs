@@ -2688,6 +2688,7 @@ mod tests {
             archive: Some(rar_set(base)),
             extract: true,
             delete_archives: delete,
+            folder: None,
         }
     }
 
@@ -2932,6 +2933,7 @@ mod tests {
             archive: None,
             extract: true,
             delete_archives: false,
+            folder: None,
         };
         let (package, _) = finished_package(&mut state, now, &["a.bin"], post);
         assert!(!state.package(package).unwrap().extract);
@@ -3175,6 +3177,7 @@ mod tests {
             archive: Some(rar_set("a")),
             extract: false,
             delete_archives: false,
+            folder: None,
         };
         let effects = state.handle(
             Input::Command(Command::AddPackage {

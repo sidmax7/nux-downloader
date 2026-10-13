@@ -100,6 +100,7 @@ fn opts(dest: &Path, extract: bool, delete: bool) -> AddOptions {
         priority: Priority::Normal,
         extract,
         delete_archives: delete,
+        own_folder: false,
     }
 }
 
@@ -158,20 +159,26 @@ async fn collect_groups_a_split_archive_and_extract_leaves_the_volumes() {
         .collect();
     assert_eq!(names, vec!["set.7z.001", "set.7z.002", "set.7z.003"]);
 
-    // The shell pre-ticks "extract"; "delete" is off.
+    // The shell pre-ticks "extract" and a folder of its own; "delete" is
+    // off.
     let options = AddOptions::for_draft(&draft, dest.path().to_path_buf());
-    assert!(options.extract && !options.delete_archives);
+    assert!(options.extract && !options.delete_archives && options.own_folder);
     engine.enqueue(draft, options).await.unwrap();
 
     wait_status(&engine, |s| *s == PackageStatus::Done).await;
-    assert_extracted(dest.path());
+    // Decision 37: `<dest>/<name>/` holds the extracted files, and the
+    // parts sit in its `Archives`.
+    let package = engine.snapshot().await.packages[0].clone();
+    let folder = package.folder.clone().expect("a folder of its own");
+    assert_eq!(folder, dest.path().join(&package.name));
+    assert_eq!(package.dest_dir, folder.join("Archives"));
+    assert_eq!(listing(dest.path()), vec![package.name.clone()]);
+    assert_extracted(&folder);
+    assert_eq!(listing(&folder), vec!["Archives", "data", "readme.txt"]);
     // Extraction doesn't delete the archives unless asked.
-    let files = listing(dest.path());
-    assert!(files.contains(&"set.7z.001".to_string()), "{files:?}");
-    assert!(files.contains(&"set.7z.003".to_string()), "{files:?}");
-    assert!(
-        files.iter().all(|f| !f.contains("nuxdextract")),
-        "{files:?}"
+    assert_eq!(
+        listing(&package.dest_dir),
+        vec!["set.7z.001", "set.7z.002", "set.7z.003"]
     );
     engine.shutdown().await;
 }
@@ -451,5 +458,171 @@ async fn a_restart_during_post_processing_finishes_the_job() {
     let engine = engine(data.path()).await;
     wait_status(&engine, |s| *s == PackageStatus::Done).await;
     assert_extracted(dest.path());
+    engine.shutdown().await;
+}
+
+/// The release builds extract RAR (Decision 36): a two-volume set pasted
+/// in reverse is grouped, downloaded, extracted from its first volume and
+/// its volumes removed. The fixtures are hand-made, see
+/// tests/fixtures/rar/make_fixtures.py.
+#[cfg(feature = "rar")]
+#[tokio::test]
+async fn a_multi_volume_rar_set_is_grouped_extracted_and_cleaned_up() {
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rar");
+    let mut origins = Vec::new();
+    for name in ["split.part2.rar", "split.part1.rar"] {
+        origins.push(serve(name, std::fs::read(fixtures.join(name)).unwrap()).await);
+    }
+    let data = tempdir().unwrap();
+    let dest = tempdir().unwrap();
+    let engine = engine(data.path()).await;
+
+    let drafts = engine
+        .collect(origins.iter().map(Origin::url).collect())
+        .await;
+    assert_eq!(drafts.len(), 1, "{drafts:?}");
+    let draft = drafts.into_iter().next().unwrap();
+    assert_eq!(draft.archive.as_ref().unwrap().scheme, ArchiveScheme::Rar);
+    assert!(draft.offers_extract() && draft.missing_volumes.is_empty());
+
+    engine
+        .enqueue(draft, opts(dest.path(), true, true))
+        .await
+        .unwrap();
+    wait_status(&engine, |s| *s == PackageStatus::Done).await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while listing(dest.path()).iter().any(|f| f.ends_with(".rar")) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the volumes were never deleted");
+    let expected: Vec<u8> = (0..3000).map(|i| ((i * 31 + 7) % 251) as u8).collect();
+    assert_eq!(
+        std::fs::read(dest.path().join("big.bin")).unwrap(),
+        expected
+    );
+    assert_eq!(listing(dest.path()), vec!["big.bin".to_string()]);
+    engine.shutdown().await;
+}
+
+/// Decision 37: an archive whose root is one folder is unwrapped into the
+/// package folder (no `Name/Name/`), and deleting the archives also
+/// removes the emptied `Archives`.
+#[tokio::test]
+async fn a_one_folder_archive_is_unwrapped_and_the_emptied_archives_folder_goes() {
+    let wrapped: Vec<(String, Vec<u8>)> = payload()
+        .into_iter()
+        .map(|(name, data)| (format!("Game/{name}"), data))
+        .collect();
+    let entries: Vec<(&str, Vec<u8>)> = wrapped
+        .iter()
+        .map(|(name, data)| (name.as_str(), data.clone()))
+        .collect();
+    let origin = serve("game.zip", make_zip(&entries)).await;
+    let data = tempdir().unwrap();
+    let dest = tempdir().unwrap();
+    let engine = engine(data.path()).await;
+    let draft = engine
+        .collect(vec![origin.url()])
+        .await
+        .into_iter()
+        .next()
+        .unwrap();
+    let mut options = AddOptions::for_draft(&draft, dest.path().to_path_buf());
+    options.delete_archives = true;
+    engine.enqueue(draft, options).await.unwrap();
+    wait_status(&engine, |s| *s == PackageStatus::Done).await;
+
+    let folder = engine.snapshot().await.packages[0].folder.clone().unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while folder.join("Archives").exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the emptied Archives folder was never removed");
+    assert_extracted(&folder);
+    assert_eq!(listing(&folder), vec!["data", "readme.txt"]);
+    assert_eq!(listing(dest.path()).len(), 1);
+    engine.shutdown().await;
+}
+
+/// Decision 37: plain files of one package share a folder of their own —
+/// a fresh one if a folder of that name already holds something — and a
+/// lone file goes straight into the download folder.
+#[tokio::test]
+async fn several_files_get_a_fresh_folder_and_a_lone_file_none() {
+    let a = serve("a.txt", b"first".to_vec()).await;
+    let b = serve("b.txt", b"second".to_vec()).await;
+    let c = serve("c.txt", b"alone".to_vec()).await;
+    let data = tempdir().unwrap();
+    let dest = tempdir().unwrap();
+    // Somebody else's files already live in `Notes`.
+    std::fs::create_dir(dest.path().join("Notes")).unwrap();
+    std::fs::write(dest.path().join("Notes/mine.txt"), b"keep").unwrap();
+    let engine = engine(data.path()).await;
+
+    let pair = engine.collect(vec![a.url(), b.url()]).await;
+    assert_eq!(pair.len(), 1, "{pair:?}");
+    let mut options = AddOptions::for_draft(&pair[0], dest.path().to_path_buf());
+    options.name = "Notes".to_string();
+    engine
+        .enqueue(pair.into_iter().next().unwrap(), options)
+        .await
+        .unwrap();
+    let lone = engine.collect(vec![c.url()]).await;
+    let options = AddOptions::for_draft(&lone[0], dest.path().to_path_buf());
+    engine
+        .enqueue(lone.into_iter().next().unwrap(), options)
+        .await
+        .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let snapshot = engine.snapshot().await;
+            if snapshot
+                .packages
+                .iter()
+                .all(|p| p.status == PackageStatus::Done)
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("never finished");
+    assert_eq!(listing(dest.path()), vec!["Notes", "Notes (1)", "c.txt"]);
+    assert_eq!(listing(&dest.path().join("Notes")), vec!["mine.txt"]);
+    assert_eq!(
+        listing(&dest.path().join("Notes (1)")),
+        vec!["a.txt", "b.txt"]
+    );
+    engine.shutdown().await;
+}
+
+/// A package removed with its files leaves no empty folder behind
+/// (Decision 37).
+#[tokio::test]
+async fn removing_a_package_removes_its_emptied_folder() {
+    let a = serve("a.bin", pseudo(400_000, 3)).await;
+    let b = serve("b.bin", pseudo(400_000, 4)).await;
+    let data = tempdir().unwrap();
+    let dest = tempdir().unwrap();
+    let engine = engine(data.path()).await;
+    let mut options = opts(dest.path(), false, false);
+    options.own_folder = true;
+    let ids = engine.add(vec![a.url(), b.url()], options).await.unwrap();
+    assert_eq!(listing(dest.path()), vec!["pkg"]);
+    engine
+        .remove(nuxd_core::Target::Package(ids[0]), true)
+        .await
+        .unwrap();
+    assert!(
+        listing(dest.path()).is_empty(),
+        "{:?}",
+        listing(&dest.path().join("pkg"))
+    );
     engine.shutdown().await;
 }

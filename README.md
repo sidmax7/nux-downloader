@@ -37,8 +37,12 @@ It combines two ideas from earlier tools:
   `.zip.001`…) are grouped into one package. Checksum files are
   verified. Two separate options per package: **extract after
   download**, and **delete the archive after extraction** (only after a
-  successful extraction). ZIP and 7z are supported; RAR only in builds
-  with RAR support.
+  successful extraction). ZIP, 7z and RAR are supported.
+- **Tidy folders.** Each package gets its own folder in your download
+  folder. An extracted archive's files sit at the top of it and the
+  downloaded parts go in an `Archives` subfolder (removed along with
+  them if you delete archives). A single file goes straight into the
+  download folder. Settings can turn this off.
 - **Desktop app and command line.** The app has a tray icon, desktop
   notifications, light and dark themes, and a block map showing which
   link delivered which part of a file. The `nuxd` command does the same
@@ -159,6 +163,7 @@ The `nuxd` command uses the same engine and the same queue as the app
 ```sh
 nuxd get https://example.com/big.iso            # download now, wait for it
 nuxd add -i links.txt --extract                 # queue links from a file
+                                                #   (--flat: no package folder)
 nuxd queue                                      # what's in the queue
 nuxd resume                                     # download the queue
 nuxd links                                      # network links found
@@ -212,17 +217,20 @@ To work on the app with live reload, run
 
 Packaging for a distribution? Build without the self-updater, so the
 package manager stays in charge:
-`../ui/node_modules/.bin/tauri build -- --no-default-features`.
+`../ui/node_modules/.bin/tauri build -- --no-default-features --features rar`.
 
 Maintainers: the release process is in [docs/releasing.md](docs/releasing.md).
 
 ### RAR support
 
-RAR extraction uses the UnRAR library, whose licence is not open
-source, so it is off by default. To include it:
+RAR extraction uses the UnRAR library, which is freeware rather than
+open source (its licence is in `THIRD_PARTY_NOTICES.md`). The app and
+`nuxd` include it by default. For a repository that excludes non-free
+code, build without it; RAR archives are then downloaded but not
+extracted:
 
 ```sh
-cargo install --path cli --features nuxd-core/rar
+cargo install --path cli --no-default-features
 ```
 
 ### Tests
